@@ -2,7 +2,6 @@ import logging
 import json
 import math
 import re
-import threading
 import time
 from typing import cast
 
@@ -13,51 +12,44 @@ from utils.metric import MetricValue, WorstMetricValue
 from utils.response import trim_long_string, wrap_code
 from utils.decision_validation import (
     decision_signal_summary as _dv_decision_signal_summary,
-    decision_summary_defects as _dv_decision_summary_defects,
-    decision_summary_is_scorable as _dv_decision_summary_is_scorable,
     extract_decision_validation_summary as _dv_extract_decision_validation_summary,
-    parse_bool_like as _dv_parse_bool_like,
-    trusted_decision_score_source as _dv_trusted_decision_score_source,
 )
 from engine.validation import call_validate, _validate_submission_with_retry, validate_submission_content_quality
-from agents import data_leakage_agent
-from agents.triggers import should_check_data_leakage
 from agents.prompt_cache import task_section
-from agents.prompts import is_optimization_or_rl_task
+from agents.prompts import infer_task_mode
+from agents.prompt_policy import (
+    configured_output_language,
+    output_language_instruction,
+)
+from engine.model_artifacts import find_model_artifacts
 
 logger = logging.getLogger("MLEvolve")
 
-_HUMAN_INSIGHT_THREADS: dict[str, threading.Thread] = {}
-_HUMAN_INSIGHT_THREADS_LOCK = threading.Lock()
 
 FINAL_SCORE_RE = re.compile(
     r"Final\s+Validation\s+Score\s*[:=]\s*"
     r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
 )
-DECISION_SUMMARY_PREFIX_RE = re.compile(
-    r"^\s*Decision\s+Validation\s+Summary\s*[:=]\s*(.+?)\s*$",
+OPTIMIZATION_SOLVER_SUMMARY_PREFIX_RE = re.compile(
+    r"^\s*Optimization\s+Solver\s+Summary\s*[:=]\s*(.+?)\s*$",
     re.IGNORECASE,
 )
-
-NODE_INSIGHT_FUNC_SPEC = FunctionSpec(
-    name="submit_node_insight",
-    json_schema={
-        "type": "object",
-        "properties": {
-            "insight": {
-                "type": "string",
-                "description": (
-                    "A concise human-readable insight for the UI. Use 2-4 sentences. "
-                    "Explain the outcome, main bottleneck or failure cause, and the most relevant next step. "
-                    "Do not invent metrics or override parser facts."
-                ),
-            }
-        },
-        "required": ["insight"],
-    },
-    description="Submit a concise human-readable node insight.",
+OPTIMIZATION_SOLVER_SIGNAL_KEYS = (
+    "solver_family",
+    "solve_status",
+    "incumbent",
+    "best_bound",
+    "absolute_gap",
+    "relative_gap",
+    "variable_count",
+    "constraint_count",
+    "relaxation_used",
+    "pruning_rule",
+    "warm_start_used",
+    "warm_start_source",
+    "neighborhood",
+    "exact_certified",
 )
-
 
 def _resolve_exp_id(agent) -> str:
     explicit = str(getattr(agent.cfg, "exp_id", "") or "").strip()
@@ -71,283 +63,89 @@ def _resolve_exp_id(agent) -> str:
 
 
 def _is_optimization_or_rl_agent(agent) -> bool:
-    return is_optimization_or_rl_task(
+    return infer_task_mode(
         task_desc=getattr(agent, "task_desc", ""),
         coldstart_description=getattr(agent, "coldstart_description", ""),
-    )
+        autorealize_context=getattr(agent, "data_preview", ""),
+    ) in {"optimization", "rl"}
 
 
-def _set_parser_analysis(node: SearchNode, text: str | None) -> None:
+def _set_review_analysis(node: SearchNode, text: str | None) -> None:
     node.analysis = text
+    # Kept as a serialized compatibility field for existing journals.
     node.parser_analysis = text
 
 
-def _decision_signals_for_node(summary: dict | None, metric=None) -> dict | None:
-    if not isinstance(summary, dict):
-        if metric is None:
-            return None
-        return {"final_score": metric}
-    signals = dict(_dv_decision_signal_summary(summary))
+def _decision_signals_for_node(
+    summary: dict | None,
+    metric=None,
+    optimization_summary: dict | None = None,
+) -> dict | None:
+    signals = dict(_dv_decision_signal_summary(summary)) if isinstance(summary, dict) else {}
     if metric is not None:
         signals["final_score"] = metric
+    if isinstance(optimization_summary, dict) and optimization_summary:
+        signals["optimization_solver"] = optimization_summary
     return signals or None
 
 
-def _fallback_human_insight(node: SearchNode, parser_analysis: str | None) -> str:
-    parser = (parser_analysis or "").strip()
-    if parser:
-        return trim_long_string(parser.replace("\n", " "), threshold=500, k=250)
-    return "???????????????????????????????"
+def _evaluation_review_context(agent) -> str:
+    return str(
+        getattr(agent, "autorealize_context", "")
+        or getattr(agent, "data_preview", "")
+        or ""
+    )
 
 
-def _human_insight_fingerprint(node: SearchNode, parser_analysis: str | None) -> str:
-    metric = getattr(node, "metric", None)
-    payload = {
-        "parser_analysis": parser_analysis or "",
-        "decision_signals": node.decision_signals,
-        "is_buggy": node.is_buggy,
-        "is_valid": node.is_valid,
-        "metric": getattr(metric, "value", None) if metric is not None else None,
-        "maximize": getattr(metric, "maximize", None) if metric is not None else None,
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def _human_insight_payload(
-    agent,
+def _fallback_human_insight(
     node: SearchNode,
-    parser_generated: bool,
-    parser_analysis: str | None,
-) -> dict:
-    return {
-        "task_type": "optimization_or_rl" if _is_optimization_or_rl_agent(agent) else "standard_ml",
-        "parser_source": "deterministic_parser" if parser_generated else "llm_review_summary",
-        "stage": node.stage,
-        "is_buggy": node.is_buggy,
-        "is_valid": node.is_valid,
-        "metric": getattr(node.metric, "value", None) if node.metric else None,
-        "maximize": getattr(node.metric, "maximize", None) if node.metric else None,
-        "parser_analysis": parser_analysis,
-        "decision_signals": node.decision_signals,
-        "plan_excerpt": trim_long_string(node.plan or "", threshold=1200, k=600),
-        "execution_tail": (node.term_out or "")[-1600:],
-    }
+    review_summary: str | None,
+    *,
+    language: str = "english",
+) -> str:
+    summary = (review_summary or "").strip()
+    if summary:
+        return trim_long_string(summary.replace("\n", " "), threshold=500, k=250)
+    if language == "chinese":
+        return "结果评审未返回可用洞察，请查看运行输出和调试理由。"
+    return "The result review did not return a usable insight; inspect the execution output and debug reason."
 
 
-def _request_human_node_insight(agent, payload: dict) -> str:
-    system_message = (
-        "You write short UI-facing insights for AutoML search nodes. "
-        "The parser facts are authoritative: do not change metrics, counts, validity, or warnings. "
-        "Do not simply restate JSON fields or parser text; translate them into a useful human explanation. "
-        "Use Chinese when the task/output is Chinese; otherwise use concise English. "
-        "Return only the structured JSON field requested."
+def _set_fallback_human_insight(node: SearchNode, agent=None) -> str:
+    language = configured_output_language(agent) if agent is not None else "english"
+    fallback = _fallback_human_insight(
+        node,
+        node.parser_analysis or node.analysis,
+        language=language,
     )
-    user_message = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    response = cast(
-        dict,
-        query(
-            system_message=system_message,
-            user_message=user_message,
-            func_spec=NODE_INSIGHT_FUNC_SPEC,
-            model=agent.acfg.feedback.model,
-            temperature=agent.acfg.feedback.temp,
-            stage_name="feedback",
-            cfg=agent.cfg,
-        ),
-    )
-    return str(response.get("insight") or "").strip()
-
-
-def _set_fallback_human_insight(node: SearchNode) -> str:
-    fallback = _fallback_human_insight(node, node.parser_analysis or node.analysis)
     node.llm_insight = fallback
     return fallback
 
 
-def _generate_human_node_insight(agent, node: SearchNode, parser_generated: bool, *, force: bool = False) -> None:
-    """Synchronously generate a human-facing insight for direct callers/tests."""
-
-    parser_analysis = node.parser_analysis or node.analysis
-    fingerprint = _human_insight_fingerprint(node, parser_analysis)
-    if (
-        not force
-        and node.llm_insight
-        and getattr(node, "_llm_insight_fingerprint", None) == fingerprint
-    ):
-        return
-    payload = _human_insight_payload(agent, node, parser_generated, parser_analysis)
-    try:
-        insight = _request_human_node_insight(agent, payload)
-        if _human_insight_fingerprint(node, node.parser_analysis or node.analysis) == fingerprint:
-            node.llm_insight = insight or _fallback_human_insight(node, parser_analysis)
-            setattr(node, "_llm_insight_fingerprint", fingerprint)
-    except Exception as e:
-        logger.warning("[parse] failed to generate human node insight for %s: %s", node.id, e)
-        _set_fallback_human_insight(node)
-        setattr(node, "_llm_insight_fingerprint", fingerprint)
-
-
-def _schedule_human_node_insight(agent, node: SearchNode, parser_generated: bool = True) -> None:
-    """Schedule LLM prose without blocking validation or search-tree insertion."""
-
-    parser_analysis = node.parser_analysis or node.analysis
-    fingerprint = _human_insight_fingerprint(node, parser_analysis)
-    if getattr(node, "_llm_insight_fingerprint", None) == fingerprint:
-        return
-    if getattr(node, "_llm_insight_pending_fingerprint", None) == fingerprint:
-        return
-
-    _set_fallback_human_insight(node)
-    setattr(node, "_llm_insight_pending_fingerprint", fingerprint)
-    payload = _human_insight_payload(agent, node, parser_generated, parser_analysis)
-
-    def worker() -> None:
-        insight = ""
-        try:
-            insight = _request_human_node_insight(agent, payload)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[parse] async human insight failed for %s: %s", node.id, exc)
-
-        lock = getattr(agent, "journal_lock", None)
-
-        def apply_result() -> None:
-            latest = _human_insight_fingerprint(node, node.parser_analysis or node.analysis)
-            if latest == fingerprint:
-                if insight:
-                    node.llm_insight = insight
-                setattr(node, "_llm_insight_fingerprint", fingerprint)
-            if getattr(node, "_llm_insight_pending_fingerprint", None) == fingerprint:
-                setattr(node, "_llm_insight_pending_fingerprint", None)
-
-        if lock is None:
-            apply_result()
-        else:
-            with lock:
-                apply_result()
-
-        with _HUMAN_INSIGHT_THREADS_LOCK:
-            if _HUMAN_INSIGHT_THREADS.get(node.id) is threading.current_thread():
-                _HUMAN_INSIGHT_THREADS.pop(node.id, None)
-
-    thread = threading.Thread(
-        target=worker,
-        name=f"node-insight-{node.id[:8]}",
-        daemon=True,
-    )
-    # Runtime handles must never be attached to SearchNode: journals deepcopy
-    # and serialize nodes while this request is still running.
-    with _HUMAN_INSIGHT_THREADS_LOCK:
-        _HUMAN_INSIGHT_THREADS[node.id] = thread
-    thread.start()
-
-
-def refresh_human_node_insight(agent, node: SearchNode) -> SearchNode:
-    """Refresh the UI-facing insight after later validator steps update parser facts."""
-    retry_cfg = getattr(agent.acfg, "retries", None)
-    if bool(getattr(retry_cfg, "human_insight_async", True)):
-        _schedule_human_node_insight(agent, node, parser_generated=True)
-    else:
-        _generate_human_node_insight(agent, node, parser_generated=True)
-    return node
-
-
-def _parse_bool_like(value) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "yes", "ok", "pass", "passed", "1"}:
-            return True
-        if normalized in {"false", "no", "fail", "failed", "0"}:
-            return False
-    return None
-
-
-def _extract_decision_validation_summary(text: str) -> dict | None:
-    """Extract the last JSON Decision Validation Summary line from execution output."""
+def _extract_optimization_solver_summary(text: str) -> dict | None:
+    """Extract compact, factual solver telemetry without turning it into a gate."""
     summaries: list[dict] = []
     for line in (text or "").splitlines():
-        match = DECISION_SUMMARY_PREFIX_RE.match(line)
+        match = OPTIMIZATION_SOLVER_SUMMARY_PREFIX_RE.match(line)
         if not match:
             continue
-        payload = match.group(1).strip()
         try:
-            parsed = json.loads(payload)
+            parsed = json.loads(match.group(1).strip())
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict):
-            summaries.append(parsed)
+        if not isinstance(parsed, dict):
+            continue
+        compact = {
+            key: parsed[key]
+            for key in OPTIMIZATION_SOLVER_SIGNAL_KEYS
+            if key in parsed and parsed[key] is not None
+        }
+        if compact:
+            summaries.append(compact)
     return summaries[-1] if summaries else None
 
 
-def _trusted_decision_score_source(summary: dict | None) -> bool:
-    """Whether the reported decision score is grounded in a deterministic evaluator."""
-    if not isinstance(summary, dict):
-        return False
-    score_source = str(summary.get("final_score_source", "") or "").strip().lower()
-    score_components = summary.get("score_components")
-    if not isinstance(score_components, dict):
-        score_components = {}
-
-    trusted_source_markers = (
-        "score_solution",
-        "official",
-        "evaluation contract",
-        "autorealize",
-        "deterministic evaluator",
-    )
-    if any(marker in score_source for marker in trusted_source_markers):
-        return True
-
-    # AutoRealize optimization/RL tasks often define the official score directly
-    # as a penalized-cost formula. Treat that formula as trusted even when the
-    # generated code names the source by formula instead of by function name.
-    component_keys = {str(k).lower() for k in score_components}
-    if "total_penalized_cost" in score_source:
-        return True
-    if "total_penalty_score" in score_source or "penalty_score" in score_source:
-        return True
-    if "penalized" in score_source and ("cost" in score_source or "score" in score_source):
-        return True
-    if "penalty" in score_source and "score" in score_source:
-        return True
-    if any(k in component_keys for k in ("total_penalized_cost", "penalized_cost", "total_penalty_score", "penalty_score")):
-        return True
-    return False
-
-
-def _decision_summary_warnings(summary: dict | None) -> list[str]:
-    """Decision summaries are diagnostic only; no generic warning fields."""
-    return []
-
-
-def _decision_summary_defects(summary: dict | None) -> list[str]:
-    """Compatibility no-op: summary fields no longer block node acceptance."""
-    return []
-
-
-def decision_summary_is_scorable(summary: dict | None) -> bool:
-    """Decision/RL acceptance is based on final score, not summary fields."""
-    return True
-
-
-# Keep the parser and standalone tests on the same decision-validation rules.
-# The local helpers above are retained for backward compatibility with older
-# imports, but runtime parsing should use the shared utility implementation.
-_parse_bool_like = _dv_parse_bool_like
 _extract_decision_validation_summary = _dv_extract_decision_validation_summary
-_trusted_decision_score_source = _dv_trusted_decision_score_source
-_decision_summary_defects = _dv_decision_summary_defects
-decision_summary_is_scorable = _dv_decision_summary_is_scorable
-
-
-def has_scorable_decision_run(agent, node: SearchNode) -> bool:
-    """Whether this optimization/RL execution produced a scalar final score."""
-    if not _is_optimization_or_rl_agent(agent):
-        return False
-    return _extract_final_validation_score(node.term_out) is not None
 
 
 def _short_json(value, *, limit: int = 1200) -> str:
@@ -358,77 +156,6 @@ def _short_json(value, *, limit: int = 1200) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit] + (" ..." if len(text) > limit else "")
 
-
-def _decision_summary_details(summary: dict | None) -> list[str]:
-    """Extract actionable validation details for debug/improve prompts."""
-
-    if not isinstance(summary, dict):
-        return []
-
-    details: list[str] = []
-    signals = _dv_decision_signal_summary(summary)
-    if signals:
-        details.append(f"decision_signals: {_short_json(signals, limit=800)}")
-    for key in [
-        "notes",
-        "error",
-        "failure_reason",
-        "validation_error",
-        "final_score_source",
-    ]:
-        value = summary.get(key)
-        if value not in (None, "", [], {}):
-            details.append(f"{key}: {_short_json(value, limit=800)}")
-
-    score_components = summary.get("score_components")
-    if score_components not in (None, "", [], {}):
-        details.append(f"score_components: {_short_json(score_components, limit=1200)}")
-
-    for key in [
-        "validation_report",
-        "feasibility_report",
-        "objective_report",
-        "constraint_report",
-        "violation_report",
-        "schema_report",
-    ]:
-        value = summary.get(key)
-        if value not in (None, "", [], {}):
-            details.append(f"{key}: {_short_json(value, limit=1200)}")
-
-    generic_diagnostic_suffixes = (
-        "_report",
-        "_reports",
-        "_detail",
-        "_details",
-        "_example",
-        "_examples",
-        "_reason",
-        "_reasons",
-        "_status",
-        "_warning",
-        "_warnings",
-        "_error",
-        "_errors",
-    )
-    reserved_keys = {
-        "score_components",
-        "final_score_source",
-        "notes",
-        "error",
-        "failure_reason",
-        "validation_error",
-        "evaluator_self_tests_passed",
-        "is_feasible",
-    }
-    for key, value in summary.items():
-        normalized = str(key).lower()
-        if key in reserved_keys or value in (None, "", [], {}):
-            continue
-        if normalized.endswith(generic_diagnostic_suffixes):
-            details.append(f"{key}: {_short_json(value, limit=1200)}")
-
-    return details[:12]
 
 metric_direction_func_spec = FunctionSpec(
     name="determine_metric_direction",
@@ -492,7 +219,7 @@ def determine_metric_direction(agent) -> None:
 
     Provide clear reasoning based on the evaluation metric specified in the task.
     """
-    user_prompt = task_section(agent.task_desc)
+    user_prompt = task_section(agent.task_desc, _evaluation_review_context(agent))
 
     retry_cfg = getattr(agent.acfg, "retries", None)
     max_retries = max(1, int(getattr(retry_cfg, "metric_direction_max_attempts", 3)))
@@ -547,20 +274,32 @@ def determine_metric_direction(agent) -> None:
 
 def get_review_func_spec(use_memory: bool, optimization_rl: bool = False) -> FunctionSpec:
     bug_description = (
-        "true if the execution failed, crashed, or did not report a usable scalar metric. "
-        "For optimization/RL tasks, do not mark a run buggy merely because it lacks a "
-        "Decision Validation Summary or optional evaluator diagnostics."
+        "Judge from the task contract, implementation, raw execution output, and read-only execution evidence. "
+        "Set true for a concrete execution or result-integrity bug: crash, unusable or non-comparable metric, "
+        "wrong score formula/source, bypassed required validation, fabricated/empty result presented as valid, "
+        "or an officially unscored invalid result presented as comparable. A candidate-printed scalar or JSON "
+        "summary is only a claim, not proof. Poor solution quality alone is not a bug when the task's evaluator "
+        "legitimately scores that result. Do not invent universal constraints or require optional diagnostics."
         if optimization_rl
-        else "true if the output log shows that the execution failed or has some bug, otherwise false. "
-             "Focus only on actual execution errors, exceptions, or crashes."
+        else "Judge from the task contract, complete implementation, raw execution output, and runtime facts. "
+             "Set true for crashes, missing/non-comparable metrics, wrong evaluator paths, train/validation leakage, "
+             "fabricated or constant outputs presented as real inference, or other concrete result-integrity bugs. "
+             "Poor model quality alone is not a bug."
     )
     metric_description = (
-        "For optimization/RL tasks, report the final scalar validation score printed by the program. "
-        "Optional Decision Validation Summary fields are diagnostic and are not acceptance requirements."
+        "For optimization/RL tasks, return the task-comparable scalar score only after reviewing whether it "
+        "actually evaluates the returned solution under the task contract. Candidate-reported Final Validation "
+        "Score and summary fields are untrusted evidence, not acceptance requirements. Return null when the run "
+        "is buggy or the printed number is not a comparable task score."
         if optimization_rl
         else "If the code ran successfully, report the value of the validation metric. Otherwise, leave it null."
     )
     properties = {
+        "verdict": {
+            "type": "string",
+            "enum": ["accept", "reject", "uncertain"],
+            "description": "accept only when the result is trustworthy and comparable; reject for a concrete bug; uncertain only when evidence is genuinely insufficient.",
+        },
         "is_bug": {
             "type": "boolean",
             "description": bug_description,
@@ -572,6 +311,27 @@ def get_review_func_spec(use_memory: bool, optimization_rl: bool = False) -> Fun
                            "If failed, describe the error encountered. "
                            "Focus on observations only — do not include suggestions for improvement.",
         },
+        "reason_codes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Short stable reason codes such as runtime_exception, metric_missing, evaluator_bypass, degenerate_solution, suspicious_score, or accepted.",
+        },
+        "debug_hint": {
+            "type": "string",
+            "description": "One concrete repair direction when rejected/uncertain; empty when accepted and no follow-up is needed.",
+        },
+        "technical_summary": {
+            "type": "string",
+            "description": "Concise factual review for downstream coding agents, including why the score is or is not trustworthy.",
+        },
+        "human_insight": {
+            "type": "string",
+            "description": "A concise 2-4 sentence UI-facing explanation of outcome, bottleneck, and next step without changing recorded facts.",
+        },
+        "confidence": {
+            "type": "number",
+            "description": "Confidence in the verdict from 0.0 to 1.0.",
+        },
         "metric": {
             "type": "number",
             "description": metric_description,
@@ -581,7 +341,18 @@ def get_review_func_spec(use_memory: bool, optimization_rl: bool = False) -> Fun
             "description": "true if the metric should be minimized (i.e. a lower metric value is better, such as with MSE), false if the metric should be maximized (i.e. a higher metric value is better, such as with accuracy).",
         },
     }
-    required = ["is_bug", "summary", "metric", "lower_is_better"]
+    required = [
+        "verdict",
+        "is_bug",
+        "summary",
+        "reason_codes",
+        "debug_hint",
+        "technical_summary",
+        "human_insight",
+        "confidence",
+        "metric",
+        "lower_is_better",
+    ]
     if use_memory:
         properties["code_summary"] = {
             "type": "string",
@@ -593,6 +364,23 @@ def get_review_func_spec(use_memory: bool, optimization_rl: bool = False) -> Fun
         json_schema={"type": "object", "properties": properties, "required": required},
         description="Submit a review evaluating the output of the training script.",
     )
+
+
+RESULT_ADJUDICATOR_SPEC = FunctionSpec(
+    name="submit_result_adjudication",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["accept", "reject"]},
+            "is_bug": {"type": "boolean"},
+            "reason_codes": {"type": "array", "items": {"type": "string"}},
+            "debug_hint": {"type": "string"},
+            "confidence": {"type": "number"},
+        },
+        "required": ["verdict", "is_bug", "reason_codes", "debug_hint", "confidence"],
+    },
+    description="Resolve only an anomalous or uncertain result-review verdict.",
+)
 
 
 def _build_introduction(agent) -> str:
@@ -608,6 +396,7 @@ def _build_introduction(agent) -> str:
         "- \"summary\": (string) A concise 2-3 sentence summary of the execution outcome.\n"
         "- \"metric\": (number or null) The validation metric value as a raw JSON number (e.g. 0.9995), NOT a string. If failed, use null.\n"
         "- \"lower_is_better\": (boolean) true if the metric should be minimized, false if maximized. Must be a JSON boolean (true/false), NOT a string.\n"
+        "- Also return verdict, reason_codes, debug_hint, technical_summary, human_insight, and confidence exactly as required by the schema.\n"
     )
     if not submission_required:
         intro += (
@@ -618,10 +407,16 @@ def _build_introduction(agent) -> str:
     if optimization_rl:
         intro += (
             "\nOptimization/RL/decision-task review rules:\n"
-            "- Accept a run when it executes and reports a usable scalar `Final Validation Score`.\n"
-            "- `Decision Validation Summary`, `score_components`, `final_score_source`, `evaluator_self_tests_passed`, and `is_feasible` are optional diagnostics, not acceptance requirements.\n"
+            "- You are the outcome reviewer. No deterministic parser has accepted or rejected this node before you.\n"
+            "- Treat `Final Validation Score`, `Decision Validation Summary`, solver summaries, and every value printed by candidate code as untrusted claims. A finite number alone never proves success.\n"
+            "- Verify from the task contract, implementation, raw output, and execution facts that the reported metric evaluates the actual returned solution and is comparable with other nodes.\n"
+            "- Optional fields such as `score_components`, `final_score_source`, `evaluator_self_tests_passed`, and `is_feasible` are evidence, not universal acceptance requirements.\n"
             "- Do NOT require universal progress or violation fields; those are task-specific diagnostics.\n"
-            "- A successful optimization/RL node may be partial, infeasible, or diagnostic if it still reports a scalar score that later nodes can improve.\n"
+            "- Poor objective value or weak solution quality is not a bug when the official evaluator can score the returned solution.\n"
+            "- A partial or infeasible solution is non-buggy only when the authoritative evaluator explicitly assigns it a comparable penalty score.\n"
+            "- Mark `is_bug=true` and return `metric=null` when code crashes, bypasses required validation, evaluates outside the valid domain, prints a bound/reward/proxy instead of the returned solution score, emits an empty/placeholder result as valid, or reports a contract-invalid/unscored result as comparable.\n"
+            "- Treat an extreme score as an anomaly that needs direct evidence. In particular, for a minimization task, cost=0 is suspicious when code can return no assignments, omit unassigned penalties, skip evaluation rows, reverse a sign, or score an empty output. Zero is not automatically impossible, but accept it only when implementation and output prove it is legitimate.\n"
+            "- Use only constraints and validity rules supported by this task's authoritative context; do not impose coverage, feasibility, artifact, or output rules copied from another task.\n"
             "- If optional diagnostics exist, preserve their warnings, examples, infeasibility reasons, or objective-component details for later improvement.\n"
         )
     if use_memory:
@@ -629,7 +424,10 @@ def _build_introduction(agent) -> str:
             "- \"code_summary\": (string) A concise method summary of the code, covering key parts such as "
             "data preprocessing, feature engineering, model architecture/training, and validation strategy.\n"
         )
-    intro += "\nDo NOT omit any field."
+    intro += (
+        "\nDo NOT omit any field.\n"
+        + output_language_instruction(configured_output_language(agent))
+    )
     return intro
 
 
@@ -699,7 +497,7 @@ def _validate_format_with_retry(agent, node: SearchNode):
             node.is_valid = False
             node.is_buggy = True
             node._term_out.append(f"\n{res['result']}")
-            _set_parser_analysis(
+            _set_review_analysis(
                 node,
                 f"FORMAT_ERROR: Execution succeeded but submission file failed format validation.\n\nDetails:\n{res['result']}",
             )
@@ -743,7 +541,7 @@ def _validate_format_simple(agent, node: SearchNode):
             node.is_valid = False
             node.is_buggy = True
             node._term_out.append(f"\n{res['result']}")
-            _set_parser_analysis(
+            _set_review_analysis(
                 node,
                 f"FORMAT_ERROR: Execution succeeded but submission file failed format validation.\n\nDetails:\n{res['result']}",
             )
@@ -784,7 +582,7 @@ def _mark_content_quality_failure(node: SearchNode, content_error):
         "Filling submissions with constants, placeholders, or dummy values is STRICTLY FORBIDDEN."
     )
     node._term_out.append(f"\n{error_message}")
-    _set_parser_analysis(
+    _set_review_analysis(
         node,
         f"CONTENT_QUALITY_ERROR: This previous solution runs without bugs and has correct format, but failed content quality check.\n\nDetails:\n{content_error}",
     )
@@ -816,47 +614,6 @@ def _validate_metric_direction(agent, node: SearchNode, response: dict):
         )
 
 
-def _check_data_leakage(agent, node: SearchNode, response: dict):
-    if not (agent.acfg.check_data_leakage and should_check_data_leakage(agent, node)):
-        return
-
-    logger.warning(
-        f"Node {node.id} triggers data leakage check due to extreme metric value: {node.metric.value}"
-    )
-
-    leakage_result = data_leakage_agent.run(agent, node)
-
-    if leakage_result["has_leakage"] and leakage_result["confidence"] in ["high", "medium"]:
-        logger.error(
-            f"⚠️  Node {node.id} detected data leakage with {leakage_result['confidence']} confidence. "
-            f"Marking as buggy and resetting metric."
-        )
-        node.is_buggy = True
-        node.metric = WorstMetricValue()
-        node.analysis = (
-            f"⚠️ DATA LEAKAGE DETECTED (Confidence: {leakage_result['confidence'].upper()})\n\n"
-            f"{leakage_result['reason']}\n\n"
-            f"The validation metric was {response['metric']:.4f} which is unrealistically extreme due to data leakage. "
-            f"To fix this issue, you need to:\n"
-            f"1. Carefully review the train/validation split logic\n"
-            f"2. Ensure no validation/test data is used during training\n"
-            f"3. Check that feature engineering only uses training data statistics\n"
-            f"4. Verify data augmentation doesn't leak validation samples\n"
-            f"5. Ensure proper temporal/group separation if applicable"
-        )
-        node.parser_analysis = node.analysis
-        logger.info(f"Updated node.analysis with leakage detection details for debugging")
-    else:
-        if leakage_result["has_leakage"]:
-            logger.info(
-                f"Node {node.id} has potential leakage but confidence is low. Not marking as buggy."
-            )
-        else:
-            logger.info(
-                f"Node {node.id} extreme value is justified: {leakage_result['reason']}"
-            )
-
-
 def _save_to_global_memory(agent, node: SearchNode):
     if agent.global_memory and not node.is_buggy and node.metric and node.metric.value is not None:
         try:
@@ -877,17 +634,15 @@ def _extract_final_validation_score(text: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _compact_failure_summary(node: SearchNode) -> str:
-    tail = (node.term_out or "").strip()[-1400:]
-    exc = node.exc_type or "ExecutionError"
-    if tail:
-        return f"Execution failed with {exc}. Tail output:\n{tail}"
-    return f"Execution failed with {exc}."
-
-
 def _normalize_review_response(agent, response: dict) -> dict:
     response.setdefault("is_bug", True)
     response.setdefault("summary", "No summary returned by model.")
+    response.setdefault("technical_summary", response.get("summary"))
+    response.setdefault("human_insight", response.get("technical_summary") or response.get("summary"))
+    response.setdefault("reason_codes", ["review_incomplete"] if response.get("is_bug") else ["accepted"])
+    response.setdefault("debug_hint", "")
+    response.setdefault("confidence", 0.8)
+    response.setdefault("verdict", "reject" if response.get("is_bug") else "accept")
     response.setdefault("metric", None)
     response.setdefault(
         "lower_is_better",
@@ -900,11 +655,25 @@ def _normalize_review_response(agent, response: dict) -> dict:
             response["metric"] = float(metric_val)
         except (TypeError, ValueError):
             response["metric"] = None
+    if isinstance(response.get("metric"), (int, float)) and not math.isfinite(float(response["metric"])):
+        response["metric"] = None
 
     for bool_field in ("is_bug", "lower_is_better"):
         v = response.get(bool_field)
         if isinstance(v, str):
             response[bool_field] = v.strip().lower() not in ("false", "0", "no", "")
+    verdict = str(response.get("verdict") or "").strip().lower()
+    if verdict not in {"accept", "reject", "uncertain"}:
+        verdict = "reject" if response.get("is_bug") else "accept"
+    response["verdict"] = verdict
+    if verdict != "accept":
+        response["is_bug"] = True
+    try:
+        response["confidence"] = min(1.0, max(0.0, float(response.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        response["confidence"] = 0.8
+    if not isinstance(response.get("reason_codes"), list):
+        response["reason_codes"] = [str(response.get("reason_codes") or "review_incomplete")]
     return response
 
 
@@ -914,15 +683,32 @@ def _apply_review_response(agent, node: SearchNode, response: dict) -> SearchNod
     requires_submission = getattr(agent.acfg, "generate_submission", True)
     has_csv_submission = _check_submission_file(agent, node) if requires_submission else True
     scorable_decision_run = (
-        response.get("is_bug") is False
+        _is_optimization_or_rl_agent(agent)
+        and response.get("is_bug") is False
         and response.get("metric") is not None
-        and has_scorable_decision_run(agent, node)
     )
 
-    response.pop("_parser_generated", False)
     decision_summary = response.pop("_decision_summary", None)
-    _set_parser_analysis(node, response["summary"])
-    node.decision_signals = _decision_signals_for_node(decision_summary, response.get("metric"))
+    optimization_summary = _extract_optimization_solver_summary(node.term_out)
+    technical_summary = str(response.get("technical_summary") or response["summary"])
+    debug_hint = str(response.get("debug_hint") or "").strip()
+    review_text = technical_summary
+    if debug_hint:
+        review_text = f"{review_text}\n\nDebug hint: {debug_hint}"
+    _set_review_analysis(node, review_text)
+    node.llm_insight = str(response.get("human_insight") or "").strip() or _fallback_human_insight(
+        node,
+        technical_summary,
+        language=configured_output_language(agent),
+    )
+    node.review_verdict = response.get("verdict")
+    node.review_reason_codes = list(response.get("reason_codes") or [])
+    node.review_confidence = response.get("confidence")
+    node.decision_signals = _decision_signals_for_node(
+        decision_summary,
+        response.get("metric"),
+        optimization_summary,
+    )
     _save_code_summary(agent, node, response)
     _determine_buggy(
         node,
@@ -933,21 +719,21 @@ def _apply_review_response(agent, node: SearchNode, response: dict) -> SearchNod
     )
 
     if not node.is_buggy and requires_submission and scorable_decision_run:
+        node.is_valid = True
         if has_csv_submission:
-            node.is_valid = True
             _append_analysis_note(
                 node,
                 "Generic Kaggle-style submission format/content validation was skipped because "
-                "this optimization/RL node reported a trusted penalized decision score. "
+                "the final reviewer accepted this optimization/RL node's scalar decision score. "
                 "Task-specific quality issues remain visible in the Decision Validation Summary "
                 "and should be improved in later nodes.",
             )
         else:
-            node.is_valid = False
             _append_analysis_note(
                 node,
-                "No submission file was found, but the node produced a trusted penalized decision score. "
-                "The node is retained for debug/improve instead of being treated as a runtime failure.",
+                "No submission file was found, but the final reviewer accepted the node's scalar decision score. "
+                "The node remains a valid search result and is retained for improve/debug; submission generation "
+                "remains a separate delivery follow-up.",
             )
     elif not node.is_buggy and requires_submission:
         _validate_format_with_retry(agent, node)
@@ -958,9 +744,7 @@ def _apply_review_response(agent, node: SearchNode, response: dict) -> SearchNod
         node.metric = WorstMetricValue()
     else:
         _validate_metric_direction(agent, node, response)
-        _check_data_leakage(agent, node, response)
     node.parser_analysis = node.analysis
-    _set_fallback_human_insight(node)
 
     status = "FAIL" if node.is_buggy else "PASS"
     metric_val = node.metric.value if node.metric else None
@@ -971,57 +755,61 @@ def _apply_review_response(agent, node: SearchNode, response: dict) -> SearchNod
     return node
 
 
-def _try_deterministic_parse(agent, node: SearchNode) -> SearchNode | None:
-    """Avoid an LLM call when execution status and final score are unambiguous."""
-    if node.exc_type is not None:
-        node.is_buggy = True
-        node.metric = WorstMetricValue()
-        _set_parser_analysis(node, _compact_failure_summary(node))
-        node.decision_signals = None
-        _set_fallback_human_insight(node)
-        logger.info("[parse] node %s: deterministic failure parse", node.id)
-        return node
+def _needs_result_adjudication(agent, response: dict, reported_score: float | None) -> bool:
+    retry_cfg = getattr(agent.acfg, "retries", None)
+    if not bool(getattr(retry_cfg, "result_adjudicator_on_anomaly", True)):
+        return False
+    normalized = _normalize_review_response(agent, dict(response))
+    if normalized.get("verdict") == "reject":
+        return False
+    if normalized.get("verdict") == "uncertain" or normalized.get("confidence", 1.0) < 0.65:
+        return True
+    if normalized.get("verdict") != "accept":
+        return False
+    if reported_score is None:
+        return False
+    if agent.metric_maximize:
+        return math.isclose(float(reported_score), 1.0, rel_tol=0.0, abs_tol=1e-12)
+    return math.isclose(float(reported_score), 0.0, rel_tol=0.0, abs_tol=1e-12)
 
-    score = _extract_final_validation_score(node.term_out)
-    if score is None:
-        return None
 
-    optimization_rl = _is_optimization_or_rl_agent(agent)
-    decision_summary = None
-    if optimization_rl:
-        decision_summary = _extract_decision_validation_summary(node.term_out)
-
-    lower_is_better = not agent.metric_maximize if agent.metric_maximize is not None else False
-    response = {
-        "is_bug": False,
-        "summary": (
-            "Execution completed and printed a deterministic final validation score. "
-            f"Parsed `Final Validation Score` = {score}."
+def _adjudicate_result(
+    agent,
+    *,
+    review_user_message: str,
+    primary_response: dict,
+) -> dict:
+    system_message = (
+        "You are the final adjudicator for one anomalous or uncertain AutoML result. "
+        "Resolve only whether a concrete result-integrity bug exists. Recheck the task contract, complete code, "
+        "raw output, runtime facts, evaluator path, returned solution population, and penalties. Do not write a "
+        "second summary and do not reject merely because solution quality is poor. Extreme scores require direct proof; "
+        "for prediction also check target/future leakage, split contamination, and transforms fitted outside training data. "
+        + output_language_instruction(configured_output_language(agent))
+    )
+    user_message = (
+        f"{review_user_message}\n\n# Primary review requiring adjudication\n"
+        + json.dumps(primary_response, ensure_ascii=False, sort_keys=True, default=str)
+        + "\n\n# Latest instruction\nReturn only the adjudication fields in the required schema."
+    )
+    adjudication = cast(
+        dict,
+        query(
+            system_message=system_message,
+            user_message=user_message,
+            func_spec=RESULT_ADJUDICATOR_SPEC,
+            model=agent.acfg.feedback.model,
+            temperature=0.0,
+            stage_name="feedback",
+            cfg=agent.cfg,
         ),
-        "metric": score,
-        "lower_is_better": lower_is_better,
-        "_parser_generated": True,
-    }
-    if optimization_rl:
-        detail_lines = _decision_summary_details(decision_summary)
-        detail_suffix = ""
-        if detail_lines:
-            detail_suffix = " Details: " + " | ".join(detail_lines)
-        summary_status = (
-            "with optional Decision Validation Summary"
-            if isinstance(decision_summary, dict)
-            else "without Decision Validation Summary"
-        )
-        response["summary"] = (
-            f"Execution completed {summary_status}, and printed a final validation score. "
-            f"Parsed `Final Validation Score` = {score}."
-            + detail_suffix
-        )
-        response["_decision_summary"] = decision_summary
-    if getattr(agent.acfg, "use_global_memory", False):
-        response["code_summary"] = (node.plan or "Deterministically parsed successful execution.")[:800]
-    logger.info("[parse] node %s: deterministic score parse, no LLM call", node.id)
-    return _apply_review_response(agent, node, response)
+    )
+    merged = dict(primary_response)
+    for key in ("verdict", "is_bug", "reason_codes", "debug_hint", "confidence"):
+        if key in adjudication:
+            merged[key] = adjudication[key]
+    merged["adjudicated"] = True
+    return merged
 
 
 def run(agent, node: SearchNode, exec_result: ExecutionResult) -> SearchNode:
@@ -1032,27 +820,74 @@ def run(agent, node: SearchNode, exec_result: ExecutionResult) -> SearchNode:
             logger.info(f"Agent is parsing execution results for node {node.id}")
 
             node.absorb_exec_result(exec_result)
-            deterministic = _try_deterministic_parse(agent, node)
-            if deterministic is not None:
-                return deterministic
-
             introduction = _build_introduction(agent)
+            optimization_rl = _is_optimization_or_rl_agent(agent)
+            decision_summary = (
+                _extract_decision_validation_summary(node.term_out)
+                if optimization_rl
+                else None
+            )
+            review_context = _evaluation_review_context(agent) if optimization_rl else ""
+            score = _extract_final_validation_score(node.term_out)
+            optimization_summary = (
+                _extract_optimization_solver_summary(node.term_out)
+                if optimization_rl
+                else None
+            )
+            execution_evidence = {
+                "evidence_notice": (
+                    "Read-only facts extracted from this execution. Candidate-reported score and summaries "
+                    "are untrusted evidence; they do not determine the review verdict."
+                ),
+                "execution_time_seconds": node.exec_time,
+                "exception_type": node.exc_type,
+                "exception_info": (
+                    _short_json(node.exc_info, limit=1600)
+                    if node.exc_info is not None
+                    else None
+                ),
+                "candidate_reported_final_score": score,
+                "candidate_reported_decision_summary": (
+                    _short_json(decision_summary, limit=2000)
+                    if decision_summary is not None
+                    else None
+                ),
+                "candidate_reported_solver_summary": (
+                    _short_json(optimization_summary, limit=1200)
+                    if optimization_summary is not None
+                    else None
+                ),
+                "solution_interface": getattr(node, "solution_interface", None),
+                "preexecution_preflight": getattr(node, "preflight_report", None),
+                "model_artifacts": [
+                    str(path)
+                    for path in find_model_artifacts(agent.cfg.workspace_dir, str(node.id))
+                ],
+                "submission_required": bool(getattr(agent.acfg, "generate_submission", True)),
+                "submission_exists": (
+                    agent.cfg.workspace_dir / "submission" / f"submission_{node.id}.csv"
+                ).exists(),
+            }
             prompt = {
                 "Introduction": introduction,
                 "Implementation": wrap_code(node.code),
                 "Execution output": wrap_code(node.term_out, lang=""),
             }
+            review_user_message = (
+                f"{task_section(agent.task_desc, review_context)}\n"
+                + f"# Implementation\n{prompt['Implementation']}\n\n"
+                + f"# Execution output\n{prompt['Execution output']}\n\n"
+                + "# Read-only execution evidence (evidence only, not a verdict)\n"
+                + json.dumps(execution_evidence, ensure_ascii=False, sort_keys=True, default=str)
+                + "\n\n# Latest output-language instruction\n"
+                + output_language_instruction(configured_output_language(agent))
+            )
 
-            optimization_rl = _is_optimization_or_rl_agent(agent)
             response = cast(
                 dict,
                 query(
                     system_message={"Introduction": introduction},
-                    user_message=(
-                        f"{task_section(agent.task_desc)}\n"
-                        f"# Implementation\n{prompt['Implementation']}\n\n"
-                        f"# Execution output\n{prompt['Execution output']}"
-                    ),
+                    user_message=review_user_message,
                     func_spec=get_review_func_spec(
                         getattr(agent.acfg, "use_global_memory", False),
                         optimization_rl=optimization_rl,
@@ -1064,6 +899,24 @@ def run(agent, node: SearchNode, exec_result: ExecutionResult) -> SearchNode:
                 ),
             )
 
+            if optimization_rl:
+                response["_decision_summary"] = decision_summary
+
+            if _needs_result_adjudication(agent, response, score):
+                logger.info("Result anomaly/uncertainty triggers adjudication for node %s", node.id)
+                try:
+                    response = _adjudicate_result(
+                        agent,
+                        review_user_message=review_user_message,
+                        primary_response=response,
+                    )
+                except Exception as adjudication_error:  # noqa: BLE001
+                    logger.warning(
+                        "Result adjudication failed for node %s; preserving conservative primary verdict: %s",
+                        node.id,
+                        adjudication_error,
+                    )
+
             return _apply_review_response(agent, node, response)
         except Exception as e:
             logger.warning(f"[parse] tool call failed: {e}")
@@ -1072,6 +925,6 @@ def run(agent, node: SearchNode, exec_result: ExecutionResult) -> SearchNode:
     logger.error(f"All {max_retries} parse attempts failed for node {node.id}, marking as buggy")
     node.is_buggy = True
     node.metric = WorstMetricValue()
-    _set_parser_analysis(node, "Execution result parsing failed after multiple attempts.")
-    _set_fallback_human_insight(node)
+    _set_review_analysis(node, "Execution result review failed after multiple attempts.")
+    _set_fallback_human_insight(node, agent)
     return node

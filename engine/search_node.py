@@ -50,6 +50,25 @@ class SearchNode(DataClassJsonMixin):
     metric: MetricValue = field(default=None, kw_only=True)  # type: ignore
     is_buggy: bool = field(default=None, kw_only=True)  # type: ignore
     is_valid: bool = field(default=None, kw_only=True)  # type: ignore
+    runtime_ok: bool = field(default=False, kw_only=True)
+    search_eligible: bool = field(default=False, kw_only=True)
+    score_recomputed: bool = field(default=False, kw_only=True)
+    contract_valid: bool = field(default=False, kw_only=True)
+    artifact_ready: bool = field(default=False, kw_only=True)
+    delivery_ready: bool = field(default=False, kw_only=True)
+    delivery_certified: bool = field(default=False, kw_only=True)
+    certification_source: str = field(default="", kw_only=True)
+    certification_notes: list[str] = field(default_factory=list, kw_only=True)
+    method_mode: str = field(default="unknown", kw_only=True)
+    method_family: str = field(default="unknown", kw_only=True)
+    sibling_ordinal: int | None = field(default=None, kw_only=True)
+    expansion_complexity: str = field(default="unknown", kw_only=True)
+    expansion_operator: str = field(default="unknown", kw_only=True)
+    solution_interface: str = field(default="", kw_only=True)
+    preflight_report: dict | None = field(default=None, kw_only=True)
+    review_verdict: str = field(default="", kw_only=True)
+    review_reason_codes: list[str] = field(default_factory=list, kw_only=True)
+    review_confidence: float | None = field(default=None, kw_only=True)
 
     # ---- search / MCTS ----
     stage: Literal["root", "improve", "debug", "draft", "fusion_draft", "evolution", "fusion"]
@@ -68,6 +87,7 @@ class SearchNode(DataClassJsonMixin):
         compare=False,
     )
     expected_child_count: int = field(default=0, kw_only=True)
+    next_sibling_ordinal: int = field(default=0, kw_only=True)
     finish_time: str = field(default=None, kw_only=True)
     created_time: str = field(default=None, kw_only=True)
 
@@ -83,7 +103,12 @@ class SearchNode(DataClassJsonMixin):
 
     def __post_init__(self) -> None:
         if self.parent is not None:
-            self.parent.children.add(self)
+            parent_lock = getattr(self.parent, "child_count_lock", None)
+            if parent_lock is None:
+                self.parent.children.add(self)
+            else:
+                with parent_lock:
+                    self.parent.children.add(self)
         if self.stage not in ["root", "improve", "debug", "draft", "fusion_draft", "evolution", "fusion"]:
             raise ValueError(f"Invalid stage: {self.stage}")
 
@@ -115,21 +140,20 @@ class SearchNode(DataClassJsonMixin):
 
     @property
     def analysis_for_prompt(self) -> str:
-        """Provider-friendly diagnostic context for downstream coding agents.
-
-        Keep deterministic parser facts authoritative, and include LLM insight
-        as interpretation rather than as the source of truth.
-        """
+        """Provider-friendly result-review context for downstream coding agents."""
         parts: list[str] = []
         parser_text = self.parser_analysis or self.analysis
         if parser_text:
-            parts.append(f"Parser diagnostics: {trim_long_string(str(parser_text), threshold=1800, k=900)}")
+            parts.append(f"Result review: {trim_long_string(str(parser_text), threshold=1800, k=900)}")
         if self.decision_signals:
             try:
                 signals = json.dumps(self.decision_signals, ensure_ascii=False, sort_keys=True)
             except TypeError:
                 signals = str(self.decision_signals)
-            parts.append(f"Decision signals: {trim_long_string(signals, threshold=1200, k=600)}")
+            parts.append(
+                "Result evidence (candidate-reported fields are untrusted): "
+                f"{trim_long_string(signals, threshold=1200, k=600)}"
+            )
         if self.llm_insight:
             parts.append(f"LLM insight: {trim_long_string(str(self.llm_insight), threshold=900, k=450)}")
         return "\n".join(parts) if parts else "N/A"
@@ -172,15 +196,29 @@ class SearchNode(DataClassJsonMixin):
         - N = parent_visits (number of visits to the parent node)
         - n = visits (number of visits to the current node)
         """
-        parent_visits: int | None = None
+        parent_visits = 1
+        parent_virtual_visits = 0
         if self.parent:
-            parent_visits = self.parent.visits
-        if self.visits == 0:
+            parent_virtual_visits = int(
+                getattr(self.parent, "virtual_visits", 0) or 0
+            )
+            parent_visits = max(
+                1,
+                int(self.parent.visits)
+                + parent_virtual_visits,
+            )
+        virtual_visits = int(getattr(self, "virtual_visits", 0) or 0)
+        effective_visits = int(self.visits) + virtual_visits
+        if effective_visits == 0:
             return float('inf')  # Unvisited nodes have the highest priority
-        exploitation = self.total_reward / self.visits
-        exploration = exploration_constant * (math.log(parent_visits) / self.visits) ** 0.5
-        self._uct = exploitation + exploration
-        return self._uct
+        exploitation = self.total_reward / effective_visits
+        exploration = exploration_constant * (
+            math.log(parent_visits) / effective_visits
+        ) ** 0.5
+        value = exploitation + exploration
+        if virtual_visits == 0 and parent_virtual_visits == 0:
+            self._uct = value
+        return value
 
     def reached_child_limit(self, scfg: SearchConfig, for_topk: bool = False) -> bool:
         """Whether this node has reached its child limit (draft/improve/debug). for_topk uses higher limit."""
@@ -190,7 +228,13 @@ class SearchNode(DataClassJsonMixin):
                 # expected_child_count includes in-flight children; estimate in-flight drafts
                 in_flight = max(0, self.expected_child_count - len(self.children))
                 regular_expected = regular_draft_count + in_flight
-                logger.info(f"[reached_child_limit] node {self.id} regular_draft_count={regular_draft_count}, in_flight={in_flight}, limit={scfg.num_drafts}")
+                logger.debug(
+                    "[reached_child_limit] node %s regular_draft_count=%s, in_flight=%s, limit=%s",
+                    self.id,
+                    regular_draft_count,
+                    in_flight,
+                    scfg.num_drafts,
+                )
                 return regular_expected >= scfg.num_drafts
             else:
                 if self.is_buggy:
@@ -209,6 +253,18 @@ class SearchNode(DataClassJsonMixin):
                         )
                         regular_expected += (self.expected_child_count - len(self.children))
                         return regular_expected >= scfg.num_improves
+
+    def reserve_sibling_ordinal(self) -> int:
+        """Atomically reserve a parent-local child ordinal for an in-flight action."""
+
+        with self.child_count_lock:
+            materialized = [
+                int(getattr(child, "sibling_ordinal", 0) or 0)
+                for child in self.children
+            ]
+            floor = max(materialized, default=0)
+            self.next_sibling_ordinal = max(int(self.next_sibling_ordinal or 0), floor) + 1
+            return self.next_sibling_ordinal
 
 
     def update(self, result, add=True):
@@ -484,18 +540,30 @@ class Journal(DataClassJsonMixin):
 
     @property
     def good_nodes(self) -> list[SearchNode]:
-        """Return a list of nodes that are not considered buggy by the agent."""
-        return [n for n in self.nodes if not n.is_buggy]
+        """Return finite-score nodes retained for continued search."""
+        return [n for n in self.nodes if n.search_eligible and n.metric and n.metric.value is not None]
+
+    @property
+    def delivery_nodes(self) -> list[SearchNode]:
+        """Compatibility alias for accepted finite-score nodes."""
+        return self.good_nodes
 
     def get_best_node(self, only_good=True) -> None | SearchNode:
-        """Return the best solution found so far (node with the highest validation metric)."""
+        """Return the best accepted finite-score solution found so far."""
         if only_good:
-            nodes = self.good_nodes
+            nodes = self.delivery_nodes
             if not nodes:
                 return None
         else:
-            nodes = self.nodes
+            nodes = [n for n in self.nodes if n.metric and n.metric.value is not None]
+            if not nodes:
+                return None
         return max(nodes, key=lambda n: n.metric)
+
+    def get_best_search_node(self) -> None | SearchNode:
+        """Return the best provisional node, including incomplete decision artifacts."""
+        nodes = self.good_nodes
+        return max(nodes, key=lambda n: n.metric) if nodes else None
 
 
 def get_path_to_node(journal: Journal, node_id: str) -> list[str]:

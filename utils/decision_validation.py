@@ -135,70 +135,48 @@ def extract_decision_validation_summary(text: str) -> dict | None:
 
 
 def decision_signal_summary(summary: dict | None) -> dict:
-    """Return compact generic decision-output signals for logs/prompts.
+    """Return compact candidate-reported signals for logs and reviewer prompts.
 
-    Keep this parser task-agnostic. Do not infer universal progress metrics
-    here. Task-specific diagnostics belong in score_components/reports and
-    should be passed through as evidence, not interpreted as system-level
-    checks.
+    This function only labels values found in candidate output. It deliberately
+    does not infer trust, validity, feasibility, or search eligibility.
     """
     if not isinstance(summary, dict):
         return {}
     score_components = summary.get("score_components")
     if not isinstance(score_components, dict):
         score_components = {}
-    signals = {
-        "trusted_score_source": trusted_decision_score_source(summary),
-    }
+    signals = {}
     score_source = summary.get("final_score_source")
     if score_source not in (None, "", [], {}):
-        signals["final_score_source"] = score_source
+        signals["reported_final_score_source"] = score_source
     if score_components:
-        signals["score_component_count"] = len(score_components)
-    for key in ("evaluator_self_tests_passed", "is_feasible"):
-        if key in summary:
-            signals[key] = summary.get(key)
+        signals["reported_score_component_count"] = len(score_components)
+    if "evaluator_self_tests_passed" in summary:
+        signals["reported_evaluator_self_tests_passed"] = summary.get(
+            "evaluator_self_tests_passed"
+        )
+    reported_feasible = _bool_from_keys(summary, ("is_feasible", "feasible"))
+    if reported_feasible is not None:
+        signals["reported_feasible"] = reported_feasible
+    reported_valid = _bool_from_keys(
+        summary,
+        ("contract_valid", "validation_passed", "is_valid", "valid"),
+    )
+    if reported_valid is not None:
+        signals["reported_valid"] = reported_valid
+    violations = summary.get("violations")
+    if isinstance(violations, (list, tuple, set)):
+        signals["reported_violation_count"] = len(violations)
+    elif violations not in (None, "", {}):
+        signals["reported_violation_count"] = 1
     return signals
 
 
-def trusted_decision_score_source(summary: dict | None) -> bool:
-    """Whether the reported decision score is grounded in a deterministic evaluator."""
-    if not isinstance(summary, dict):
-        return False
-    score_source = str(summary.get("final_score_source", "") or "").strip().lower()
-    score_components = summary.get("score_components")
-    if not isinstance(score_components, dict):
-        score_components = {}
-
-    trusted_source_markers = (
-        "score_solution",
-        "official",
-        "evaluation contract",
-        "autorealize",
-        "deterministic evaluator",
-    )
-    if any(marker in score_source for marker in trusted_source_markers):
-        return True
-
-    component_keys = {str(k).lower() for k in score_components}
-    if "total_penalized_cost" in score_source:
-        return True
-    if "total_penalty_score" in score_source or "penalty_score" in score_source:
-        return True
-    if "penalized" in score_source and ("cost" in score_source or "score" in score_source):
-        return True
-    if "penalty" in score_source and "score" in score_source:
-        return True
-    if any(k in component_keys for k in ("total_penalized_cost", "penalized_cost", "total_penalty_score", "penalty_score")):
-        return True
-    return False
-
-
-def decision_summary_defects(summary: dict | None) -> list[str]:
-    """Compatibility no-op: decision summaries are diagnostic, not blockers."""
-    return []
-
-
-def decision_summary_is_scorable(summary: dict | None) -> bool:
-    """Decision/RL acceptance is based on final score, not summary fields."""
-    return True
+def _bool_from_keys(summary: dict, keys: tuple[str, ...]) -> bool | None:
+    for key in keys:
+        if key not in summary:
+            continue
+        parsed = parse_bool_like(summary.get(key))
+        if parsed is not None:
+            return parsed
+    return None

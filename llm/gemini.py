@@ -216,12 +216,22 @@ def _stage_max_tokens(stage) -> int | None:
     return tokens if tokens > 0 else None
 
 
+def _stage_minimum_output_tokens(stage) -> int:
+    try:
+        tokens = int(getattr(stage, "minimum_output_tokens", 32768) or 0)
+    except (TypeError, ValueError):
+        tokens = 32768
+    return max(0, tokens)
+
+
 def _resolve_max_tokens(explicit_value, stage) -> int | None:
     try:
         explicit = int(explicit_value) if explicit_value is not None else 0
     except (TypeError, ValueError):
         explicit = 0
-    return explicit if explicit > 0 else _stage_max_tokens(stage)
+    requested = explicit if explicit > 0 else int(_stage_max_tokens(stage) or 0)
+    effective = max(requested, _stage_minimum_output_tokens(stage))
+    return effective or None
 
 
 def _stage_config_for_model(cfg: Config, model: str, stage_name: str | None = None):

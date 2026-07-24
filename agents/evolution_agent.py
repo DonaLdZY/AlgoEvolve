@@ -13,6 +13,7 @@ from agents.prompts import (
     ROBUSTNESS_GENERALIZATION_STRATEGY,
     prompt_resp_fmt,
     get_impl_guideline_from_agent,
+    infer_task_mode,
 )
 from agents.improve_agent import run as run_improve
 from agents.planner import run_planner, build_planner_task, build_planner_suffix, build_chat_prompt_for_model
@@ -20,6 +21,14 @@ from agents.coder import plan_and_code_query
 from agents.coder.diff_coder import diff_generate_and_apply
 from agents.triggers import register_node
 from agents.prompt_cache import dataset_reference_sentence, routed_data_context, task_section
+from agents.memory.optimization_experience import build_optimization_experience_for_agent
+from engine.expansion_profile import ExpansionProfile
+from agents.prompt_policy import (
+    autonomous_method_selection_guidance,
+    dynamic_expansion_instruction,
+    ensure_expansion_profile,
+    scoped_search_memory,
+)
 
 logger = logging.getLogger("MLEvolve")
 
@@ -41,8 +50,20 @@ def _get_branch_trajectory_for_evolution(parent_node: SearchNode) -> str:
     return f"Your Past Evolution trajectory:\n{trajectory}"
 
 
-def run(agent, parent_node: SearchNode) -> SearchNode:
+def run(
+    agent,
+    parent_node: SearchNode,
+    expansion_profile: ExpansionProfile | None = None,
+) -> SearchNode:
+    expansion_profile = ensure_expansion_profile(
+        agent, parent_node, expansion_profile, "evolution"
+    )
     branch_trajectory = _get_branch_trajectory_for_evolution(parent_node)
+    task_mode = infer_task_mode(
+        task_desc=getattr(agent, "task_desc", ""),
+        coldstart_description=getattr(agent, "coldstart_description", ""),
+        autorealize_context=getattr(agent, "data_preview", ""),
+    )
 
     if "Insufficient evolution history" in branch_trajectory or "No evolution history" in branch_trajectory or "No branch trajectory" in branch_trajectory:
         logger.info(f"Insufficient trajectory history for evolution, falling back to normal improve for node {parent_node.id}")
@@ -54,22 +75,41 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
         "For this you should first outline a brief plan in natural language for how the solution can be improved and "
         "then implement this improvement in Python based on the provided previous solution. "
     )
+    if task_mode == "optimization":
+        introduction = (
+            "You are an expert optimization researcher improving a decision solver from its branch trajectory. "
+            "Preserve the shared evaluator and working incumbent, identify why the current formulation or search has plateaued, "
+            "and implement one evidence-grounded improvement or hybrid extension."
+        )
 
+    scoped_memory = scoped_search_memory(agent, parent_node, "evolution")
+    expansion_control = dynamic_expansion_instruction(
+        agent, expansion_profile, operator="evolution"
+    )
     prompt: Any = {
         "Introduction": introduction,
         "Task description": agent.task_desc,
-        "Memory": parent_node.fetch_child_memory(),
+        "Memory": f"{scoped_memory}\n\n{expansion_control}",
         "Branch Evolution History": branch_trajectory,
         "Instructions": {},
     }
     prompt["Previous solution"] = {
         "Code": wrap_code(parent_node.code),
     }
+    prompt["Instructions"]["Method selection autonomy"] = autonomous_method_selection_guidance()
 
     success_patience, total_patience, branch_best_score = get_patience_counter(agent, parent_node)
     use_magnitude_prompt = (success_patience >= 2) or (total_patience >= 5)
 
-    if use_magnitude_prompt:
+    if use_magnitude_prompt and task_mode == "optimization":
+        prompt["Instructions"]["Optimization plateau strategy"] = [
+            "The optimization branch has plateaued. Diagnose the magnitude of change needed using trajectory evidence.",
+            "Tier 1: tune the existing solver, neighborhood, parameters, or incremental evaluation only when the formulation is sound and the gap is already small.",
+            "Tier 2: improve decomposition, candidate generation, repair, neighborhood structure, relaxation, bound tightening, variable pruning, or incumbent construction while preserving the main method family.",
+            "Tier 3: use a justified reformulation or hybrid extension, such as heuristic incumbent plus exact local optimization, when the current formulation has a structural ceiling.",
+            "Preserve the current best feasible artifact as an incumbent/upper bound. Do not claim global optimality unless a trustworthy bound closes the gap.",
+        ]
+    elif use_magnitude_prompt:
         trigger_reason = []
         if success_patience >= 2:
             trigger_reason.append(f"success_patience={success_patience}>=2")
@@ -135,7 +175,24 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
             "- Don't suggest to do EDA.\n",
         ],
     }
-    prompt["Instructions"] |= ROBUSTNESS_GENERALIZATION_STRATEGY
+    if task_mode == "optimization":
+        optimization_experience = build_optimization_experience_for_agent(
+            agent,
+            task_mode=task_mode,
+            extra_context="\n".join(
+                [
+                    branch_trajectory,
+                    str(parent_node.analysis_for_prompt or ""),
+                ]
+            ),
+        )
+        prompt["Instructions"]["Conditional optimization experience for evolution"] = [
+            "Use the retrieved trajectory only if its structural triggers match this task and the branch evidence supports the change.",
+            "Prefer an atomic evolution step that can be compared against the parent while preserving evaluator replay and the incumbent.",
+            optimization_experience,
+        ]
+    elif task_mode == "prediction":
+        prompt["Instructions"] |= ROBUSTNESS_GENERALIZATION_STRATEGY
     prompt["Instructions"] |= get_impl_guideline_from_agent(agent)
     output = wrap_code(parent_node.term_out, lang="")
 

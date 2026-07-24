@@ -54,12 +54,117 @@ pretrain_model_dir: ""
 # Generated-code execution / 生成代码执行
 exec:
   # Per-node code execution timeout seconds / 单节点代码执行超时秒数
-  timeout: 32400
+  timeout: 1800
   # Base generated-script filename / 生成脚本基础文件名
   agent_file_name: "runfile.py"
+  # Recover an exact ModuleNotFoundError into this task's isolated package directory / 精确缺库时安装到当前任务的隔离包目录并立即重跑
+  auto_install_missing_dependencies: true
+  # ai_declared accepts one safe PyPI distribution chosen by the LLM; allowlist is the optional strict mode / ai_declared 允许模型选择单个 PyPI 包；allowlist 为可选严格模式
+  dependency_install_policy: "ai_declared"
+  # Empty uses <log_dir>/python_packages; AutoDecision injects runs/<task>/automl/python_packages / 留空使用当前 run 目录，AutoDecision 会注入任务级目录
+  dependency_install_target_path: ""
+  # Timeout for one pip installation / 单次 pip 安装超时秒数
+  dependency_install_timeout_seconds: 600
+  # Maximum wait for another AutoML task using pip in the same Python environment / 等待同一 Python 环境内其它任务完成 pip 的最长秒数
+  dependency_install_lock_timeout_seconds: 900
+  # Maximum distinct packages installed for one node execution / 单节点执行最多自动安装的不同包数
+  dependency_install_max_packages_per_execution: 3
+  # Captured pip stdout/stderr tail per installation / 每次安装记录的 pip 输出尾部字符数
+  dependency_install_output_tail_chars: 8000
+  # Used only when dependency_install_policy=allowlist / 仅在严格白名单模式下生效
+  dependency_install_allowlist:
+    - ortools
+    - pulp
+    - cvxpy
+    - pyomo
+    - highspy
+    - gymnasium
+    - stable-baselines3
+    - sb3-contrib
+    - lightgbm
+    - xgboost
+    - catboost
+    - optuna
+    - scikit-learn
+    - scikit-optimize
+    - imbalanced-learn
+    - bayesian-optimization
+    - polars
+    - pyarrow
+    - openpyxl
+    - pillow
+    - opencv-python
+    - pyyaml
+    - python-dateutil
+    - beautifulsoup4
+    - networkx
+    - rapidfuzz
+  # Import root -> pip distribution mapping / import 根模块到 pip distribution 的映射
+  dependency_import_map:
+    ortools: ortools
+    pulp: pulp
+    cvxpy: cvxpy
+    pyomo: pyomo
+    highspy: highspy
+    gymnasium: gymnasium
+    stable_baselines3: stable-baselines3
+    sb3_contrib: sb3-contrib
+    lightgbm: lightgbm
+    xgboost: xgboost
+    catboost: catboost
+    optuna: optuna
+    sklearn: scikit-learn
+    skopt: scikit-optimize
+    imblearn: imbalanced-learn
+    bayes_opt: bayesian-optimization
+    polars: polars
+    pyarrow: pyarrow
+    openpyxl: openpyxl
+    PIL: pillow
+    cv2: opencv-python
+    yaml: pyyaml
+    dateutil: python-dateutil
+    bs4: beautifulsoup4
+    networkx: networkx
+    rapidfuzz: rapidfuzz
+  # Trusted version bounds override an LLM-declared version / 可信版本范围覆盖 LLM 声明的版本
+  dependency_package_specs:
+    ortools: "ortools>=9.9.0,<10"
+    pulp: "PuLP>=2.8.0,<4"
+    cvxpy: "cvxpy>=1.5.0,<2"
+    pyomo: "pyomo>=6.7.0,<7"
+    highspy: "highspy>=1.7.0,<2"
+    gymnasium: "gymnasium>=0.29.0,<2"
+    stable-baselines3: "stable-baselines3>=2.3.0,<3"
+    sb3-contrib: "sb3-contrib>=2.3.0,<3"
+    lightgbm: "lightgbm>=4.3.0,<5"
+    xgboost: "xgboost>=2.0.0,<4"
+    catboost: "catboost>=1.2.0,<2"
+    optuna: "optuna>=3.6.0,<5"
+    scikit-learn: "scikit-learn>=1.4.0,<2"
+    scikit-optimize: "scikit-optimize>=0.10.0,<1"
+    imbalanced-learn: "imbalanced-learn>=0.12.0,<1"
+    bayesian-optimization: "bayesian-optimization>=1.4.0,<4"
+    polars: "polars>=0.20.0,<2"
+    pyarrow: "pyarrow>=15.0.0,<30"
+    openpyxl: "openpyxl>=3.1.2,<4"
+    pillow: "Pillow>=10.3.0,<13"
+    opencv-python: "opencv-python>=4.9.0,<5"
+    pyyaml: "PyYAML>=6.0.1,<7"
+    python-dateutil: "python-dateutil>=2.9.0,<3"
+    beautifulsoup4: "beautifulsoup4>=4.12.0,<5"
+    networkx: "networkx>=3.2.0,<4"
+    rapidfuzz: "RapidFuzz>=3.6.0,<4"
+  dependency_install_log_filename: "dependency_installations.jsonl"
+  dependency_install_summary_filename: "dependency_installations_summary.json"
+  # Filled by AutoDecision per task; direct MLEvolve users may set absolute paths / AutoDecision 按任务填写，独立运行也可指定绝对路径
+  dependency_install_central_log_path: ""
+  dependency_install_central_summary_path: ""
 
 # Agent models, drafts, memory, and search / Agent 模型、草稿、记忆与搜索
 agent:
+  # Language for model-authored plans, reviews, debug hints, summaries, and UI insight: english|chinese
+  output_language: "english"
   # Maximum search nodes/steps / 最大搜索节点或步数
   steps: 50
   # Whole-search wall-clock limit seconds / 整体搜索时限秒数
@@ -79,7 +184,7 @@ agent:
     model: "deepseek-v4-pro"
     # Coding-model temperature / 编码模型温度
     temp: 1.0
-    # OpenAI-compatible endpoint / OpenAI 兼容地址
+    # DeepSeek beta enables assistant-prefix completion / DeepSeek beta 用于 assistant 前缀续写
     base_url: "https://api.deepseek.com/beta"
     # Non-empty config wins; empty reads MLEVOLVE_CODE_API_KEY or DEEPSEEK_API_KEY / 配置非空优先；留空读取环境变量
     api_key: ""
@@ -87,8 +192,10 @@ agent:
     enable_thinking: null
     # null|low|medium|high|xhigh|max / 思考强度
     reasoning_effort: null
-    # null/0 lets provider choose / null/0 由服务商决定输出上限
-    max_tokens: null
+    # Every normal request is raised to at least this output cap / 正常业务请求的输出 token 下限
+    minimum_output_tokens: 32768
+    # Coding output token cap / 编码输出 token 上限
+    max_tokens: 32768
     # Per-request HTTP timeout seconds / 单次 HTTP 请求超时秒数
     request_timeout_seconds: 1200.0
     # Retryable network-call attempts / 可重试网络错误的最大尝试次数
@@ -105,6 +212,8 @@ agent:
     continuation_max_rounds: 2
     # Character window used to remove repeated continuation overlap / 续写去重扫描字符窗口
     continuation_overlap_scan_chars: 4096
+    # Provider/model context window used for local headroom accounting; 0 means unknown
+    context_window_tokens: 131072
 
   # Feedback/review model / 反馈与评审模型
   feedback:
@@ -112,7 +221,7 @@ agent:
     model: "deepseek-v4-pro"
     # Feedback-model temperature / 反馈模型温度
     temp: 1.0
-    # OpenAI-compatible endpoint / OpenAI 兼容地址
+    # DeepSeek beta enables assistant-prefix completion / DeepSeek beta 用于 assistant 前缀续写
     base_url: "https://api.deepseek.com/beta"
     # Non-empty config wins; empty reads MLEVOLVE_FEEDBACK_API_KEY or DEEPSEEK_API_KEY / 配置非空优先；留空读取环境变量
     api_key: ""
@@ -120,8 +229,10 @@ agent:
     enable_thinking: null
     # null|low|medium|high|xhigh|max / 思考强度
     reasoning_effort: null
-    # null/0 lets provider choose / null/0 由服务商决定输出上限
-    max_tokens: null
+    # Every normal request is raised to at least this output cap / 正常业务请求的输出 token 下限
+    minimum_output_tokens: 32768
+    # Feedback output token cap / 反馈输出 token 上限
+    max_tokens: 32768
     # Per-request HTTP timeout seconds / 单次 HTTP 请求超时秒数
     request_timeout_seconds: 1200.0
     # Retryable network-call attempts / 可重试网络错误的最大尝试次数
@@ -138,6 +249,8 @@ agent:
     continuation_max_rounds: 2
     # Character window used to remove repeated continuation overlap / 续写去重扫描字符窗口
     continuation_overlap_scan_chars: 4096
+    # Provider/model context window used for local headroom accounting; 0 means unknown
+    context_window_tokens: 131072
 
   # Check generated code for data leakage / 是否检查数据泄漏
   check_data_leakage: true
@@ -148,21 +261,39 @@ agent:
   draft:
     # First draft uses one LLM code call / 第一个草稿是否使用单次快速生成
     fast_first_draft: true
+    # Run first, then review only when runtime evidence requires it / 首稿先运行，只有运行证据需要时才评审
+    fast_first_draft_skip_pre_review: true
+    # Deprecated compatibility field; used only by the legacy coupled scheduler / 兼容旧配置；仅旧版耦合调度器使用
+    fast_first_draft_max_repairs: 2
+    # Deprecated compatibility field; full context is always used / 兼容旧配置；当前始终使用完整上下文
+    fast_first_draft_compact_context: false
     # Later drafts use staged generation / 后续草稿是否使用 stepwise
     use_stepwise_after_first: true
-    # Cap initial drafts for optimization/RL; 0 disables cap / 优化/RL 初始草稿上限；0 不限制
-    optimization_initial_drafts_cap: 1
     # Write gray pending draft nodes for frontend / 是否为前端写出灰色生成中节点
     show_pending_draft_nodes: true
-    # Delay between deferred draft submissions / 草稿执行提交间隔秒数
+    # Deprecated compatibility field; used only by the legacy coupled scheduler / 兼容旧配置；仅旧版耦合调度器使用
     submission_stagger_seconds: 10.0
-    # Route AutoRealize sections to only the step that needs them / 按 step 路由 AutoRealize 章节，避免每步重复全量上下文
-    stepwise_stage_context: true
+    # Deprecated compatibility field; full context is always used / 兼容旧配置；当前始终使用完整上下文
+    stepwise_stage_context: false
+    # Append each step to one provider-cache-friendly conversation / 将每一步追加到同一条利于 provider 缓存的会话
+    stepwise_accumulate_context: true
+    # Compact older dynamic turns after the estimated prompt reaches this token budget / 估算输入达到该 token 预算后压缩较早动态轮次
+    stepwise_context_max_tokens: 90000
+    # Keep this many latest step turns verbatim when compacting / 压缩时保留最近若干步骤原文
+    stepwise_compaction_keep_recent_steps: 2
+    # Maximum output tokens for one history compaction call / 单次历史压缩调用最大输出 token
+    stepwise_compaction_max_tokens: 32768
+    # Compact before the context window is full; preserves output/reasoning headroom
+    stepwise_context_headroom_ratio: 0.15
+    # Exact older turns are stored here before lossy compaction
+    stepwise_snapshot_dirname: "context_snapshots"
 
   # Agent-level review and structured-output retries / Agent 评审与结构化输出重试
   retries:
     # Maximum role-level review attempts; network retries are handled separately / 审查模型角色级最大尝试次数，网络重试单独处理
     code_review_max_attempts: 2
+    # Full same-node regenerations after deterministic preflight still rejects review patches / 确定性预检查仍拒绝补丁后，同节点整稿重生次数
+    preflight_regeneration_max_attempts: 2
     # Delay before repeated code review / 代码审查重试等待秒数
     code_review_delay_seconds: 5.0
     # feedback is faster; code uses the main coding model / feedback 更快，code 使用主编码模型
@@ -171,8 +302,6 @@ agent:
     code_review_escalate_to_code: true
     # Full code-generation attempts after extraction failure / 无法提取有效代码时的完整重新生成次数
     code_generation_extract_max_attempts: 2
-    # Generate UI prose insight in background after parser facts are ready / parser 事实就绪后在后台生成前端 insight
-    human_insight_async: true
     # Metric-direction inference attempts / 指标方向判断最大尝试次数
     metric_direction_max_attempts: 3
     # Metric-direction retry delay / 指标方向判断重试等待秒数
@@ -181,6 +310,8 @@ agent:
     result_parse_max_attempts: 3
     # Memory planner structured-output attempts / 记忆规划器结构化输出最大尝试次数
     refine_plan_max_attempts: 3
+    # Ask a second reviewer only for extreme or uncertain results
+    result_adjudicator_on_anomaly: true
 
   # Probability of fusion instead of branch evolution / 停滞时选择融合而非分支演化的概率
   fusion_vs_evolution_prob: 0.3
@@ -206,9 +337,20 @@ agent:
   # Hugging Face model or local path / 本地向量模型名称或路径
   memory_embedding_model_path: "BAAI/bge-base-en-v1.5"
 
+  # Enable deterministic optimization-method experience retrieval / 是否启用确定性的优化方法经验检索
+  use_optimization_experience_library: true
+  # Empty uses agents/memory/optimization_experiences.yaml; relative paths resolve from the MLEvolve project / 留空使用内置经验库；相对路径从 MLEvolve 项目解析
+  optimization_experience_library_path: ""
+  # Maximum full experience cards injected into one optimization prompt / 单次优化提示词最多注入的完整经验卡数量
+  optimization_experience_max_cards: 2
+  # Minimum deterministic trigger score; unmatched tasks receive only the compact index / 确定性触发最低分；未命中任务仅接收紧凑索引
+  optimization_experience_min_score: 3.0
+  # Maximum characters for index plus retrieved cards / 经验索引与命中卡片的最大字符数
+  optimization_experience_max_chars: 6000
+
   # Search-tree policy and budgets / 搜索树策略与预算
   search:
-    # Concurrent search/execution slots / 并行搜索与执行数量
+    # Parallel closed-loop workers; each owns generation, execution, and review / 并行闭环 Worker；每个 Worker 完整负责生成、执行与评审
     parallel_search_num: 4
     # GPUs available to generated solutions / 可用 GPU 数
     num_gpus: 1
@@ -278,6 +420,10 @@ agent:
     fusion_min_successful_nodes: 2
     # Independent branches required before fusion / 融合所需独立分支数
     fusion_min_branches: 2
+    # Once forced drafts exist, a new root draft competes with deeper UCT expansion
+    root_new_draft_probability: 0.25
+    # Fusion must leave enough time to generate and execute the child
+    fusion_min_remaining_seconds: 300
 
   # Exploration decay schedule / 探索衰减策略
   decay:
@@ -313,12 +459,16 @@ init_solution:
 runtime:
   # Resume an existing run directory / 是否继续已有任务
   resume_run: false
+  # Resume budget semantics: total keeps cumulative targets; additional appends fresh budget / 恢复预算语义：total 保留累计目标，additional 追加新预算
+  resume_budget_mode: "total"
   # Explicit timestamp; empty uses current time / 显式运行时间戳；空值使用当前时间
   run_timestamp: ""
   # Remove an empty workspace when startup fails / 启动前失败时是否清理空工作区
   cleanup_empty_workspace_on_exit: true
   # Exit immediately after timed-out artifacts are saved / 超时保存产物后是否立即退出进程
   force_process_exit_on_timeout: true
+  # Exit the whole MLEvolve process after the minimal resumable interrupt checkpoint is durable / 最小可恢复中断检查点落盘后立即退出整个 MLEvolve 进程
+  exit_immediately_after_interrupt_checkpoint: true
   # Write pending draft state / 是否写出生成中草稿状态
   write_pending_nodes: true
   # Pending-node state filename / 生成中节点状态文件名
@@ -331,10 +481,27 @@ runtime:
   state_write_retry_delay_seconds: 0.05
   # Scheduler completion polling interval / 调度器轮询间隔秒数
   scheduler_poll_seconds: 1.0
+  # Persist cumulative search time, RNG state, and in-flight actions / 持久化累计搜索时间、随机状态和未完成动作
+  save_search_state: true
+  # Durable search runtime state filename / 搜索运行态文件名
+  search_state_filename: "search_state.json"
+  # Periodic runtime checkpoint interval / 搜索运行态定期检查点间隔秒数
+  search_state_checkpoint_seconds: 5.0
+  # Resumable checkpoint and Top-K artifact index / 可恢复检查点与 Top-K 产物索引
+  checkpoint_manifest_filename: "checkpoint_manifest.json"
+  # Resume scheduled/generated/executing actions / 恢复已调度、已生成或执行中的动作
+  restore_inflight_actions: true
+  # Restore Python RNG state while still applying the new YAML config / 恢复 Python 随机状态，但继续应用新的 YAML 配置
+  restore_random_state: true
   # Extra service wait after configured time limit / 搜索时限后的服务等待缓冲秒数
+  # Service watchdog allowance before the search clock starts / 搜索计时开始前的服务准备宽限秒数
+  service_startup_buffer_seconds: 1800
+  # Time allowed to persist artifacts after the search clock expires / 搜索到时后保存产物的宽限秒数
   graceful_shutdown_buffer_seconds: 600
   # Graceful termination wait before kill / 强制终止前等待秒数
   termination_wait_seconds: 20
+  # Failure fallback while polling for a durable interrupt checkpoint; successful stops return much sooner / 轮询中断检查点失败时的兜底等待，正常情况会更快结束
+  interruption_checkpoint_wait_seconds: 30
   # Maximum full-journal size loaded by frontend snapshot / 前端快照加载完整 journal 的最大字节数
   snapshot_journal_max_bytes: 157286400
   # Log events returned per snapshot / 每次快照返回的日志事件数
@@ -368,5 +535,11 @@ logging:
   brief_log_filename: "MLEvolve.log"
   # Detailed log filename / 详细日志文件名
   verbose_log_filename: "MLEvolve.verbose.log"
+  # Maximum bytes per compact log file; 0 disables rotation / 单个简略日志最大字节数，0 表示不轮转
+  brief_log_max_bytes: 67108864
+  # Maximum bytes per detailed log file; 0 disables rotation / 单个详细日志最大字节数，0 表示不轮转
+  verbose_log_max_bytes: 268435456
+  # Number of rotated files retained for each log / 每类日志保留的轮转备份数
+  log_backup_count: 2
   # Reduce HTTP client noise / 是否压低 HTTP 客户端日志
   suppress_httpx_logs: true

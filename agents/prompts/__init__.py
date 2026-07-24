@@ -8,6 +8,7 @@ from .shared import (
     prompt_resp_fmt,
     plan_and_code_response_format,
     get_internet_clarification,
+    infer_task_mode,
     is_optimization_or_rl_task,
 )
 from .environment import get_prompt_environment
@@ -21,6 +22,7 @@ __all__ = [
     "prompt_resp_fmt",
     "plan_and_code_response_format",
     "get_internet_clarification",
+    "infer_task_mode",
     "is_optimization_or_rl_task",
     "get_prompt_environment",
     "get_impl_guideline",

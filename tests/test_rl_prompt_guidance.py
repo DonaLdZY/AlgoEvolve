@@ -21,7 +21,11 @@ def test_rl_stepwise_prompt_has_diagnostics_without_internal_baseline():
     assert "Env Smoke Trace" in stepwise
     assert "Method Usage Summary" in stepwise
     assert "unused_rl_scaffold" in stepwise
-    assert "curriculum/subproblem schedules" in stepwise
+    assert "Curriculum Plan" in stepwise
+    assert "small to full instances" in stepwise
+    assert "mask.any()" in shared
+    assert "all-invalid mask" in shared
+    assert "original full-scale environment" in shared
     assert "城市配送" not in combined
     assert "承运商" not in combined
 
@@ -32,6 +36,8 @@ def test_rl_review_prompt_flags_unused_rl_scaffolds_without_task_specific_gates(
     assert "unused RL scaffolds" in review
     assert "saved policy artifact" in review
     assert "final evaluated rollout" in review
+    assert "all-invalid mask" in review
+    assert "curriculum learning" in review
     assert "coverage_ok" not in review
     assert "hard_violations" not in review
     assert "baseline gap" not in review.lower()

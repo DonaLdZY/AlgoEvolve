@@ -28,6 +28,13 @@ def get_impl_guideline_from_agent(agent):
         pretrain_model_dir=getattr(agent.cfg, "pretrain_model_dir", ""),
         generate_submission=getattr(agent.acfg, "generate_submission", True),
         optimization_rl=optimization_rl,
+        auto_install_missing_dependencies=bool(
+            getattr(
+                getattr(agent.cfg, "exec", None),
+                "auto_install_missing_dependencies",
+                False,
+            )
+        ),
     )
     guideline |= get_decision_solution_protocol(
         task_desc=getattr(agent, "task_desc", ""),
@@ -54,6 +61,7 @@ def get_impl_guideline(
     pretrain_model_dir: str = "",
     generate_submission: bool = True,
     optimization_rl: bool = False,
+    auto_install_missing_dependencies: bool = False,
 ) -> dict:
     """Build implementation guideline from time and config."""
     prediction_scope = (
@@ -67,6 +75,7 @@ def get_impl_guideline(
             "- EVERY reported decision, assignment, route, schedule, action, or output row must come from a real solver, policy, heuristic, or optimization procedure in the code.",
             "- Required functions: `load_problem_data(input_dir)`, `build_solution(data)`, `validate_solution(solution, data)`, `score_solution(solution, data)`, and `run_evaluator_self_tests(data)`.",
             "- If AutoRealize provides an Exact Source Schema Contract, use only exact physical sheet/column names for raw dataframe access. Business concepts and English variable names must be created after loading through an explicit mapping.",
+            "- If AutoRealize provides Executable Data Read Recipes, prefer those successful `pandas_kwargs` and immediately compare observed shape/columns with the recipe. The recipe is guidance rather than a host gate: change it only when runtime evidence requires the change, and print the mismatch diagnostic.",
             "- Implement a safe column resolver for business aliases: exact match first, then conservative alias/fuzzy matching against actual columns with diagnostics. Never access a column name that is absent from `df.columns`.",
             "- Before `groupby`, `agg`, merge, filter, or sort, resolve every business concept to an exact physical source column variable and use that variable in the pandas call. Semantic names may be created only as derived/code-local columns after exact source access.",
             "- Define the evaluation population before scoring. Missing date/time/feature values must not be silently dropped. If the AutoRealize/task contract defines a valid/evaluable subset or exclusion rule, apply it explicitly and report excluded counts/examples; otherwise use fallback fields, explicit defaults, or validation notes.",
@@ -81,7 +90,7 @@ def get_impl_guideline(
         metric_guideline = [
             "**5. Print Validation Metric with Decision Evidence**",
             "- You may print one JSON diagnostic line before the final score: `Decision Validation Summary: {...}`.",
-            "- For heuristic or rule-based solvers, `model_path` may be a null/ignored placeholder, but `predict(model_path, data)` must still exist as the reusable entrypoint.",
+            "- Use one finite decision interface: non-RL methods define `solve(model_path, data)` and may accept `model_path=None`; RL/hybrid methods define `train_policy(data, artifact_dir)` plus `rollout(model_path, data)` and load the saved policy without retraining.",
             "- If you print the JSON, include task-defined diagnostics that help later nodes improve; no specific diagnostic field is required for acceptance.",
             "- The JSON should also include task-relevant progress signals when meaningful, but do not invent universal progress or violation fields for tasks that do not define them.",
             "- If validation fails or the solution is partial/infeasible, include counts and examples using the task's own concepts: invalid actions, missing entities, duplicate IDs, violated constraints, infeasibility reasons, or other relevant diagnostics.",
@@ -156,6 +165,7 @@ def get_impl_guideline(
         "**0. AutoRealize Contract Priority**",
         "- If `./input/autorealize_context.md` exists, read and obey it before using generic assumptions.",
         "- Its data reading examples, output contract, evaluation contract, constraints, leakage guards, and single-scalar score definition override generic Kaggle templates and lightweight file previews.",
+        "- Prefer AutoRealize Executable Data Read Recipes when present, then verify observed shape and columns after loading. If runtime evidence conflicts, adapt explicitly and report the mismatch instead of silently continuing with a malformed table.",
         "- Do not invent submission columns, target fields, row-count rules, random seeds, distance matrices, or cost formulas when AutoRealize did not provide authority for them.",
         "- If AutoRealize context contains `Source Alias Guard`, every listed alias is unsafe for raw pandas access unless it gives `exact_physical_column`; do not use guarded aliases in `df[...]`, `groupby`, `merge(on=...)`, or `sheet_name`.",
         "",
@@ -168,6 +178,7 @@ def get_impl_guideline(
         "- For PyTorch, save `state_dict` plus required preprocessing/config metadata. For sklearn and boosting libraries, save the model pipeline or model plus preprocessing state.",
         "",
         "**4. Expose Reusable Inference API**",
+        "- MUST define `def train(data, artifact_dir): ...` to fit and save the prediction artifact.",
         "- MUST define `def predict(model_path, data): ...` in the final script.",
         "- `predict(model_path, data)` must load the saved artifact, apply the same preprocessing as validation/test, and return predictions, decisions, or the required solution without retraining.",
         "- Validation, test, and submission inference must use this function or the same internal inference routine. Do not retrain inside `predict`.",
@@ -175,13 +186,24 @@ def get_impl_guideline(
         *metric_guideline,
         directories_guideline,
         "",
-        f"**Packages & Internet**: numpy, pandas, sklearn, torch, transformers, timm, xgboost, and lightgbm are available. Remote model access may be available during development."
+        f"**Packages & Internet**: common data-science packages are normally available, but the configured AutoML Python environment and the actual import result are authoritative. Remote model access may be available during development."
         + (f" Offline models at `{pretrain_model_dir}`" if pretrain_model_dir else ""),
         "",
         "**API Compatibility**: use the installed LightGBM/XGBoost early-stopping APIs; for LightGBM prefer callbacks where required.",
         "- AdamW: use `from torch.optim import AdamW`, not deprecated transformer aliases.",
         "",
         "**Execution Guidelines**:",
+        *(
+            [
+                "- If your chosen method needs a package that may be absent, determine its PyPI distribution name and bind it to the import root: `# MLEVOLVE_PIP_INSTALL[<import_root>]: pip install <distribution>`. For example: `# MLEVOLVE_PIP_INSTALL[sklearn]: pip install scikit-learn`, `# MLEVOLVE_PIP_INSTALL[PIL]: pip install Pillow`, or `# MLEVOLVE_PIP_INSTALL[cv2]: pip install opencv-python`. The older unscoped form remains valid only when the script declares one unambiguous package.",
+                "- The declaration is not executed by the generated script. After an exact `ModuleNotFoundError`, the runtime validates your single PyPI distribution declaration, applies a configured trusted version bound when available, installs it into this task's isolated package directory, and reruns this same script once. A configured import map is only a fallback when no declaration is present; strict deployments may enable an allowlist policy.",
+                "- Never call `pip`, `conda`, `subprocess`, `os.system`, shell commands, or notebook `!pip` from generated solution code. Do not request upgrades or reinstall an already present package.",
+            ]
+            if auto_install_missing_dependencies
+            else [
+                "- Automatic dependency installation is disabled. Use only packages available in the configured AutoML environment; never execute pip/conda/shell installation from generated code.",
+            ]
+        ),
         "- Avoid tqdm and verbose training output.",
         "- Print at most one concise line per epoch.",
         "- Choose DataLoader workers conservatively within the task CPU budget.",
@@ -189,7 +211,7 @@ def get_impl_guideline(
         "**Self-Check Before Finalizing**:",
         *[f"- {item}" for item in predict_self_check],
         "- Did I save the best model/preprocessing artifact under ./working, ./models, ./artifacts, or ./checkpoints?",
-        "- Did I define `predict(model_path, data)` and use it or the same inference path for validation/test/submission?",
+        "- Did I define `train(data, artifact_dir)` plus `predict(model_path, data)` and use the same inference path for validation/test/submission?",
         *submission_self_check,
         "- Did I print the validation metric as the last line?",
         "- Did I use the complete training dataset rather than a tiny subset?",

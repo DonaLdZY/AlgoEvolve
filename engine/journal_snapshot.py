@@ -139,6 +139,25 @@ class NodeSnapshot:
     metric: MetricSnapshot | None = None
     is_buggy: bool | None = None
     is_valid: bool | None = None
+    runtime_ok: bool = False
+    search_eligible: bool = False
+    score_recomputed: bool = False
+    contract_valid: bool = False
+    artifact_ready: bool = False
+    delivery_ready: bool = False
+    delivery_certified: bool = False
+    certification_source: str = ""
+    certification_notes: Any = None
+    method_mode: str = "unknown"
+    method_family: str = "unknown"
+    sibling_ordinal: int | None = None
+    expansion_complexity: str = "unknown"
+    expansion_operator: str = "unknown"
+    solution_interface: str = ""
+    preflight_report: Any = None
+    review_verdict: str = ""
+    review_reason_codes: Any = None
+    review_confidence: float | None = None
     visits: int = 0
     total_reward: float = 0.0
     is_terminal: bool = False
@@ -148,6 +167,7 @@ class NodeSnapshot:
     improve_failure_depth: int = 0
     lock: bool = False
     expected_child_count: int = 0
+    next_sibling_ordinal: int = 0
     finish_time: str | None = None
     created_time: str | None = None
     alpha: int = 1
@@ -197,6 +217,25 @@ class NodeSnapshot:
             metric=MetricSnapshot.from_metric(getattr(node, "metric", None)),
             is_buggy=getattr(node, "is_buggy", None),
             is_valid=getattr(node, "is_valid", None),
+            runtime_ok=bool(getattr(node, "runtime_ok", False)),
+            search_eligible=bool(getattr(node, "search_eligible", False)),
+            score_recomputed=bool(getattr(node, "score_recomputed", False)),
+            contract_valid=bool(getattr(node, "contract_valid", False)),
+            artifact_ready=bool(getattr(node, "artifact_ready", False)),
+            delivery_ready=bool(getattr(node, "delivery_ready", False)),
+            delivery_certified=bool(getattr(node, "delivery_certified", False)),
+            certification_source=str(getattr(node, "certification_source", "") or ""),
+            certification_notes=_safe_json_value(getattr(node, "certification_notes", [])),
+            method_mode=str(getattr(node, "method_mode", "unknown") or "unknown"),
+            method_family=str(getattr(node, "method_family", "unknown") or "unknown"),
+            sibling_ordinal=getattr(node, "sibling_ordinal", None),
+            expansion_complexity=str(getattr(node, "expansion_complexity", "unknown") or "unknown"),
+            expansion_operator=str(getattr(node, "expansion_operator", "unknown") or "unknown"),
+            solution_interface=str(getattr(node, "solution_interface", "") or ""),
+            preflight_report=_safe_json_value(getattr(node, "preflight_report", None)),
+            review_verdict=str(getattr(node, "review_verdict", "") or ""),
+            review_reason_codes=_safe_json_value(getattr(node, "review_reason_codes", [])),
+            review_confidence=getattr(node, "review_confidence", None),
             visits=int(getattr(node, "visits", 0) or 0),
             total_reward=float(getattr(node, "total_reward", 0.0) or 0.0),
             is_terminal=bool(getattr(node, "is_terminal", False)),
@@ -206,6 +245,7 @@ class NodeSnapshot:
             improve_failure_depth=int(getattr(node, "improve_failure_depth", 0) or 0),
             lock=bool(getattr(node, "lock", False)),
             expected_child_count=int(getattr(node, "expected_child_count", 0) or 0),
+            next_sibling_ordinal=int(getattr(node, "next_sibling_ordinal", 0) or 0),
             finish_time=getattr(node, "finish_time", None),
             created_time=getattr(node, "created_time", None),
             alpha=int(getattr(node, "alpha", 1) or 1),
@@ -258,6 +298,34 @@ class NodeSnapshot:
             metric=MetricSnapshot.from_payload(payload.get("metric")),
             is_buggy=payload.get("is_buggy"),
             is_valid=payload.get("is_valid"),
+            runtime_ok=bool(
+                payload.get("runtime_ok", payload.get("is_buggy") is False)
+            ),
+            search_eligible=bool(
+                payload.get(
+                    "search_eligible",
+                    payload.get("is_buggy") is False
+                    and isinstance(payload.get("metric"), Mapping)
+                    and payload.get("metric", {}).get("value") is not None,
+                )
+            ),
+            score_recomputed=bool(payload.get("score_recomputed", False)),
+            contract_valid=bool(payload.get("contract_valid", False)),
+            artifact_ready=bool(payload.get("artifact_ready", False)),
+            delivery_ready=bool(payload.get("delivery_ready", False)),
+            delivery_certified=bool(payload.get("delivery_certified", False)),
+            certification_source=str(payload.get("certification_source") or ""),
+            certification_notes=_safe_json_value(payload.get("certification_notes") or []),
+            method_mode=str(payload.get("method_mode") or "unknown"),
+            method_family=str(payload.get("method_family") or "unknown"),
+            sibling_ordinal=payload.get("sibling_ordinal"),
+            expansion_complexity=str(payload.get("expansion_complexity") or "unknown"),
+            expansion_operator=str(payload.get("expansion_operator") or "unknown"),
+            solution_interface=str(payload.get("solution_interface") or ""),
+            preflight_report=_safe_json_value(payload.get("preflight_report")),
+            review_verdict=str(payload.get("review_verdict") or ""),
+            review_reason_codes=_safe_json_value(payload.get("review_reason_codes") or []),
+            review_confidence=payload.get("review_confidence"),
             visits=int(payload.get("visits") or 0),
             total_reward=float(payload.get("total_reward") or 0.0),
             is_terminal=bool(payload.get("is_terminal", False)),
@@ -267,6 +335,7 @@ class NodeSnapshot:
             improve_failure_depth=int(payload.get("improve_failure_depth") or 0),
             lock=bool(payload.get("lock", False)),
             expected_child_count=int(payload.get("expected_child_count") or 0),
+            next_sibling_ordinal=int(payload.get("next_sibling_ordinal") or 0),
             finish_time=payload.get("finish_time"),
             created_time=payload.get("created_time"),
             alpha=int(payload.get("alpha") or 1),
@@ -301,6 +370,25 @@ class NodeSnapshot:
             metric=self.metric.to_metric() if self.metric is not None else None,
             is_buggy=self.is_buggy,
             is_valid=self.is_valid,
+            runtime_ok=self.runtime_ok,
+            search_eligible=self.search_eligible,
+            score_recomputed=self.score_recomputed,
+            contract_valid=self.contract_valid,
+            artifact_ready=self.artifact_ready,
+            delivery_ready=self.delivery_ready,
+            delivery_certified=self.delivery_certified,
+            certification_source=self.certification_source,
+            certification_notes=list(self.certification_notes or []),
+            method_mode=self.method_mode,
+            method_family=self.method_family,
+            sibling_ordinal=self.sibling_ordinal,
+            expansion_complexity=self.expansion_complexity,
+            expansion_operator=self.expansion_operator,
+            solution_interface=self.solution_interface,
+            preflight_report=self.preflight_report,
+            review_verdict=self.review_verdict,
+            review_reason_codes=list(self.review_reason_codes or []),
+            review_confidence=self.review_confidence,
             visits=self.visits,
             total_reward=self.total_reward,
             is_terminal=self.is_terminal,
@@ -310,6 +398,7 @@ class NodeSnapshot:
             improve_failure_depth=self.improve_failure_depth,
             lock=self.lock,
             expected_child_count=self.expected_child_count,
+            next_sibling_ordinal=self.next_sibling_ordinal,
             finish_time=self.finish_time,
             created_time=self.created_time,
             alpha=self.alpha,
@@ -345,6 +434,25 @@ class NodeSnapshot:
             "metric": self.metric.to_payload() if self.metric is not None else None,
             "is_buggy": self.is_buggy,
             "is_valid": self.is_valid,
+            "runtime_ok": self.runtime_ok,
+            "search_eligible": self.search_eligible,
+            "score_recomputed": self.score_recomputed,
+            "contract_valid": self.contract_valid,
+            "artifact_ready": self.artifact_ready,
+            "delivery_ready": self.delivery_ready,
+            "delivery_certified": self.delivery_certified,
+            "certification_source": self.certification_source,
+            "certification_notes": self.certification_notes,
+            "method_mode": self.method_mode,
+            "method_family": self.method_family,
+            "sibling_ordinal": self.sibling_ordinal,
+            "expansion_complexity": self.expansion_complexity,
+            "expansion_operator": self.expansion_operator,
+            "solution_interface": self.solution_interface,
+            "preflight_report": self.preflight_report,
+            "review_verdict": self.review_verdict,
+            "review_reason_codes": self.review_reason_codes,
+            "review_confidence": self.review_confidence,
             "stage": self.stage,
             "visits": self.visits,
             "total_reward": self.total_reward,
@@ -357,6 +465,7 @@ class NodeSnapshot:
             "lock": self.lock,
             "child_count_lock": None,
             "expected_child_count": self.expected_child_count,
+            "next_sibling_ordinal": self.next_sibling_ordinal,
             "finish_time": self.finish_time,
             "created_time": self.created_time,
             "alpha": self.alpha,

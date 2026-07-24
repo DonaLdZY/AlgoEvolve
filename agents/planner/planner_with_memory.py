@@ -138,7 +138,11 @@ def refine_plan_to_json(
         label_filter=-1,
     )
 
-    refinement_guidance = _build_refinement_guidance(similar_success_records, similar_fail_records)
+    refinement_guidance = _build_refinement_guidance(
+        similar_success_records,
+        similar_fail_records,
+        getattr(agent_instance.global_memory, "node_metadata_map", {}),
+    )
 
     allowed_modules = get_planning_allowed_modules(agent_instance=agent_instance)
     component_descriptions = {
@@ -275,7 +279,11 @@ def refine_plan_to_json(
 
 # ============ Internal helpers ============
 
-def _build_refinement_guidance(similar_success_records, similar_fail_records) -> str:
+def _build_refinement_guidance(
+    similar_success_records,
+    similar_fail_records,
+    metadata_map=None,
+) -> str:
     """Build guidance text from retrieved similar records."""
     if not similar_success_records and not similar_fail_records:
         return ""
@@ -290,6 +298,12 @@ def _build_refinement_guidance(similar_success_records, similar_fail_records) ->
         for idx, (record, score) in enumerate(similar_success_records, 1):
             guidance_parts.append(f"{idx}. Plan: {record.description}")
             guidance_parts.append(f"   Method: {record.method}")
+            meta = (metadata_map or {}).get(record.record_id, {})
+            if isinstance(meta, dict) and meta.get("decision_signals"):
+                guidance_parts.append(
+                    "   Solver facts: "
+                    + json.dumps(meta["decision_signals"], ensure_ascii=False, sort_keys=True, default=str)[:1200]
+                )
         guidance_parts.append("")
 
     if similar_fail_records:

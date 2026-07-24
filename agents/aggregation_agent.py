@@ -10,6 +10,12 @@ from agents.prompt_cache import dataset_reference_sentence, routed_data_context,
 
 from engine.conditions import should_trigger_branch_fusion  # noqa: F401
 from agents.triggers import register_node
+from engine.expansion_profile import ExpansionProfile
+from agents.prompt_policy import (
+    dynamic_expansion_instruction,
+    ensure_expansion_profile,
+    scoped_search_memory,
+)
 
 logger = logging.getLogger("MLEvolve")
 
@@ -55,6 +61,7 @@ def run(
     agent,
     mode: str = "node",
     parent_node: Optional[SearchNode] = None,
+    expansion_profile: ExpansionProfile | None = None,
 ) -> Optional[SearchNode]:
 
     if parent_node and not agent.is_root(parent_node):
@@ -62,6 +69,10 @@ def run(
             f"_aggregation() should only be called from root node! Got parent_node: {parent_node.id}"
         )
         return None
+    parent_node = parent_node or agent.virtual_root
+    expansion_profile = ensure_expansion_profile(
+        agent, parent_node, expansion_profile, "fusion_draft"
+    )
 
     if agent.fusion_draft_count >= agent.max_fusion_drafts:
         logger.info(
@@ -113,6 +124,15 @@ def run(
             reference_summaries.append(branch_info)
 
     reference_experiences = "\n" + "-" * 80 + "\n".join(reference_summaries)
+    scoped_memory = scoped_search_memory(
+        agent,
+        parent_node,
+        "fusion_draft",
+        source_nodes=branch_representatives,
+    )
+    expansion_control = dynamic_expansion_instruction(
+        agent, expansion_profile, operator="fusion_draft"
+    )
 
     prompt: Any = {
         "Introduction": introduction,
@@ -168,7 +188,8 @@ def run(
 
     user_prompt = (
         f"{task_section(prompt['Task description'], data_preview)}\n"
-        f"{instructions}\n# Branch Experiences\n{prompt['Branch Experiences']}"
+        f"{instructions}\n# Branch Experiences\n{prompt['Branch Experiences']}\n"
+        f"# Scoped fusion evidence\n{scoped_memory}\n\n{expansion_control}"
     )
     prompt_complete = build_chat_prompt_for_model(agent.acfg.code.model, introduction, user_prompt, assistant_prefix)
 

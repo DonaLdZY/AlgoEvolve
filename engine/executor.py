@@ -21,6 +21,8 @@ import humanize
 import psutil
 from dataclasses_json import DataClassJsonMixin
 
+from engine.dependency_installer import DependencyInstaller, find_unsafe_installation_call
+
 
 def memory_limited_subprocess_command(
     command: list[str],
@@ -108,6 +110,7 @@ class Interpreter:
         self.lock = Lock()
         self._procs_lock = threading.Lock()
         self._active_procs: dict[int, subprocess.Popen] = {}
+        self.dependency_installer = DependencyInstaller(cfg)
 
     def _available_cpus(self) -> list[int]:
         """Return the CPU ids available to this process on the current platform."""
@@ -170,6 +173,7 @@ class Interpreter:
                         proc.wait()
             except Exception as e:
                 logger.warning(f"Error terminating subprocess slot {slot_id}: {e}")
+        self.dependency_installer.terminate_all()
 
     def check_current_status(self):
         """Check current parallel run number."""
@@ -286,6 +290,19 @@ class Interpreter:
         Returns:
             ExecutionResult: output, exec_time, exc_type, exc_info, exc_stack.
         """
+        unsafe_install = find_unsafe_installation_call(code)
+        if unsafe_install:
+            return ExecutionResult(
+                term_out=[
+                    "Generated solution code was not executed: "
+                    f"{unsafe_install}. Use only `# MLEVOLVE_PIP_INSTALL: pip install <distribution>`; "
+                    "the runtime controls dependency installation.\n"
+                ],
+                exec_time=0.0,
+                exc_type="PermissionError",
+                exc_info={"message": unsafe_install},
+                exc_stack=[],
+            )
         return self._run_subprocess(code=code, id=id, working_dir=working_dir)
 
     def _run_subprocess(self, code: str, id, working_dir: str | None = None):
@@ -337,29 +354,68 @@ class Interpreter:
             with open(runfile_path, "w") as f:
                 f.write(code)
 
-            cmd = memory_limited_subprocess_command([sys.executable, str(runfile_path)])
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(run_wd),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            )
-            with self._procs_lock:
-                self._active_procs[process_id] = proc
-
             child_in_overtime = False
             exc_type = None
             exc_info = {}
             exc_stack = []
-            
-            try:
-                stdout, stderr = proc.communicate(timeout=self.timeout)
-                exec_time = time.time() - start_time
-                
+
+            installed_for_execution: set[str] = set()
+            while True:
+                execution_started_monotonic = time.monotonic()
+                cmd = memory_limited_subprocess_command(
+                    [sys.executable, str(runfile_path)]
+                )
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(run_wd),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    env=self.dependency_installer.execution_environment(
+                        {**os.environ, "PYTHONUNBUFFERED": "1"}
+                    ),
+                )
+                with self._procs_lock:
+                    self._active_procs[process_id] = proc
+                try:
+                    stdout, stderr = proc.communicate(timeout=self.timeout)
+                    exec_time = time.time() - start_time
+                except subprocess.TimeoutExpired:
+                    logger.warning("Subprocess timeout, sending SIGINT...")
+                    try:
+                        proc.send_signal(signal.SIGINT)
+                        stdout, stderr = proc.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(
+                            "Subprocess failed to terminate after SIGINT, killing..."
+                        )
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                    exec_time = time.time() - start_time
+                    exc_type = "TimeoutError"
+                    exc_info = {}
+                    exc_stack = []
+                    break
+                finally:
+                    with self._procs_lock:
+                        self._active_procs.pop(process_id, None)
+
                 if proc.returncode != 0:
+                    recovery = self.dependency_installer.maybe_recover(
+                        code=code,
+                        stderr=stderr or "",
+                        node_id=str(id),
+                        execution_started_monotonic=execution_started_monotonic,
+                        installed_for_execution=installed_for_execution,
+                    )
+                    if recovery.retry:
+                        logger.info("[dependency-install] %s", recovery.message)
+                        proc = None
+                        continue
+                break
+
+            if proc is not None and proc.returncode != 0 and exc_type != "TimeoutError":
                     exc_type = "RuntimeError"
                     exc_info = {}
                     exc_stack = []
@@ -377,6 +433,7 @@ class Interpreter:
                             ("KeyError", "KeyError"),
                             ("IndexError", "IndexError"),
                             ("FileNotFoundError", "FileNotFoundError"),
+                            ("PermissionError", "PermissionError"),
                             ("ImportError", "ImportError"),
                             ("AssertionError", "AssertionError"),
                             ("NameError", "NameError"),
@@ -427,21 +484,6 @@ class Interpreter:
                                     if len(parts) == 2:
                                         exc_info["message"] = parts[1].strip()
                                     break
-            except subprocess.TimeoutExpired:
-                logger.warning("Subprocess timeout, sending SIGINT...")
-                try:
-                    proc.send_signal(signal.SIGINT)
-                    stdout, stderr = proc.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    logger.warning("Subprocess failed to terminate after SIGINT, killing...")
-                    proc.kill()
-                    stdout, stderr = proc.communicate()
-                
-                exec_time = time.time() - start_time
-                exc_type = "TimeoutError"
-                exc_info = {}
-                exc_stack = []
-            
             output: list[str] = []
             if stdout:
                 output.extend(stdout.splitlines(keepends=True))

@@ -116,6 +116,39 @@ def test_complete_automl_context_pack_is_prompt_ready(tmp_path: Path) -> None:
     assert "final_validation_score" in text
 
 
+def test_pack_renders_executable_read_recipes_as_advisory_context(tmp_path: Path) -> None:
+    pack = {
+        "problem_paradigm": "static_optimization",
+        "task_goal": "Minimize transport cost.",
+        "evaluation_contract": {"primary_metric": "cost", "metric_direction": "minimize"},
+        "output_contract": {"output_kind": "solution_table", "columns": ["id"]},
+        "data_access": [
+            {
+                "path": "input_items.csv",
+                "read_method": "pandas.read_csv",
+                "read_contract": {
+                    "schema_version": "autorealize.csv_read_contract.v1",
+                    "verified": True,
+                    "path": "input_items.csv",
+                    "reader": "pandas.read_csv",
+                    "pandas_kwargs": {"sep": ";", "decimal": ",", "encoding": "utf-8-sig"},
+                    "validated_shape": [203, 19],
+                    "validated_columns_exact": ["Item ident", "Weight"],
+                },
+            }
+        ],
+    }
+    (tmp_path / "automl_context_pack.json").write_text(json.dumps(pack), encoding="utf-8")
+
+    text = _CTX.build_autorealize_context_md(tmp_path, write_context_file=False)
+    fast_context = _CTX.select_autorealize_context_for_stage(text, "fast_draft")
+
+    assert "Executable Data Read Recipes" in text
+    assert '"decimal": ","' in text
+    assert "not an immutable host-level gate" in text
+    assert "Executable Data Read Recipes" in fast_context
+
+
 def test_stage_context_routes_complete_sections_without_character_truncation() -> None:
     text = """## AutoRealize Structured Context
 Stable introduction.

@@ -2,13 +2,13 @@ import atexit
 import json
 import logging
 import os
+import signal
 import shutil
 import sys
 import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from types import SimpleNamespace
 from typing import Optional
 
 
@@ -30,7 +30,7 @@ Common overrides:
   workspace_dir=PATH             Execution workspace root
   agent.steps=50                 Maximum search nodes/steps
   agent.time_limit=10800         Search wall-clock limit in seconds
-  agent.initial_drafts=1         Number of initial drafts
+  agent.initial_drafts=3         Number of initial drafts
   agent.search.parallel_search_num=4
   runtime.resume_run=true        Resume from existing log/workspace paths
 
@@ -57,10 +57,26 @@ from rich.status import Status
 
 from config import load_cfg, load_task_desc, prep_agent_workspace, save_run
 from engine.agent_search import AgentSearch as Agent
+from engine.evaluation import ExpansionReservation
 from engine.coldstart import build_guidance_description
 from engine.executor import Interpreter
+from engine.expansion_profile import ExpansionProfile
+from engine.node_selection import refresh_persisted_uct_values
 from engine.search_node import Journal
-from agents.prompts import is_optimization_or_rl_task
+from engine.search_budget import resolve_search_budget
+from engine.search_runtime_state import (
+    SearchRuntimeState,
+    SearchRuntimeStateStore,
+    load_search_runtime_state,
+    prune_completed_actions,
+    reconcile_runtime_locks,
+    repair_journal_for_resume,
+    retain_generated_actions,
+    retain_one_action_per_parent,
+    restore_generated_node,
+)
+from engine.solution_manager import persist_resumable_checkpoint
+from agents.prompt_policy import infer_task_family
 from utils.seed import set_global_seed
 from utils.logging_config import setup_logging
 from utils.visualization import journal_to_string_tree
@@ -69,13 +85,38 @@ from utils.serialize import load_json
 
 PENDING_NODES_FILE = "pending_nodes.json"
 RUN_STATUS_FILE = "run_status.json"
-PENDING_DRAFT_STATUSES = {"generating", "pending_execution", "executing", "cancelled", "failed"}
+PENDING_DRAFT_STATUSES = {"generating", "pending_execution", "executing", "reviewing", "cancelled", "failed"}
 
 
 def _node_attr(node, name: str, default=None):
     if isinstance(node, dict):
         return node.get(name, default)
     return getattr(node, name, default)
+
+
+def _interrupted_budget_targets(cfg) -> tuple[int, int]:
+    """Read effective targets from the interrupted continuation session."""
+
+    runtime_cfg = getattr(cfg, "runtime", None)
+    filename = str(
+        getattr(runtime_cfg, "run_status_filename", RUN_STATUS_FILE) or RUN_STATUS_FILE
+    )
+    path = cfg.log_dir / filename
+    if not path.exists():
+        return 0, 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return 0, 0
+    if str(payload.get("status") or "") not in {
+        "interrupted_resumable",
+        "interrupted_incomplete",
+    }:
+        return 0, 0
+    return (
+        max(0, int(payload.get("total_steps") or 0)),
+        max(0, int(payload.get("time_limit_secs") or 0)),
+    )
 
 
 def _pending_node_row(node, status: str) -> dict:
@@ -107,45 +148,47 @@ def _pending_node_row(node, status: str) -> dict:
         "from_topk": _node_attr(node, "from_topk", None),
         "created_time": _node_attr(node, "created_time", None),
         "status": status,
-        "pending_execution": status in {"generating", "pending_execution", "executing"},
+        "pending_execution": status in {"generating", "pending_execution", "executing", "reviewing"},
         "label": {
             "generating": "Draft code is being generated",
             "pending_execution": "Draft generated, pending execution",
             "executing": "Draft execution is running",
+            "reviewing": "Draft execution finished; result review is running",
             "cancelled": "Draft execution was cancelled before journal append",
             "failed": "Draft generation failed before execution",
         }.get(status, status),
     }
 
 
-def _make_pending_draft_placeholder(draft_idx: int, draft_total: int, *, single_call: bool) -> SimpleNamespace:
-    mode = "single_call_draft" if single_call else "stepwise_draft"
-    return SimpleNamespace(
-        id=f"draft-{draft_idx + 1}-generating",
-        parent=None,
-        parent_id=None,
-        stage="draft",
-        plan=(
-            f"Generating draft {draft_idx + 1}/{draft_total} via {mode}. "
-            "This placeholder is shown before code generation finishes."
-        ),
-        code="",
-        analysis=None,
-        parser_analysis=None,
-        decision_signals=None,
-        llm_insight=None,
-        metric=None,
-        is_buggy=None,
-        is_valid=None,
-        visits=0,
-        total_reward=0.0,
-        _uct=None,
-        finish_time=None,
-        exec_time=None,
-        branch_id=draft_idx + 1,
-        from_topk=False,
-        created_time=time.strftime("%Y-%m-%dT%H:%M:%S"),
-    )
+def _active_action_placeholder(action, parent) -> dict:
+    profile = action.expansion_profile
+    if getattr(parent, "stage", "") == "root":
+        stage = "draft"
+    elif bool(getattr(parent, "is_buggy", False)):
+        stage = "debug"
+    else:
+        stage = "improve"
+    return {
+        "id": f"action-{action.action_id}",
+        "runtime_action_id": action.action_id,
+        "parent": parent,
+        "parent_id": action.parent_node_id,
+        "stage": stage,
+        "plan": f"Worker is expanding parent {action.parent_node_id}.",
+        "code": "",
+        "metric": None,
+        "is_buggy": None,
+        "is_valid": None,
+        "visits": 0,
+        "total_reward": 0.0,
+        "_uct": None,
+        "branch_id": getattr(parent, "branch_id", None),
+        "from_topk": bool(action.parent_from_topk),
+        "created_time": action.created_at or time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "sibling_ordinal": getattr(profile, "sibling_ordinal", None),
+        "expansion_complexity": getattr(profile, "complexity", "moderate"),
+        "expansion_operator": getattr(profile, "operator", "auto"),
+    }
 
 
 def _write_run_status(
@@ -173,6 +216,16 @@ def _write_run_status(
     tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _exit_process_immediately(exit_code: int) -> None:
+    """End the whole worker process without waiting for non-cancellable LLM threads."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(exit_code)
 
 
 def _write_pending_nodes_state(cfg, nodes, status_by_id: dict[str, str], phase: str) -> None:
@@ -239,6 +292,21 @@ def run():
         cfg.coldstart.description = build_guidance_description(cfg, task_desc=task_desc)
         logger.info(f"Guidance description: {cfg.coldstart.description}")
 
+    interruption_requested = threading.Event()
+    normal_exit = {"done": False}
+
+    def request_interruption(signum, _frame):
+        interruption_requested.set()
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        signal_value = getattr(signal, signal_name, None)
+        if signal_value is not None:
+            try:
+                signal.signal(signal_value, request_interruption)
+            except (OSError, RuntimeError, ValueError):
+                pass
+
     with Status("Preparing agent workspace (copying and extracting files) ..."):
         prep_agent_workspace(cfg)
 
@@ -248,48 +316,233 @@ def run():
         if (
             global_step == 0
             and not resume_run
+            and not interruption_requested.is_set()
             and bool(getattr(runtime_cfg, "cleanup_empty_workspace_on_exit", True))
         ):
             shutil.rmtree(cfg.workspace_dir)
 
     atexit.register(cleanup)
 
-    def _repair_journal_state(journal: Journal):
-        if len(journal) == 0:
-            return journal
-        id2node = {n.id: n for n in journal.nodes}
-        for n in journal.nodes:
-            n.children = set()
-            n.lock = False
-            n.child_count_lock = threading.Lock()
-        for n in journal.nodes:
-            p = getattr(n, "parent", None)
-            if p is None:
-                continue
-            if p.id in id2node:
-                parent = id2node[p.id]
-                n.parent = parent
-                parent.children.add(n)
-        for n in journal.nodes:
-            n.expected_child_count = len(getattr(n, "children", set()) or set())
-        return journal
+    search_state_path = cfg.log_dir / str(
+        getattr(runtime_cfg, "search_state_filename", "search_state.json") or "search_state.json"
+    )
+    initial_search_state = SearchRuntimeState()
+    if resume_run and search_state_path.exists():
+        try:
+            initial_search_state = load_search_runtime_state(search_state_path)
+        except Exception as exc:
+            logger.warning("Failed to load search runtime state; journal resume will continue without it: %s", exc)
+
+    search_state = SearchRuntimeStateStore(
+        search_state_path,
+        initial_state=initial_search_state,
+        enabled=bool(getattr(runtime_cfg, "save_search_state", True)),
+        checkpoint_seconds=float(getattr(runtime_cfg, "search_state_checkpoint_seconds", 5.0)),
+        write_max_attempts=int(getattr(runtime_cfg, "state_write_max_attempts", 5)),
+        write_retry_delay_seconds=float(
+            getattr(runtime_cfg, "state_write_retry_delay_seconds", 0.05)
+        ),
+    )
+    if resume_run and bool(getattr(runtime_cfg, "restore_random_state", True)):
+        if search_state.restore_random_state():
+            logger.info("Restored Python random state from %s", search_state_path)
+
+    restored_actions = (
+        search_state.actions()
+        if resume_run and bool(getattr(runtime_cfg, "restore_inflight_actions", True))
+        else []
+    )
 
     resume_path = cfg.log_dir / "journal.json"
     if resume_path.exists():
         try:
             journal = load_json(resume_path, Journal)
-            journal = _repair_journal_state(journal)
             logger.info(f"Resuming from existing journal: {resume_path}")
         except Exception as e:
             logger.warning(f"Failed to load existing journal, starting fresh: {e}")
             journal = Journal()
     else:
         journal = Journal()
+
+    journal_node_ids = {node.id for node in journal.nodes}
+    restored_actions = prune_completed_actions(restored_actions, journal_node_ids)
+    valid_parent_ids = journal_node_ids
+    restored_actions = [
+        action for action in restored_actions if action.parent_node_id in valid_parent_ids
+    ]
+    restored_actions = retain_one_action_per_parent(restored_actions)
+    discarded_unmaterialized_actions = [
+        action for action in restored_actions if action.generated_node is None
+    ]
+    restored_actions = [
+        action for action in restored_actions if action.generated_node is not None
+    ]
+    if discarded_unmaterialized_actions:
+        logger.info(
+            "Discarding %s interrupted actions without generated code; "
+            "their parents will be selected again from current UCT state.",
+            len(discarded_unmaterialized_actions),
+        )
+    search_state.replace_actions(restored_actions)
+    search_state.start_periodic_checkpointing()
+    journal = repair_journal_for_resume(journal, restored_actions)
+    requested_steps = max(0, int(cfg.agent.steps))
+    requested_time_limit = max(0, int(getattr(cfg.agent, "time_limit", 0) or 0))
+    resume_budget_mode = str(
+        getattr(runtime_cfg, "resume_budget_mode", "total") or "total"
+    ).strip().lower()
+    restored_completed = max(0, len(journal) - 1)
+    restored_elapsed = max(0.0, search_state.elapsed_seconds())
+    preserved_target_steps, preserved_time_limit = _interrupted_budget_targets(cfg)
+    cfg.agent.steps, cfg.agent.time_limit = resolve_search_budget(
+        requested_steps=requested_steps,
+        requested_time_limit=requested_time_limit,
+        restored_completed=restored_completed,
+        restored_elapsed=restored_elapsed,
+        resume_run=resume_run,
+        resume_budget_mode=resume_budget_mode,
+        preserved_target_steps=preserved_target_steps,
+        preserved_time_limit=preserved_time_limit,
+    )
+    if resume_run and resume_budget_mode == "additional":
+        logger.info(
+            "Appending resume budget: completed=%s + steps=%s -> target=%s; "
+            "elapsed=%.1fs + time=%ss -> target=%ss",
+            restored_completed,
+            requested_steps,
+            cfg.agent.steps,
+            restored_elapsed,
+            requested_time_limit,
+            cfg.agent.time_limit,
+        )
     agent = Agent(
         task_desc=task_desc,
         cfg=cfg,
         journal=journal,
     )
+    agent.restore_search_elapsed(search_state.elapsed_seconds())
+    agent.runtime_checkpoint_callback = lambda action_id, action_status, node: search_state.update_action(
+        action_id,
+        status=action_status,
+        generated_node=node,
+    )
+
+    checkpoint_lock = threading.Lock()
+    checkpoint_committed = {"done": False}
+
+    def commit_interrupted_checkpoint() -> bool:
+        if checkpoint_committed["done"]:
+            return True
+        if normal_exit["done"]:
+            return False
+        with checkpoint_lock:
+            if checkpoint_committed["done"]:
+                return True
+            if normal_exit["done"]:
+                return False
+            interruption_requested.set()
+            search_state_closed = False
+            try:
+                # Freeze action updates before serializing the final interrupt
+                # checkpoint so search_state.json and the manifest agree.
+                agent.accept_search_results = False
+                agent.runtime_checkpoint_callback = None
+                all_actions = search_state.actions()
+                resumable_actions = retain_one_action_per_parent(
+                    retain_generated_actions(all_actions)
+                )
+                discarded_count = len(all_actions) - len(resumable_actions)
+                search_state.close(
+                    clear_actions=False,
+                    replacement_actions=resumable_actions,
+                )
+                search_state_closed = True
+                active_actions = [
+                    action.to_payload() for action in resumable_actions
+                ]
+                with agent.journal_lock:
+                    repair_journal_for_resume(journal, resumable_actions)
+                    save_run(cfg, journal)
+                _write_run_status(
+                    cfg,
+                    status="interrupted_resumable",
+                    termination_reason="external_interrupt",
+                    completed_steps=max(0, len(journal) - 1),
+                    total_steps=int(cfg.agent.steps),
+                    time_limit_secs=int(getattr(cfg.agent, "time_limit", 0) or 0),
+                )
+                # Manifests are written last and therefore serve as the service's
+                # durable readiness marker for terminating the process tree.
+                persist_resumable_checkpoint(
+                    agent,
+                    status="interrupted_resumable",
+                    reason="external_interrupt",
+                    active_actions=active_actions,
+                    manifest_filename=str(
+                        getattr(
+                            runtime_cfg,
+                            "checkpoint_manifest_filename",
+                            "checkpoint_manifest.json",
+                        )
+                    ),
+                    materialize_artifacts=False,
+                )
+                checkpoint_committed["done"] = True
+                logger.info(
+                    "Interrupted checkpoint committed: resumable_generated_actions=%s, "
+                    "discarded_unmaterialized_actions=%s",
+                    len(resumable_actions),
+                    discarded_count,
+                )
+                return True
+            except Exception:
+                logger.exception("Failed to commit interrupted resumable checkpoint")
+                return False
+            finally:
+                if not search_state_closed:
+                    try:
+                        search_state.close(clear_actions=False)
+                    except Exception:
+                        logger.exception("Failed to finalize interrupted search state")
+
+    atexit.register(commit_interrupted_checkpoint)
+    logger.info(
+        "Search resume state: elapsed=%.1fs, active_actions=%d. "
+        "Current YAML/CLI settings remain authoritative.",
+        search_state.elapsed_seconds(),
+        len(restored_actions),
+    )
+
+    restored_generated_nodes: dict[str, object] = {}
+    invalid_restored_action_ids: set[str] = set()
+    for action in restored_actions:
+        if action.generated_node is None:
+            invalid_restored_action_ids.add(action.action_id)
+            continue
+        node = restore_generated_node(action, journal)
+        if node is None:
+            invalid_restored_action_ids.add(action.action_id)
+            continue
+        restored_generated_nodes[action.action_id] = node
+        if getattr(node, "stage", None) == "fusion_draft":
+            agent.fusion_draft_count += 1
+        branch_id = getattr(node, "branch_id", None)
+        if branch_id is not None:
+            branch_nodes = agent.branch_all_nodes.setdefault(branch_id, [])
+            if all(existing.id != node.id for existing in branch_nodes):
+                branch_nodes.append(node)
+            agent.branch_successful_nodes.setdefault(branch_id, [])
+            try:
+                agent.next_branch_id = max(agent.next_branch_id, int(branch_id) + 1)
+            except (TypeError, ValueError):
+                pass
+    if invalid_restored_action_ids:
+        search_state.replace_actions(
+            action
+            for action in search_state.actions()
+            if action.action_id not in invalid_restored_action_ids
+        )
+        repair_journal_for_resume(journal, search_state.actions())
 
     interpreter = Interpreter(
         cfg.workspace_dir, **OmegaConf.to_container(cfg.exec), cfg=cfg  # type: ignore
@@ -305,44 +558,182 @@ def run():
         status.update("[green]Generating code...")
         return res
 
-    def step_task(node=None):
+    def _reconcile_parent_runtime_state(parent_node_id: str) -> None:
+        parent = next((node for node in journal.nodes if node.id == parent_node_id), None)
+        if parent is None:
+            return
+        journal_ids = {node.id for node in journal.nodes}
+        remaining_actions = [
+            action for action in search_state.actions() if action.parent_node_id == parent_node_id
+        ]
+        active_generated_ids = {
+            action.generated_node.id
+            for action in remaining_actions
+            if action.generated_node is not None
+        }
+        parent.children = {
+            child
+            for child in getattr(parent, "children", set())
+            if child.id in journal_ids or child.id in active_generated_ids
+        }
+        unmaterialized_count = sum(
+            1 for action in remaining_actions if action.generated_node is None
+        )
+        parent.expected_child_count = len(parent.children) + unmaterialized_count
+        parent.lock = bool(remaining_actions)
+
+        active_ids = {
+            action.generated_node.id
+            for action in search_state.actions()
+            if action.generated_node is not None
+        }
+        for branch_id, branch_nodes in list(agent.branch_all_nodes.items()):
+            agent.branch_all_nodes[branch_id] = [
+                node for node in branch_nodes if node.id in journal_ids or node.id in active_ids
+            ]
+
+    def finish_search_action(action_id: str) -> None:
+        action = search_state.remove_action(action_id)
+        if action is not None:
+            _reconcile_parent_runtime_state(action.parent_node_id)
+
+    def register_search_action(parent, *, parent_from_topk: bool = False):
+        profile = ExpansionProfile.create(
+            parent.reserve_sibling_ordinal(),
+            task_family=infer_task_family(agent),
+        )
+        return search_state.register_action(
+            parent.id,
+            parent_from_topk=parent_from_topk,
+            expansion_profile=profile,
+        )
+
+    def step_task(
+        action_id: str,
+        node,
+        *,
+        reuse_reserved_slot: bool = False,
+        execute_immediately: bool = True,
+        return_result_node: bool = False,
+        draft_single_call: bool = False,
+        fast_draft_mode: bool = False,
+        expansion_reservation=None,
+    ):
         if node:
             logger.info(f"[step_task] Processing node: {node.id}")
         else:
             logger.info("[step_task] Processing virtual root node.")
-        return agent.step(exec_callback=exec_callback, node=node)
+        if reuse_reserved_slot:
+            with node.child_count_lock:
+                node.expected_child_count = max(len(node.children), node.expected_child_count - 1)
+        search_state.update_action(action_id, status="generating")
+        action = search_state.get_action(action_id)
+        expansion_profile = action.expansion_profile if action is not None else None
+        if expansion_profile is None:
+            expansion_profile = ExpansionProfile.create(
+                node.reserve_sibling_ordinal(),
+                task_family=infer_task_family(agent),
+            )
+        return agent.step(
+            exec_callback=exec_callback,
+            node=node,
+            execute_immediately=execute_immediately,
+            runtime_action_id=action_id,
+            parent_preselected=True,
+            return_result_node=return_result_node,
+            expansion_profile=expansion_profile,
+            draft_single_call=draft_single_call,
+            fast_draft_mode=fast_draft_mode,
+            expansion_reservation=expansion_reservation,
+        )
+
+    def schedule_new_step(executor):
+        # Selection, parent reservation, and virtual visits are one atomic tree
+        # operation. A second worker therefore observes the updated UCT state
+        # and skips the parent already owned by the first worker.
+        with agent.tree_state_lock:
+            reconcile_runtime_locks(journal.nodes, search_state.actions())
+            parent = agent.select_parent(None)
+            if parent is None:
+                return None
+            journal_ids = {node.id for node in journal.nodes}
+            active_parent_ids = {
+                action.parent_node_id for action in search_state.actions()
+            }
+            if (
+                parent.id not in journal_ids
+                or bool(getattr(parent, "pending_execution", False))
+                or parent.id in active_parent_ids
+            ):
+                return None
+            root_draft = agent.is_root(parent) and not parent.reached_child_limit(
+                scfg=agent.scfg
+            )
+            action = register_search_action(
+                parent,
+                parent_from_topk=bool(getattr(parent, "_topk_triggered", False)),
+            )
+            _reconcile_parent_runtime_state(parent.id)
+            reservation = ExpansionReservation(parent, agent.tree_state_lock)
+            profile = action.expansion_profile
+            ordinal = int(getattr(profile, "sibling_ordinal", 0) or 0)
+            draft_single_call = bool(
+                root_draft
+                and (
+                    (ordinal == 1 and getattr(draft_cfg, "fast_first_draft", True))
+                    or (
+                        ordinal > 1
+                        and not getattr(draft_cfg, "use_stepwise_after_first", True)
+                    )
+                )
+            )
+            fast_draft_mode = bool(root_draft and ordinal == 1 and draft_single_call)
+            placeholder = _active_action_placeholder(action, parent)
+            placeholder_id = str(placeholder["id"])
+            pending_draft_nodes.append(placeholder)
+            pending_status_by_id[placeholder_id] = "generating"
+            pending_action_id_by_node_id[placeholder_id] = action.action_id
+            refresh_pending_nodes_state("worker_selected")
+        future = executor.submit(
+            step_task,
+            action.action_id,
+            parent,
+            reuse_reserved_slot=True,
+            return_result_node=True,
+            draft_single_call=draft_single_call,
+            fast_draft_mode=fast_draft_mode,
+            expansion_reservation=reservation,
+        )
+        return future, action, reservation, placeholder_id
 
     max_workers = interpreter.max_parallel_run
     total_steps = cfg.agent.steps
     initial_draft_count = cfg.agent.initial_drafts
     draft_cfg = getattr(cfg.agent, "draft", None)
-    optimization_or_rl_task = is_optimization_or_rl_task(
-        task_desc=str(getattr(agent, "task_desc", "") or task_desc or ""),
-        coldstart_description=str(getattr(agent, "coldstart_description", "") or ""),
-    )
-    optimization_draft_cap = int(getattr(draft_cfg, "optimization_initial_drafts_cap", 1))
-    if optimization_or_rl_task and optimization_draft_cap > 0 and initial_draft_count > optimization_draft_cap:
-        logger.info(
-            "Optimization/RL task detected; reducing Phase 1 initial_drafts from %s to %s "
-            "so the first executable search node appears sooner.",
-            initial_draft_count,
-            optimization_draft_cap,
-        )
-        initial_draft_count = optimization_draft_cap
-
     time_limit_secs = int(getattr(cfg.agent, "time_limit", 0) or 0)
-    run_deadline: Optional[float] = time.time() + time_limit_secs if time_limit_secs > 0 else None
+    remaining_time_secs = max(
+        0.0,
+        time_limit_secs - search_state.elapsed_seconds(),
+    ) if time_limit_secs > 0 else None
+    run_deadline: Optional[float] = (
+        time.time() + remaining_time_secs if remaining_time_secs is not None else None
+    )
     timed_out = False
 
     logger.info(f"ThreadPool max_workers set to: {max_workers} (matching interpreter capacity)")
-    logger.info(f"Initial draft count: {initial_draft_count} (executed sequentially for diversity)")
+    logger.info(f"Initial forced root draft count: {initial_draft_count}")
     logger.info(
-        "Phase 1 draft mode: fast_first=%s, stepwise_after_first=%s",
+        "Worker-local draft generation: fast_first=%s, stepwise_after_first=%s",
         bool(getattr(draft_cfg, "fast_first_draft", True)),
         bool(getattr(draft_cfg, "use_stepwise_after_first", True)),
     )
     if run_deadline is not None:
-        logger.info(f"Hard timeout enabled: {time_limit_secs}s")
+        logger.info(
+            "Hard timeout enabled: total=%ss, restored_elapsed=%.1fs, remaining=%.1fs",
+            time_limit_secs,
+            search_state.elapsed_seconds(),
+            remaining_time_secs,
+        )
 
     def is_timed_out() -> bool:
         return run_deadline is not None and time.time() >= run_deadline
@@ -352,6 +743,12 @@ def run():
 
     pending_draft_nodes = []
     pending_status_by_id: dict[str, str] = {}
+    pending_action_id_by_node_id: dict[str, str] = {}
+
+    for action_id, node in restored_generated_nodes.items():
+        pending_draft_nodes.append(node)
+        pending_status_by_id[node.id] = "pending_execution"
+        pending_action_id_by_node_id[node.id] = action_id
     _write_pending_nodes_state(cfg, pending_draft_nodes, pending_status_by_id, "initialized")
 
     def refresh_pending_nodes_state(phase: str) -> None:
@@ -360,71 +757,26 @@ def run():
         except Exception as exc:
             logger.warning(f"Failed to write {PENDING_NODES_FILE}: {exc}")
 
-    if initial_draft_count > 0 and completed == 0 and total_steps > 0:
-        logger.info(f"Phase 1: Sequential draft generation (code only, {initial_draft_count} drafts)")
-
-        def step_task_generate_only(*, single_call: bool = False):
-            logger.info(
-                "[step_task_generate_only] Generating draft from virtual root%s",
-                " using single-call route" if single_call else "",
-            )
-            previous_stepwise = getattr(agent, "use_stepwise_generation", True)
-            if single_call:
-                agent.use_stepwise_generation = False
-            try:
-                return agent.step(exec_callback=exec_callback, node=None, execute_immediately=False)
-            finally:
-                agent.use_stepwise_generation = previous_stepwise
-
-        draft_total = min(initial_draft_count, total_steps)
-        for draft_idx in range(draft_total):
-            if is_timed_out():
-                timed_out = True
-                logger.warning("Time limit reached during Phase 1 draft generation; stop creating new drafts.")
-                break
-            single_call = (
-                draft_idx == 0 and bool(getattr(draft_cfg, "fast_first_draft", True))
-            ) or (
-                draft_idx > 0 and not bool(getattr(draft_cfg, "use_stepwise_after_first", True))
-            )
-            placeholder = _make_pending_draft_placeholder(
-                draft_idx,
-                draft_total,
-                single_call=single_call,
-            )
-            pending_draft_nodes.append(placeholder)
-            pending_status_by_id[placeholder.id] = "generating"
-            refresh_pending_nodes_state("phase1_draft_generation")
-            try:
-                logger.info(
-                    f"Generating draft {draft_idx + 1}/{min(initial_draft_count, total_steps)} (code only)"
-                )
-                cur_node = step_task_generate_only(single_call=single_call)
-                pending_draft_nodes[-1] = cur_node
-                pending_status_by_id.pop(placeholder.id, None)
-                pending_status_by_id[cur_node.id] = "pending_execution"
-                refresh_pending_nodes_state("phase1_draft_generation")
-                logger.info(f"Draft {draft_idx + 1} code generated: node.id={cur_node.id}")
-            except Exception as e:
-                pending_status_by_id[placeholder.id] = "failed"
-                refresh_pending_nodes_state("phase1_draft_generation")
-                logger.exception(f"Exception during draft {draft_idx + 1} generation: {e}")
-
-        logger.info(f"Phase 1 complete: {len(pending_draft_nodes)} draft codes generated")
-        refresh_pending_nodes_state("phase1_draft_generation_complete")
-
+    logger.info(
+        "Search pipeline: parallel closed-loop workers with virtual-visit UCT reservations"
+    )
     if pending_draft_nodes or completed < total_steps:
         drafts_to_execute = [
             node for node in pending_draft_nodes
             if pending_status_by_id.get(str(_node_attr(node, "id", ""))) == "pending_execution"
         ]
-        logger.info("Phase 2: Pipelined parallel execution")
-        logger.info(f"  - Pending draft executions: {len(drafts_to_execute)}")
+        logger.info("Parallel MCTS: closed-loop worker execution")
+        logger.info(f"  - Restored generated nodes: {len(drafts_to_execute)}")
         logger.info(f"  - Remaining steps: {total_steps - completed}")
 
-        def execute_draft_node(node):
+        def execute_draft_node(node, action_id: str, reservation):
             try:
-                executed_node = agent.execute_deferred_node(node, exec_callback)
+                executed_node = agent.execute_deferred_node(
+                    node,
+                    exec_callback,
+                    runtime_action_id=action_id,
+                    expansion_reservation=reservation,
+                )
                 logger.info(f"Draft node {executed_node.id} executed: metric={executed_node.metric.value}")
                 return executed_node
             except Exception as e:
@@ -436,38 +788,62 @@ def run():
         fast_shutdown = False
         try:
             futures = set()
-            pending_future_ids: dict = {}
-            submitted_drafts = 0
-            for i, node in enumerate(drafts_to_execute):
+            future_metadata: dict = {}
+            submitted_actions = 0
+            action_submission_budget = max(0, total_steps - completed)
+            for node in drafts_to_execute:
+                if submitted_actions >= action_submission_budget:
+                    break
                 if is_timed_out():
                     timed_out = True
                     logger.warning("Time limit reached before submitting pending draft executions.")
                     break
                 pending_status_by_id[node.id] = "executing"
                 refresh_pending_nodes_state("phase2_execution")
-                fut = executor.submit(execute_draft_node, node)
+                action_id = pending_action_id_by_node_id[node.id]
+                reservation = ExpansionReservation(node.parent, agent.tree_state_lock)
+                fut = executor.submit(
+                    execute_draft_node,
+                    node,
+                    action_id,
+                    reservation,
+                )
                 futures.add(fut)
-                pending_future_ids[fut] = node.id
-                submitted_drafts += 1
-                logger.info(f"Submitted draft execution: {node.id}")
-                if i < len(drafts_to_execute) - 1:
-                    time.sleep(max(0.0, float(getattr(draft_cfg, "submission_stagger_seconds", 10.0))))
-                    if is_timed_out():
-                        timed_out = True
-                        logger.warning("Time limit reached while staggering draft submissions.")
-                        break
+                future_metadata[fut] = {
+                    "action_id": action_id,
+                    "pending_node_id": node.id,
+                    "reservation": reservation,
+                }
+                submitted_actions += 1
+                logger.info(f"Resumed generated node in a closed-loop worker: {node.id}")
 
-            initial_step_tasks = min(max_workers, total_steps - completed) - submitted_drafts
-            if initial_step_tasks > 0 and not timed_out:
-                for _ in range(initial_step_tasks):
-                    if is_timed_out():
-                        timed_out = True
-                        logger.warning("Time limit reached before initial step submission.")
+            def fill_worker_slots() -> int:
+                added = 0
+                while (
+                    len(futures) < max_workers
+                    and completed + len(futures) < total_steps
+                    and not timed_out
+                ):
+                    scheduled = schedule_new_step(executor)
+                    if scheduled is None:
                         break
-                    futures.add(executor.submit(step_task))
-                    logger.info("Submitted initial step_task to fill thread pool")
+                    future, action, reservation, placeholder_id = scheduled
+                    futures.add(future)
+                    future_metadata[future] = {
+                        "action_id": action.action_id,
+                        "pending_node_id": placeholder_id,
+                        "reservation": reservation,
+                    }
+                    added += 1
+                    logger.info(
+                        "Assigned worker to parent %s after virtual-visit UCT update",
+                        action.parent_node_id,
+                    )
+                return added
 
-            while completed < total_steps and futures:
+            fill_worker_slots()
+
+            while futures:
                 if is_timed_out():
                     timed_out = True
                     logger.warning("Time limit reached in Phase 2 main loop.")
@@ -480,11 +856,15 @@ def run():
                 )
 
                 if not done:
+                    search_state.checkpoint_if_due()
                     continue
 
                 for fut in done:
                     futures.remove(fut)
-                    pending_node_id = pending_future_ids.pop(fut, None)
+                    metadata = future_metadata.pop(fut, {})
+                    action_id = metadata.get("action_id")
+                    pending_node_id = metadata.get("pending_node_id")
+                    reservation = metadata.get("reservation")
                     try:
                         cur_node = fut.result()
                         if cur_node:
@@ -497,29 +877,36 @@ def run():
                     except Exception as e:
                         logger.exception(f"Exception during task execution: {e}")
                         cur_node = None
+                    if cur_node is None and isinstance(reservation, ExpansionReservation):
+                        reservation.settle_failure(-1.0)
 
                     with lock:
-                        save_run(cfg, journal)
                         completed = len(journal) - 1
                         if completed == total_steps:
                             logger.info(journal_to_string_tree(journal))
 
                         if pending_node_id and cur_node:
+                            pending_draft_nodes[:] = [
+                                node
+                                for node in pending_draft_nodes
+                                if str(_node_attr(node, "id", "")) != pending_node_id
+                            ]
                             pending_status_by_id.pop(pending_node_id, None)
+                            pending_action_id_by_node_id.pop(pending_node_id, None)
                             refresh_pending_nodes_state("phase2_execution")
                         elif pending_node_id:
                             pending_status_by_id[pending_node_id] = "failed"
                             refresh_pending_nodes_state("phase2_execution")
+                        if action_id:
+                            finish_search_action(action_id)
+                        with agent.journal_lock:
+                            save_run(cfg, journal)
 
-                    if completed + len(futures) < total_steps and not timed_out:
-                        if is_timed_out():
-                            timed_out = True
-                            logger.warning("Time limit reached before scheduling next task.")
-                            continue
-                        futures.add(executor.submit(step_task, cur_node))
-                        logger.info(
-                            f"Submitted next task based on node {cur_node.id if cur_node else 'None'}"
-                        )
+                    if is_timed_out():
+                        timed_out = True
+                        logger.warning("Time limit reached before scheduling next task.")
+                    else:
+                        fill_worker_slots()
                     logger.info(f"Progress: {completed}/{total_steps} steps completed, {len(futures)} tasks running")
 
             if timed_out:
@@ -527,24 +914,49 @@ def run():
                     f"Time limit reached (configured={time_limit_secs}s). "
                     "Search budget is exhausted; saving current best artifacts and ending AutoML normally."
                 )
+                with agent.journal_lock:
+                    agent.accept_search_results = False
+                    agent.runtime_checkpoint_callback = None
+                    for metadata in future_metadata.values():
+                        reservation = metadata.get("reservation")
+                        if isinstance(reservation, ExpansionReservation):
+                            reservation.cancel()
                 interpreter.terminate_all_subprocesses()
                 fast_shutdown = True
                 with lock:
                     for node_id in list(pending_status_by_id):
                         pending_status_by_id[node_id] = "cancelled"
                     refresh_pending_nodes_state("timed_out")
-                    save_run(cfg, journal)
+                    with agent.journal_lock:
+                        repair_journal_for_resume(journal, [])
+                        save_run(cfg, journal)
             elif completed < total_steps and not futures:
                 logger.warning(
                     f"Phase 2 exited with no active futures before reaching target steps: {completed}/{total_steps}"
                 )
         except KeyboardInterrupt:
             interrupted = True
+            interruption_requested.set()
             logger.info("KeyboardInterrupt received, terminating subprocesses and shutting down...")
             for node_id in list(pending_status_by_id):
                 pending_status_by_id[node_id] = "cancelled"
+            with agent.journal_lock:
+                agent.accept_search_results = False
+                agent.runtime_checkpoint_callback = None
+                for metadata in future_metadata.values():
+                    reservation = metadata.get("reservation")
+                    if isinstance(reservation, ExpansionReservation):
+                        reservation.cancel()
             refresh_pending_nodes_state("interrupted")
             interpreter.terminate_all_subprocesses()
+            checkpoint_ok = commit_interrupted_checkpoint()
+            if checkpoint_ok and bool(
+                getattr(runtime_cfg, "exit_immediately_after_interrupt_checkpoint", True)
+            ):
+                logger.warning(
+                    "Interrupted checkpoint is durable; terminating the MLEvolve process immediately."
+                )
+                _exit_process_immediately(130)
             if sys.version_info >= (3, 9):
                 executor.shutdown(wait=False, cancel_futures=True)
             else:
@@ -559,15 +971,24 @@ def run():
             elif not interrupted:
                 executor.shutdown(wait=True)
     else:
-        logger.info(
-            f"All steps completed in Phase 1 (total_steps={total_steps} <= initial_draft_count={initial_draft_count})"
-        )
+        logger.info("Search target was already complete; no worker expansion was scheduled")
 
     if timed_out and bool(getattr(runtime_cfg, "force_process_exit_on_timeout", True)):
         logger.warning(f"MLEvolve search budget exhausted: {time_limit_secs}s")
 
-    if not pending_status_by_id:
-        refresh_pending_nodes_state("complete")
+    pending_draft_nodes.clear()
+    pending_status_by_id.clear()
+    pending_action_id_by_node_id.clear()
+    refresh_pending_nodes_state("complete")
+    with agent.journal_lock:
+        if timed_out:
+            # Timed-out workers are intentionally abandoned. Remove their
+            # transient locks and unjournaled child links before committing a
+            # completed checkpoint that may later be resumed.
+            repair_journal_for_resume(journal, [])
+        with agent.tree_state_lock:
+            refresh_persisted_uct_values(agent)
+            save_run(cfg, journal)
 
     termination_reason = "time_limit_exhausted" if timed_out else "steps_completed"
     _write_run_status(
@@ -578,12 +999,35 @@ def run():
         total_steps=total_steps,
         time_limit_secs=time_limit_secs,
     )
+    # Clear cancelled/completed runtime actions before the completion manifest
+    # is written. The manifest is the final durable marker and must never point
+    # at an older search_state.json that still contains in-flight work.
+    search_state.close(clear_actions=True)
+    persist_resumable_checkpoint(
+        agent,
+        status="completed",
+        reason=termination_reason,
+        active_actions=[],
+        manifest_filename=str(
+            getattr(
+                runtime_cfg,
+                "checkpoint_manifest_filename",
+                "checkpoint_manifest.json",
+            )
+        ),
+    )
+    normal_exit["done"] = True
     interpreter.cleanup_session(-1)
-    if timed_out:
+    if timed_out and bool(getattr(runtime_cfg, "force_process_exit_on_timeout", True)):
         # ThreadPoolExecutor cannot cancel already-running LLM calls. Once the
         # search budget is exhausted and artifacts are saved, exit the process
         # immediately so the outer service can continue to AutoReport instead
         # of waiting for stale worker threads until the grace timeout.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
         logging.shutdown()
         os._exit(0)
 

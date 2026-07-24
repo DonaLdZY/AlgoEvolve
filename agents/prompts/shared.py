@@ -84,6 +84,19 @@ OPTIMIZATION_RL_KEYWORDS = (
     "硬约束",
 )
 
+RL_METHOD_KEYWORDS = (
+    "reinforcement learning",
+    "offline rl",
+    "online rl",
+    "policy learning",
+    "reward function",
+    "gymnasium",
+    "gym env",
+    "强化学习",
+    "离线强化学习",
+    "在线强化学习",
+)
+
 
 def is_optimization_or_rl_task(task_desc: str = "", coldstart_description: str = "") -> bool:
     """Return True only when the task text strongly suggests optimization/RL."""
@@ -95,6 +108,32 @@ def is_optimization_or_rl_task(task_desc: str = "", coldstart_description: str =
     return any(keyword in text for keyword in OPTIMIZATION_RL_KEYWORDS)
 
 
+def infer_task_mode(
+    task_desc: str = "",
+    coldstart_description: str = "",
+    autorealize_context: str = "",
+) -> str:
+    """Route generation by problem structure and required method.
+
+    AutoRealize's structured contract is authoritative. Keyword fallback is
+    used only when that contract is unavailable.
+    """
+
+    if autorealize_context:
+        from utils.autorealize_context import infer_autorealize_task_mode
+
+        structured_mode = infer_autorealize_task_mode(autorealize_context)
+        if structured_mode:
+            return structured_mode
+
+    text = f"{task_desc}\n{coldstart_description}".lower()
+    if any(keyword in text for keyword in RL_METHOD_KEYWORDS):
+        return "rl"
+    if is_optimization_or_rl_task(task_desc, coldstart_description):
+        return "optimization"
+    return "prediction"
+
+
 def get_optimization_rl_strategy(task_desc: str = "", coldstart_description: str = "") -> dict:
     """Conditional guidance for optimization and reinforcement-learning tasks."""
     if not is_optimization_or_rl_task(task_desc, coldstart_description):
@@ -103,12 +142,17 @@ def get_optimization_rl_strategy(task_desc: str = "", coldstart_description: str
     return {
         "Optimization / Reinforcement Learning Strategy (conditional)": [
             "",
-            "**Activate this section only because the task appears to involve optimization, sequential decision-making, or RL. Do not force RL if the problem is better solved by operations research or heuristics.**",
+            "**Activate this section only because the task appears to involve optimization, sequential decision-making, or RL. Problem structure and solution method are separate: a static optimization problem may still require an RL method constructed from static data. Do not force RL when it is neither required nor justified.**",
             "",
             "**First decide the problem family:**",
             "- Static one-shot assignment/routing/scheduling/resource allocation: consider MILP/CP-SAT/OR-Tools when constraints are explicit, or local search, simulated annealing, tabu search, genetic/evolutionary search, or large-neighborhood search.",
             "- Sequential decision task with a simulator, transition dynamics, delayed rewards, or logged trajectories: consider an RL formulation.",
+            "- Static optimization with RL required: construct episodes from problem instances or subproblems, define partial-solution state transitions and legal-action masks, and align terminal reward with the same evaluator used for every method.",
             "- If there are only historical decisions and no safe simulator for exploration, treat it as offline RL or imitation learning; do not use naive online exploration.",
+            "- For static optimization, explicitly check whether nonlinear terms depend on a small bounded integer aggregate state or short local state transition. When they do, consider enumeration/linearization, flow-consistency constraints, MILP/CP-SAT, or dynamic programming before defaulting to a purely local heuristic.",
+            "- Treat a fast feasible heuristic as a potentially valuable incumbent and upper bound. When possible, obtain a relaxation/lower bound, use the bound gap for safe variable or state pruning, and consider fix-and-optimize or exact large-neighborhood search around the incumbent.",
+            "- Exact reformulation is conditional, not mandatory. Reject it when state ranges, global nonlinear dependence, missing evaluator facts, solver availability, memory, or runtime make it unsuitable.",
+            "- Never equate an incumbent with a proof. Preserve solver status, best bound, gap, model size, warm-start source, and independent evaluator replay when those facts are available.",
             "",
             "**If proposing RL, the plan must explicitly define:**",
             "- State / observation: all information available at decision time only; no future leakage.",
@@ -128,9 +172,15 @@ def get_optimization_rl_strategy(task_desc: str = "", coldstart_description: str
             "**Implementation expectations if RL is chosen:**",
             "- Implement a Gymnasium-like environment with `reset(seed=None, options=None)` and `step(action)` returning `(obs, reward, terminated, truncated, info)`.",
             "- Keep reward calculation and constraint checking as deterministic, testable functions.",
-            "- For combinatorial actions, expose `valid_action_mask(obs)` and apply it in policy sampling / greedy action selection. If no action is legal, follow the task contract's documented fallback such as record an infeasible/undecided case, open a new feasible resource bucket if allowed, backtrack/repair, or terminate the episode with an infeasible reason; never silently pick an illegal action.",
+            "- For combinatorial actions, expose `valid_action_mask(obs)` and apply it in policy sampling / greedy action selection. Check `mask.any()` before masked logits or softmax: an all-invalid mask must take a deterministic task-valid fallback, backtrack/repair, or terminate with an infeasible reason; never softmax all `-inf`/large-negative logits, create NaN probabilities, or silently pick an illegal action.",
             "- A search node should represent one coherent method. Do not hide a competing internal comparison method inside an RL node; MLEvolve compares different solution nodes by their final scalar scores.",
-            "- If you claim the node uses RL, the evaluated solution must come from environment interaction plus policy selection/training/configured rollout, and the saved artifact plus `predict` must reproduce that rollout without retraining.",
+            "- If you claim the node uses RL, the evaluated solution must come from environment interaction plus policy selection/training/configured rollout, and the saved artifact plus `rollout` must reproduce that rollout without retraining.",
+            "",
+            "**Curriculum learning when RL is chosen:**",
+            "- Explicitly decide whether curriculum learning is useful. Suitable progressions include small to full instances, relaxed to original constraints, short to full horizons, or heuristic demonstrations / behavior cloning followed by RL fine-tuning. If none is suitable, explain the concrete reason instead of forcing a curriculum.",
+            "- Define level advancement with measured thresholds such as episode success rate, feasible-solution rate, or evaluator score over a fixed validation window; do not advance by training step count alone when the policy is still failing.",
+            "- Keep state/action semantics and the final objective consistent across levels. Dense shaping and relaxed constraints may aid learning but must not replace the official terminal objective or hide infeasibility.",
+            "- End training and model selection on the original full-scale environment, original hard constraints, complete horizon, and official evaluator. A curriculum-level score is never the final comparable score.",
             "",
         ]
     }
@@ -157,9 +207,9 @@ def get_decision_solution_protocol(task_desc: str = "", coldstart_description: s
             "- If the official objective is incomplete, implement the most conservative scalar explicitly supported by the task text and state missing assumptions in the validation summary; do not silently optimize an unrelated score.",
             "",
             "**2. A solution is an artifact, not just a model output.**",
-            "- `predict(model_path, data)` may return a decision plan/solution table/action sequence. It does not have to be a neural-network prediction.",
-            "- For heuristic or rule-based solvers, `model_path` may be a null/ignored placeholder; the function still serves as the reusable entrypoint.",
-            "- The saved artifact may be a solver configuration, fitted estimator, policy checkpoint, preprocessing state, learned cost model, or heuristic parameters, but it must be sufficient to reproduce `predict` without retraining.",
+            "- Non-RL decision methods expose `solve(model_path, data)`; a stateless heuristic/rule/exact solver may accept `model_path=None`.",
+            "- RL or hybrid methods expose `train_policy(data, artifact_dir)` and `rollout(model_path, data)`. The evaluated rollout must load the saved policy without retraining.",
+            "- The saved artifact may be a solver configuration, fitted estimator, policy checkpoint, preprocessing state, learned cost model, or heuristic parameters, but it must be sufficient to reproduce solve/rollout without retraining.",
             "- Static assignment/routing/scheduling problems may use repair/local search/OR methods. Use RL only when a real state/action/transition/reward formulation is natural and evaluable, or when the task explicitly requests an RL/hybrid RL solution.",
             "- For optimization and RL, build feasible candidates with a hard-constraint mask before scoring or sampling actions. The mask should cover known contract/route/resource availability, capacity, time-window, uniqueness, inventory, budget, and schema/entity validity constraints when they apply.",
             "- If the feasible-candidate mask is empty for an item/job/state, handle it explicitly according to the task contract: record an infeasible/undecided case with a reason, try an allowed repair/backtracking/new-resource fallback, or terminate the episode with an infeasible flag. Do not crash, loop forever, or choose a known-illegal action just to keep going.",
@@ -173,12 +223,12 @@ def get_decision_solution_protocol(task_desc: str = "", coldstart_description: s
             "- Do not claim feasibility just because code executed. Feasibility must come from `validate_solution`.",
             "",
             "**4. Execution evidence for improvement.**",
-            "- The parser accepts nodes by the final scalar `Final Validation Score`; `Decision Validation Summary` is optional diagnostic evidence.",
+            "- The result reviewer decides whether the returned solution and its `Final Validation Score` are valid and comparable under this task contract; candidate-printed summaries are supporting evidence, never an automatic pass.",
             "- When useful, print one JSON line prefixed with `Decision Validation Summary:` from the validator / evaluator report.",
             "- If you print the JSON, include task-relevant diagnostics, but do not invent universal progress or violation fields for tasks that do not define them.",
             "- If validation is not clean and you print diagnostics, include actionable details using the task's own concepts, such as invalid action examples, infeasibility reasons, duplicate IDs, unknown IDs, violated constraints, or objective-component diagnostics.",
             "- A partial, infeasible, diagnostic, or empty solution can still be useful when the official scalar score handles that case and the summary explains it.",
-            "- Use `json.dumps(summary, ensure_ascii=False, sort_keys=True)` so the parser and reviewer can inspect it.",
+            "- Use `json.dumps(summary, ensure_ascii=False, sort_keys=True)` so the result reviewer can inspect it.",
             "- The final score must be the value returned by `score_solution`, after validation and official invalid-solution handling.",
             "",
         ]

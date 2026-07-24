@@ -87,7 +87,7 @@ def run(agent, node: SearchNode) -> dict:
             query(
                 system_message={"Introduction": introduction},
                 user_message=(
-                    f"{task_section(agent.task_desc)}\n"
+                    f"{task_section(agent.task_desc, getattr(agent, 'data_preview', ''))}\n"
                     f"# Implementation\n{prompt['Implementation']}\n\n"
                     f"# Execution output\n{prompt['Execution output']}\n\n"
                     f"# Validation metric\n{prompt['Validation metric']}"

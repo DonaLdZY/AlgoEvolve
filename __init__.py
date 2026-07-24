@@ -55,5 +55,10 @@ class Experiment:
         self.interpreter.cleanup_session()
 
         best_node = self.journal.get_best_node()
+        if best_node is None:
+            raise RuntimeError(
+                "Search completed without a delivery-ready solution. "
+                "Inspect provisional nodes in journal.json for continued improvement."
+            )
         return Solution(code=best_node.code, valid_metric=best_node.metric.value)
 

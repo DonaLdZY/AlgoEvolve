@@ -15,7 +15,14 @@ from fastapi import HTTPException
 
 import service_api
 from engine.executor import Interpreter, memory_limited_subprocess_command
-from service_api import JobStore, StartMLEvolveRequest, TaskResourceLimits, _monitor_task_resources, _resolve_resource_limits
+from service_api import (
+    JobStore,
+    StartMLEvolveRequest,
+    TaskResourceLimits,
+    _memory_child_guard_threshold,
+    _monitor_task_resources,
+    _resolve_resource_limits,
+)
 from utils.resource_limits import (
     _macos_mps_devices,
     _nvidia_devices,
@@ -309,6 +316,7 @@ def test_run_job_without_config_path_applies_task_environment(tmp_path: Path, mo
     local_store = JobStore()
     monkeypatch.setattr(service_api, "store", local_store)
     monkeypatch.delenv("MLEVOLVE_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("PYTHONFAULTHANDLER", raising=False)
     cpu_ids = choose_cpu_ids(1)
     workdir = tmp_path / "service-workdir"
     log_dir = tmp_path / "service-logs"
@@ -326,6 +334,7 @@ def test_run_job_without_config_path_applies_task_environment(tmp_path: Path, mo
                 "    'affinity': psutil.Process().cpu_affinity(),",
                 "    'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),",
                 "    'config_path_present': bool(os.environ.get('MLEVOLVE_CONFIG_PATH')),",
+                "    'python_faulthandler': os.environ.get('PYTHONFAULTHANDLER'),",
                 "}))",
             ]
         ),
@@ -356,6 +365,7 @@ def test_run_job_without_config_path_applies_task_environment(tmp_path: Path, mo
     assert payload["affinity"] == cpu_ids
     assert payload["cuda_visible_devices"] == ""
     assert payload["config_path_present"] is False
+    assert payload["python_faulthandler"] == "1"
     assert (log_dir / "resource_usage.json").exists()
 
 
@@ -497,6 +507,52 @@ def test_memory_monitor_observes_limit_without_terminating_task(tmp_path: Path, 
     assert proc.returncode == 0
     assert status.resource_violation is None
     assert status.peak_memory_bytes > int(0.02 * (1024**3))
+
+
+def test_hard_memory_limit_reserves_controller_headroom(monkeypatch, tmp_path: Path) -> None:
+    memory_limit = 8 * 1024**3
+    guard_threshold = _memory_child_guard_threshold(memory_limit, True)
+    assert guard_threshold == memory_limit - memory_limit // 10
+
+    local_store = JobStore()
+    monkeypatch.setattr(service_api, "store", local_store)
+    job = local_store.create(
+        "hard-limit-guard",
+        str(tmp_path / "logs"),
+        str(tmp_path / "workspace"),
+    )
+    stop_event = threading.Event()
+    observed: dict[str, int] = {}
+
+    class FakeProcess:
+        pid = 43210
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_relieve(_root_pid: int, threshold: int):
+        observed["threshold"] = threshold
+        stop_event.set()
+        return SimpleNamespace(
+            action="terminated_child",
+            child_pid=43211,
+            observed_bytes=threshold + 1,
+            limit_bytes=threshold,
+        )
+
+    monkeypatch.setattr(service_api, "apply_process_tree_cpu_affinity", lambda *_args: [])
+    monkeypatch.setattr(service_api, "process_tree_memory_bytes", lambda _pid: guard_threshold + 1)
+    monkeypatch.setattr(service_api, "relieve_process_tree_memory_pressure", fake_relieve)
+    limits = TaskResourceLimits(memory_limit_gb=8, monitor_interval_seconds=0.1)
+
+    _monitor_task_resources(job.job_id, FakeProcess(), limits, [], stop_event, True)
+
+    status = local_store.status(job.job_id)
+    assert observed["threshold"] == guard_threshold
+    assert status.resource_warning is not None
+    assert "MLEvolve controller continues" in status.resource_warning
+    assert "configured limit=8.00 GiB" in status.resource_warning
 
 
 def test_memory_fallback_stops_child_but_preserves_controller(tmp_path: Path, monkeypatch) -> None:

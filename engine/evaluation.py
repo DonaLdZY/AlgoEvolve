@@ -3,10 +3,76 @@
 import logging
 import time
 import random
+import threading
 
 from engine.search_node import SearchNode
 
 logger = logging.getLogger("MLEvolve")
+
+
+def _update_virtual_visits(node: SearchNode | None, delta: int) -> None:
+    while node is not None:
+        current = int(getattr(node, "virtual_visits", 0) or 0)
+        node.virtual_visits = max(0, current + delta)
+        node = node.parent
+
+
+class ExpansionReservation:
+    """One parallel MCTS selection, settled exactly once after review/failure."""
+
+    def __init__(self, parent: SearchNode, tree_lock=None) -> None:
+        self.parent = parent
+        self._tree_lock = tree_lock
+        self._state_lock = threading.Lock()
+        self._active = True
+        self._with_tree_lock(lambda: _update_virtual_visits(parent, 1))
+
+    @property
+    def active(self) -> bool:
+        with self._state_lock:
+            return self._active
+
+    def _with_tree_lock(self, callback) -> None:
+        if self._tree_lock is None:
+            callback()
+            return
+        with self._tree_lock:
+            callback()
+
+    def _claim(self) -> bool:
+        with self._state_lock:
+            if not self._active:
+                return False
+            self._active = False
+            return True
+
+    def settle_result(self, node: SearchNode, reward: float) -> bool:
+        if not self._claim():
+            return False
+
+        def apply() -> None:
+            _update_virtual_visits(self.parent, -1)
+            backpropagate(node, reward)
+
+        self._with_tree_lock(apply)
+        return True
+
+    def settle_failure(self, reward: float = -1.0) -> bool:
+        if not self._claim():
+            return False
+
+        def apply() -> None:
+            _update_virtual_visits(self.parent, -1)
+            backpropagate(self.parent, reward)
+
+        self._with_tree_lock(apply)
+        return True
+
+    def cancel(self) -> bool:
+        if not self._claim():
+            return False
+        self._with_tree_lock(lambda: _update_virtual_visits(self.parent, -1))
+        return True
 
 
 def backpropagate(node: SearchNode, value: float, add_to_tree=True):
@@ -21,8 +87,6 @@ def backpropagate(node: SearchNode, value: float, add_to_tree=True):
             node.parent.continue_improve = node.continue_improve
         if node.stage in ["draft", "fusion_draft"] and node.lock:
             node.lock = False
-        if node.improve_failure_depth > 0:
-            node.improve_failure_depth = 0
         node.update(value, add_to_tree)
         node = node.parent
 
@@ -47,6 +111,16 @@ def get_node_reward(agent, node: SearchNode):
             else:
                 reward += 1
     return reward
+
+
+def _commit_review_reward(agent, node: SearchNode) -> None:
+    reward = get_node_reward(agent, node)
+    reservation = getattr(node, "_expansion_reservation", None)
+    if isinstance(reservation, ExpansionReservation):
+        reservation.settle_result(node, reward)
+        node._expansion_reservation = None
+    else:
+        backpropagate(node, reward)
 
 
 def check_improvement(agent, cur_node: SearchNode, parent_node: SearchNode):
@@ -128,8 +202,7 @@ def check_improvement(agent, cur_node: SearchNode, parent_node: SearchNode):
                         cur_node.local_best_node = cur_node
                         logger.info(f"  └─ Set as local_best: {cur_node.metric.value:.4f}")
 
-                reward = get_node_reward(agent, cur_node)
-                backpropagate(cur_node, reward)
+                _commit_review_reward(agent, cur_node)
                 return True
 
     local_best_node = cur_node.local_best_node
@@ -185,9 +258,7 @@ def check_improvement(agent, cur_node: SearchNode, parent_node: SearchNode):
             if cur_node.debug_depth >= agent.scfg.max_debug_depth:
                 cur_node.is_terminal = True
 
-    if should_backpropagate:
-        reward = get_node_reward(agent, cur_node)
-        backpropagate(cur_node, reward)
-    else:
+    _commit_review_reward(agent, cur_node)
+    if not should_backpropagate:
         agent.current_node_list.append(cur_node)
     return should_backpropagate

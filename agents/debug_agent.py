@@ -16,6 +16,12 @@ from agents.coder.diff_coder import SearchReplacePatcher, DIFF_SYS_FORMAT
 from agents.planner import build_chat_prompt_for_model
 from agents.triggers import register_node
 from agents.prompt_cache import dataset_reference_sentence, routed_data_context, task_section
+from engine.expansion_profile import ExpansionProfile
+from agents.prompt_policy import (
+    dynamic_expansion_instruction,
+    ensure_expansion_profile,
+    scoped_search_memory,
+)
 
 logger = logging.getLogger("MLEvolve")
 
@@ -58,7 +64,14 @@ def _format_debug_memory_guidance(agent, similar_fixes: List[Tuple]) -> str:
     return "\n".join(guidance_parts)
 
 
-def run(agent, parent_node: SearchNode) -> SearchNode:
+def run(
+    agent,
+    parent_node: SearchNode,
+    expansion_profile: ExpansionProfile | None = None,
+) -> SearchNode:
+    expansion_profile = ensure_expansion_profile(
+        agent, parent_node, expansion_profile, "debug"
+    )
     data_context = routed_data_context(agent, "code_review")
     output_requirement = (
         "Complete test inference and submission.csv generation"
@@ -114,7 +127,7 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
         "Bugfix improvement sketch guideline": [
             "- You should write a brief natural language description (2-3 sentences) of how the issue in the previous implementation can be fixed.\n",
             "- Don't suggest to do EDA.\n",
-            "- Most libraries are stable and available. The bug is not caused by the library version mismatch. **Don't suggest to reinstall the core libraries.** (like pip install torch, pip upgrade transformers, !pip install tensorflow, subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'transformers', 'accelerate', 'pandas', 'torch', 'torchvision']))\n",
+            "- Do not execute pip/conda/shell installation from solution code. For an exact missing-package error, preserve or add only the controlled declaration comment `# MLEVOLVE_PIP_INSTALL: pip install <distribution>` when automatic dependency installation is enabled; the runtime owns installation and retry. Never upgrade or reinstall core libraries.\n",
         ],
     }
     optimization_or_rl = is_optimization_or_rl_task(
@@ -123,8 +136,9 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
     )
     if optimization_or_rl:
         prompt["Instructions"]["Decision-task debug priorities"] = [
+            "- When this is a fast-draft repair, preserve the selected core method. Encoding, path, dependency, package-API, serialization, and output-wrapper failures are integration failures, not evidence that the algorithm should be replaced.",
             "- If the parent analysis shows a no-op/placeholder/diagnostic solution or a task-specific validator bottleneck, first repair feasible candidate generation and data/schema mapping. Do not spend this debug attempt tuning PPO/DQN epochs, neural dimensions, or reward shaping.",
-            "- If the parent has a partial but scored solution, preserve its `load_problem_data`, `validate_solution`, `score_solution`, optional diagnostics, and output schema. Debug should reduce the named bottleneck reported by the task-specific validator, parser analysis, or execution trace.",
+            "- If the parent has a partial but scored solution, preserve its `load_problem_data`, `validate_solution`, `score_solution`, optional diagnostics, and output schema. Debug should reduce the named bottleneck reported by the task-specific validator, result review, or execution trace.",
             "- For invalid actions or infeasible candidate choices, add or fix a task-defined constraint mask before selection. If the legal-action mask is empty, follow the task contract's fallback with reason examples instead of selecting a known-illegal action or crashing.",
             "- If task constraints make a complete/feasible solution impossible under the available data, keep the official penalized score and report the task-defined remaining/impossible cases as counts and examples. Do not crash or force fake decisions.",
             "- The fixed script should print task-appropriate diagnostics when useful, but acceptance depends on the final scalar score rather than any required diagnostic field.",
@@ -166,16 +180,24 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
 
     base_instructions = "\n# Instructions\n\n"
     base_instructions += compile_prompt_to_md(prompt["Instructions"], 2)
+    scoped_memory = scoped_search_memory(agent, parent_node, "debug")
+    expansion_control = dynamic_expansion_instruction(
+        agent, expansion_profile, operator="debug"
+    )
 
     def build_prompt_complete(instructions_with_format, use_full_code_requirement=False):
         current_introduction = introduction_base + (full_code_requirement if use_full_code_requirement else "")
-        user_prompt = f"{task_section(prompt['Task description'], data_context)}{instructions_with_format}"
+        user_prompt = (
+            f"{task_section(prompt['Task description'], data_context)}"
+            f"{instructions_with_format}\n# Debug ancestor evidence\n{scoped_memory}\n\n"
+            f"{expansion_control}"
+        )
         assistant_prefix = (
             "Let me approach this systematically.\n"
             f"{dataset_reference_sentence(prompt['Task description'], data_context)}\n"
             f"The code that needs fixing:\n{prompt['Previous (buggy) implementation']}\n"
             f"The error/issue encountered:\n{prompt['Execution output']}\n"
-            f"Analyzing the root cause and parser facts:\n{parent_node.analysis_for_prompt}\n"
+            f"Analyzing the root cause and result-review evidence:\n{parent_node.analysis_for_prompt}\n"
             "I'll now fix this issue."
         )
         return build_chat_prompt_for_model(agent.acfg.code.model, current_introduction, user_prompt, assistant_prefix)

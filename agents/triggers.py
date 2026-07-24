@@ -2,29 +2,7 @@ import logging
 
 from engine.search_node import SearchNode
 
-from engine.conditions import should_trigger_branch_fusion
-
 logger = logging.getLogger("MLEvolve")
-
-
-def should_check_data_leakage(agent, node: SearchNode) -> bool:
-    if node.metric is None or node.metric.is_worst:
-        return False
-
-    metric_value = node.metric.value
-    maximize = agent.metric_maximize
-
-    if maximize:
-        is_extreme = (metric_value == 1.0)
-    else:
-        is_extreme = (metric_value == 0.0)
-
-    if is_extreme:
-        logger.info(
-            f"Node {node.id} triggers data leakage check: "
-            f"extreme value {metric_value} (maximize={maximize})"
-        )
-    return is_extreme
 
 
 def get_patience_counter(agent, parent_node: SearchNode) -> tuple:
@@ -75,12 +53,21 @@ def register_node(agent, node: SearchNode, prompt, parent_node=None, new_branch:
     node.prompt_input = agent._serialize_prompt(prompt)
     node.created_time = time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    if new_branch:
-        node.branch_id = agent.next_branch_id
-        agent.next_branch_id += 1
-        agent.branch_all_nodes[node.branch_id] = [node]
-        agent.branch_successful_nodes[node.branch_id] = []
+    state_lock = getattr(agent, "tree_state_lock", None)
+
+    def _register_branch_state() -> None:
+        if new_branch:
+            node.branch_id = agent.next_branch_id
+            agent.next_branch_id += 1
+            agent.branch_all_nodes[node.branch_id] = [node]
+            agent.branch_successful_nodes[node.branch_id] = []
+        else:
+            node.branch_id = parent_node.branch_id
+            if node.branch_id in agent.branch_all_nodes:
+                agent.branch_all_nodes[node.branch_id].append(node)
+
+    if state_lock is None:
+        _register_branch_state()
     else:
-        node.branch_id = parent_node.branch_id
-        if node.branch_id in agent.branch_all_nodes:
-            agent.branch_all_nodes[node.branch_id].append(node)
+        with state_lock:
+            _register_branch_state()

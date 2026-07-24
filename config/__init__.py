@@ -38,7 +38,8 @@ class StageConfig:
     api_key: str
     enable_thinking: bool | None = None
     reasoning_effort: str | None = None
-    max_tokens: int | None = None
+    minimum_output_tokens: int = 32768
+    max_tokens: int | None = 32768
     request_timeout_seconds: float = 1200.0
     network_retry_max_attempts: int = 5
     network_retry_base_sleep_seconds: float = 5.0
@@ -47,6 +48,8 @@ class StageConfig:
     generation_retry_delay_seconds: float = 3.0
     continuation_max_rounds: int = 2
     continuation_overlap_scan_chars: int = 4096
+    # Used only for local headroom accounting; zero means unknown/provider-managed.
+    context_window_tokens: int = 0
 
 
 @dataclass
@@ -54,11 +57,25 @@ class DraftConfig:
     """Initial draft generation and visibility controls."""
 
     fast_first_draft: bool = True
+    fast_first_draft_skip_pre_review: bool = True
+    # Deprecated: first-result sequencing replaces synchronous repair blocking.
+    fast_first_draft_max_repairs: int = 2
+    # Deprecated: full AutoRealize context is always used.
+    fast_first_draft_compact_context: bool = False
     use_stepwise_after_first: bool = True
-    optimization_initial_drafts_cap: int = 1
+    # Deprecated compatibility field. agent.initial_drafts is authoritative.
+    optimization_initial_drafts_cap: int = 0
     show_pending_draft_nodes: bool = True
+    # Deprecated: execution is now scheduled by a priority queue.
     submission_stagger_seconds: float = 10.0
-    stepwise_stage_context: bool = True
+    # Deprecated: full AutoRealize context is always used.
+    stepwise_stage_context: bool = False
+    stepwise_accumulate_context: bool = True
+    stepwise_context_max_tokens: int = 90000
+    stepwise_compaction_keep_recent_steps: int = 2
+    stepwise_compaction_max_tokens: int = 32768
+    stepwise_context_headroom_ratio: float = 0.15
+    stepwise_snapshot_dirname: str = "context_snapshots"
 
 
 @dataclass
@@ -66,15 +83,16 @@ class RetryConfig:
     """Agent-level structured-output and review retry policy."""
 
     code_review_max_attempts: int = 2
+    preflight_regeneration_max_attempts: int = 2
     code_review_delay_seconds: float = 5.0
     code_review_model_role: str = "feedback"
     code_review_escalate_to_code: bool = True
     code_generation_extract_max_attempts: int = 2
-    human_insight_async: bool = True
     metric_direction_max_attempts: int = 3
     metric_direction_delay_seconds: float = 1.0
     result_parse_max_attempts: int = 3
     refine_plan_max_attempts: int = 3
+    result_adjudicator_on_anomaly: bool = True
 
 @dataclass
 class DecayConfig:
@@ -117,6 +135,8 @@ class SearchConfig:
     fusion_max_time_hours: float
     fusion_min_successful_nodes: int
     fusion_min_branches: int
+    root_new_draft_probability: float = 0.25
+    fusion_min_remaining_seconds: int = 300
 
 @dataclass
 class AgentConfig:
@@ -145,10 +165,30 @@ class AgentConfig:
     use_diff_mode: bool = True
     draft: DraftConfig = field(default_factory=DraftConfig)
     retries: RetryConfig = field(default_factory=RetryConfig)
+    use_optimization_experience_library: bool = True
+    optimization_experience_library_path: str = ""
+    optimization_experience_max_cards: int = 2
+    optimization_experience_min_score: float = 3.0
+    optimization_experience_max_chars: int = 6000
+    output_language: str = "english"
 @dataclass
 class ExecConfig:
     timeout: int
     agent_file_name: str
+    auto_install_missing_dependencies: bool = True
+    dependency_install_policy: str = "ai_declared"
+    dependency_install_target_path: str = ""
+    dependency_install_timeout_seconds: int = 600
+    dependency_install_lock_timeout_seconds: int = 900
+    dependency_install_max_packages_per_execution: int = 3
+    dependency_install_output_tail_chars: int = 8000
+    dependency_install_allowlist: list[str] = field(default_factory=list)
+    dependency_import_map: dict[str, str] = field(default_factory=dict)
+    dependency_package_specs: dict[str, str] = field(default_factory=dict)
+    dependency_install_log_filename: str = "dependency_installations.jsonl"
+    dependency_install_summary_filename: str = "dependency_installations_summary.json"
+    dependency_install_central_log_path: str = ""
+    dependency_install_central_summary_path: str = ""
 
 
 @dataclass
@@ -169,17 +209,29 @@ class RuntimeConfig:
     """Process lifecycle, resume behavior, and state-file controls."""
 
     resume_run: bool = False
+    # ``total`` keeps configured limits as cumulative run targets. ``additional``
+    # treats them as fresh budget appended to the restored checkpoint.
+    resume_budget_mode: str = "total"
     run_timestamp: str = ""
     cleanup_empty_workspace_on_exit: bool = True
     force_process_exit_on_timeout: bool = True
+    exit_immediately_after_interrupt_checkpoint: bool = True
     write_pending_nodes: bool = True
     pending_nodes_filename: str = "pending_nodes.json"
     run_status_filename: str = "run_status.json"
     state_write_max_attempts: int = 5
     state_write_retry_delay_seconds: float = 0.05
     scheduler_poll_seconds: float = 1.0
+    save_search_state: bool = True
+    search_state_filename: str = "search_state.json"
+    search_state_checkpoint_seconds: float = 5.0
+    checkpoint_manifest_filename: str = "checkpoint_manifest.json"
+    restore_inflight_actions: bool = True
+    restore_random_state: bool = True
+    service_startup_buffer_seconds: int = 1800
     graceful_shutdown_buffer_seconds: int = 600
     termination_wait_seconds: int = 20
+    interruption_checkpoint_wait_seconds: int = 30
     snapshot_journal_max_bytes: int = 157286400
     snapshot_event_limit: int = 400
     snapshot_text_tail_chars: int = 200000
@@ -201,6 +253,9 @@ class LoggingConfig:
     write_console_log: bool = True
     brief_log_filename: str = "MLEvolve.log"
     verbose_log_filename: str = "MLEvolve.verbose.log"
+    brief_log_max_bytes: int = 67108864
+    verbose_log_max_bytes: int = 268435456
+    log_backup_count: int = 2
     suppress_httpx_logs: bool = True
 
 
@@ -314,6 +369,17 @@ def prep_cfg(cfg: Config):
             "You must provide either a description of the task goal (`goal=...`) or a path to a plaintext file containing the description (`desc_file=...`)."
         )
 
+    # Generation and execution now share the same actual worker count. Silently
+    # discard this retired key so saved configs from older runs remain resumable.
+    search_cfg = OmegaConf.select(cfg, "agent.search")
+    if search_cfg is not None and "generation_parallel_num" in search_cfg:
+        del search_cfg["generation_parallel_num"]
+    if search_cfg is not None and "pending_execution_headroom" in search_cfg:
+        del search_cfg["pending_execution_headroom"]
+    draft_cfg = OmegaConf.select(cfg, "agent.draft")
+    if draft_cfg is not None and "decouple_generation_execution" in draft_cfg:
+        del draft_cfg["decouple_generation_execution"]
+
     if cfg.data_dir.startswith("example_tasks/"):
         cfg.data_dir = Path(__file__).parent.parent / cfg.data_dir
     cfg.data_dir = Path(cfg.data_dir).resolve()
@@ -372,9 +438,24 @@ def prep_cfg(cfg: Config):
     cfg.resources.monitor_interval_seconds = max(0.1, float(cfg.resources.monitor_interval_seconds))
     cfg.cpu_number = str(cfg.resources.cpu_cores)
 
+    cfg.runtime.resume_budget_mode = str(
+        cfg.runtime.resume_budget_mode or "total"
+    ).strip().lower()
+    if cfg.runtime.resume_budget_mode not in {"total", "additional"}:
+        raise ValueError("runtime.resume_budget_mode must be one of: total, additional")
+
     # Normalize model endpoints after schema merge so runtime clients see the right URL.
     cfg.agent.code.base_url = _normalize_model_base_url(cfg.agent.code.model, cfg.agent.code.base_url)
     cfg.agent.feedback.base_url = _normalize_model_base_url(cfg.agent.feedback.model, cfg.agent.feedback.base_url)
+    from agents.prompt_policy import normalize_output_language
+
+    cfg.agent.output_language = normalize_output_language(cfg.agent.output_language)
+    cfg.agent.code.context_window_tokens = max(0, int(cfg.agent.code.context_window_tokens or 0))
+    cfg.agent.feedback.context_window_tokens = max(0, int(cfg.agent.feedback.context_window_tokens or 0))
+    cfg.agent.draft.stepwise_context_headroom_ratio = min(
+        0.5,
+        max(0.05, float(cfg.agent.draft.stepwise_context_headroom_ratio)),
+    )
     cfg.agent.code.api_key = (
         str(cfg.agent.code.api_key or "").strip()
         or os.environ.get("MLEVOLVE_CODE_API_KEY", "").strip()
@@ -485,7 +566,7 @@ def save_run(cfg: Config, journal):
         OmegaConf.save(config=_redacted_cfg(cfg), f=cfg.log_dir / "config.yaml")
     
     # save the best found solution
-    best_node = journal.get_best_node()
+    best_node = journal.get_best_node(only_good=True)
     if best_node is not None and bool(getattr(runtime_cfg, "save_best_solution", True)):
         with open(cfg.log_dir / "best_solution.py", "w") as f:
             f.write(best_node.code)

@@ -14,6 +14,15 @@ from agents.coder.diff_coder import diff_generate_and_apply
 from engine import solution_manager
 from agents.triggers import register_node
 from agents.prompt_cache import dataset_reference_sentence, routed_data_context, task_section
+from engine.expansion_profile import ExpansionProfile
+from agents.prompt_policy import (
+    autonomous_method_selection_guidance,
+    dynamic_expansion_instruction,
+    ensure_expansion_profile,
+    scoped_search_memory,
+    infer_task_family,
+    method_family_for_node,
+)
 
 logger = logging.getLogger("MLEvolve")
 
@@ -26,6 +35,16 @@ def _get_fusion_candidates(agent, parent_node: SearchNode) -> List[SearchNode]:
             branch_candidates = solution_manager.get_branch_top_nodes(agent,branch_id, top_k=2)
             candidates.extend(branch_candidates)
 
+    task_family = infer_task_family(agent)
+    parent_family = method_family_for_node(parent_node, task_family=task_family)
+    complementary = [
+        node
+        for node in candidates
+        if method_family_for_node(node, task_family=task_family) != parent_family
+    ]
+    if complementary:
+        candidates = complementary
+
     if not candidates:
         current_branch_candidates = solution_manager.get_branch_top_nodes(agent,parent_node.branch_id, top_k=2)
         candidates = [node for node in current_branch_candidates if node.id != parent_node.id]
@@ -34,7 +53,15 @@ def _get_fusion_candidates(agent, parent_node: SearchNode) -> List[SearchNode]:
     return candidates
 
 
-def fuse_two_nodes(agent, source_node: SearchNode, target_node: SearchNode) -> SearchNode:
+def fuse_two_nodes(
+    agent,
+    source_node: SearchNode,
+    target_node: SearchNode,
+    expansion_profile: ExpansionProfile | None = None,
+) -> SearchNode:
+    expansion_profile = ensure_expansion_profile(
+        agent, source_node, expansion_profile, "fusion"
+    )
     introduction = (
         "You are a Kaggle grandmaster attending a competition. "
         "You are provided with a successful reference solution from another approach below. "
@@ -45,6 +72,12 @@ def fuse_two_nodes(agent, source_node: SearchNode, target_node: SearchNode) -> S
 
     reference_trajectory = target_node.generate_node_trajectory(need_code=True)
 
+    scoped_memory = scoped_search_memory(
+        agent, source_node, "fusion", source_nodes=[target_node]
+    )
+    expansion_control = dynamic_expansion_instruction(
+        agent, expansion_profile, operator="fusion"
+    )
     prompt: Any = {
         "Introduction": introduction,
         "Task description": agent.task_desc,
@@ -55,8 +88,10 @@ def fuse_two_nodes(agent, source_node: SearchNode, target_node: SearchNode) -> S
             "Analysis": source_node.analysis_for_prompt if source_node.analysis_for_prompt else 'N/A'
         },
         "Reference Solution": reference_trajectory,
+        "Memory": f"{scoped_memory}\n\n{expansion_control}",
         "Instructions": {},
     }
+    prompt["Instructions"]["Method selection autonomy"] = autonomous_method_selection_guidance()
 
     prompt["Instructions"] |= {
         "🔬 Critical: Scientific Approach to Fusion": [
@@ -87,7 +122,8 @@ def fuse_two_nodes(agent, source_node: SearchNode, target_node: SearchNode) -> S
 
     user_prompt = (
         f"{task_section(prompt['Task description'], routed_data_context(agent, 'merge'))}\n"
-        f"{instructions}\n# Reference Solution\n{prompt['Reference Solution']}"
+        f"{instructions}\n# Reference Solution\n{prompt['Reference Solution']}\n"
+        f"# Scoped fusion evidence\n{prompt['Memory']}"
     )
     assistant_prefix = (
         "Let me approach this systematically.\n"
@@ -130,8 +166,14 @@ def fuse_two_nodes(agent, source_node: SearchNode, target_node: SearchNode) -> S
 
 
 def _fuse_with_multiple_references(
-    agent, parent_node: SearchNode, reference_nodes: List[SearchNode]
+    agent,
+    parent_node: SearchNode,
+    reference_nodes: List[SearchNode],
+    expansion_profile: ExpansionProfile | None = None,
 ) -> SearchNode:
+    expansion_profile = ensure_expansion_profile(
+        agent, parent_node, expansion_profile, "fusion"
+    )
     introduction = (
         "You are a Kaggle grandmaster attending a competition. "
         "You are provided with multiple successful solutions from different approaches below. "
@@ -146,6 +188,12 @@ def _fuse_with_multiple_references(
         reference_summaries.append(trajectory)
     reference_memory = "\n-------------------------------\n".join(reference_summaries)
 
+    scoped_memory = scoped_search_memory(
+        agent, parent_node, "fusion", source_nodes=reference_nodes
+    )
+    expansion_control = dynamic_expansion_instruction(
+        agent, expansion_profile, operator="fusion"
+    )
     prompt: Any = {
         "Introduction": introduction,
         "Task description": agent.task_desc,
@@ -156,8 +204,10 @@ def _fuse_with_multiple_references(
             "Analysis": parent_node.analysis_for_prompt if parent_node.analysis_for_prompt else 'N/A'
         },
         "Reference Solutions": reference_memory,
+        "Memory": f"{scoped_memory}\n\n{expansion_control}",
         "Instructions": {},
     }
+    prompt["Instructions"]["Method selection autonomy"] = autonomous_method_selection_guidance()
 
     prompt["Instructions"] |= {
         "🔬 Critical: Scientific Approach to Multi-Reference Fusion": [
@@ -188,7 +238,8 @@ def _fuse_with_multiple_references(
 
     user_prompt = (
         f"{task_section(prompt['Task description'], routed_data_context(agent, 'merge'))}\n"
-        f"{instructions}\n# Reference Solutions\n{prompt['Reference Solutions']}"
+        f"{instructions}\n# Reference Solutions\n{prompt['Reference Solutions']}\n"
+        f"# Scoped fusion evidence\n{prompt['Memory']}"
     )
     assistant_prefix = (
         "Let me approach this systematically.\n"
@@ -230,26 +281,41 @@ def _fuse_with_multiple_references(
     return fused_node
 
 
-def run(agent, parent_node: SearchNode) -> SearchNode:
+def run(
+    agent,
+    parent_node: SearchNode,
+    expansion_profile: ExpansionProfile | None = None,
+) -> SearchNode:
+    expansion_profile = ensure_expansion_profile(
+        agent, parent_node, expansion_profile, "fusion"
+    )
     candidates = _get_fusion_candidates(agent, parent_node)
 
     if not candidates:
         logger.info(f"No fusion candidates found for node {parent_node.id}, falling back to normal improve")
-        return run_improve(agent, parent_node)
+        return run_improve(
+            agent, parent_node, expansion_profile=expansion_profile.with_operator("improve")
+        )
 
     if len(candidates) == 1:
-        fused_node = fuse_two_nodes(agent, parent_node, candidates[0])
+        fused_node = fuse_two_nodes(
+            agent, parent_node, candidates[0], expansion_profile=expansion_profile
+        )
         parent_node.add_expected_child_count()
         return fused_node
 
     elif len(candidates) <= 5:
-        fused_node = _fuse_with_multiple_references(agent, parent_node, candidates)
+        fused_node = _fuse_with_multiple_references(
+            agent, parent_node, candidates, expansion_profile=expansion_profile
+        )
         parent_node.add_expected_child_count()
         return fused_node
 
     else:
         top_5_candidates = candidates[:5]
-        fused_node = _fuse_with_multiple_references(agent, parent_node, top_5_candidates)
+        fused_node = _fuse_with_multiple_references(
+            agent, parent_node, top_5_candidates, expansion_profile=expansion_profile
+        )
         parent_node.add_expected_child_count()
         return fused_node
 

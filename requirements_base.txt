@@ -7,6 +7,7 @@ omegaconf>=2.3.0,<3
 pydantic>=2.7.0,<3
 dataclasses-json>=0.6.7,<1
 jsonschema>=4.22.0,<5
+packaging>=24.0,<26
 
 # LLM providers and retry helpers
 openai>=1.40.0,<3

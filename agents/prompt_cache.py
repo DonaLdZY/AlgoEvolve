@@ -14,6 +14,7 @@ DATA_CONTEXT_REFERENCE = (
     "The stable task and data context is already provided in the Task description "
     "section above. Do not expect it to be repeated here."
 )
+TASK_CONTEXT_END_MARKER = "# End stable task/data context"
 
 
 def _norm(text: Any) -> str:
@@ -57,7 +58,7 @@ def dynamic_data_reference(task_desc: Any, data_preview: Any) -> str:
 
 def task_section(task_desc: Any, data_preview: Any = "") -> str:
     context = stable_data_context(task_desc, data_preview)
-    return f"\n# Task description\n{context}\n"
+    return f"\n# Task description\n{context}\n\n{TASK_CONTEXT_END_MARKER}\n"
 
 
 def dataset_reference_sentence(task_desc: Any, data_preview: Any = "") -> str:
@@ -75,14 +76,7 @@ def context_fingerprint(text: Any) -> str:
 
 
 def routed_data_context(agent: Any, stage: str) -> str:
-    """Return a stage-specific AutoRealize view when routing is enabled."""
+    """Return the complete AutoRealize context for every search stage."""
 
-    preview = _norm(getattr(agent, "data_preview", ""))
-    enabled = bool(
-        getattr(getattr(getattr(agent, "acfg", None), "draft", None), "stepwise_stage_context", True)
-    )
-    if not enabled:
-        return preview
-    from utils.autorealize_context import select_autorealize_context_for_stage
-
-    return select_autorealize_context_for_stage(preview, stage)
+    del stage
+    return _norm(getattr(agent, "data_preview", ""))

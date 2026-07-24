@@ -2,11 +2,19 @@
 
 import shutil
 import logging
+import json
+import os
+import re
+import time
+import uuid
 from collections import defaultdict
+from pathlib import Path
 from typing import List
 
 from engine.model_artifacts import find_model_artifacts
 from engine.search_node import SearchNode
+from engine.solution_protocol import interface_for, solution_manifest
+from agents.prompt_policy import infer_task_family
 
 logger = logging.getLogger("MLEvolve")
 
@@ -47,6 +55,12 @@ def write_metric_file(filepath, node, metric_maximize: bool) -> None:
         else:
             f.write(f"From Top-K: False\n")
 
+        f.write(f"Search Eligible: {bool(getattr(node, 'search_eligible', False))}\n")
+        f.write(f"Result Review Verdict: {getattr(node, 'review_verdict', '') or 'N/A'}\n")
+        f.write(f"Score Recomputed: {bool(getattr(node, 'score_recomputed', False))}\n")
+        f.write(f"Evidence Source: {getattr(node, 'certification_source', '') or 'N/A'}\n")
+        f.write(f"Method Mode: {getattr(node, 'method_mode', 'unknown')}\n")
+
         if node.exec_time is not None:
             f.write(f"Execution Time(s): {node.exec_time:.2f}\n")
         else:
@@ -86,6 +100,32 @@ def copy_model_artifacts(agent, node: SearchNode, target_dir) -> None:
         (target_dir / "model_path.txt").write_text(str(primary), encoding="utf-8")
 
 
+def write_solution_manifest(agent, node: SearchNode, target_dir: Path) -> dict:
+    """Write the finite cross-system interface contract next to exported code."""
+
+    interface = interface_for(
+        task_family=infer_task_family(agent),
+        method_family=str(getattr(node, "method_family", "unknown") or "unknown"),
+    )
+    model_path_file = target_dir / "model_path.txt"
+    artifact_path = (
+        model_path_file.read_text(encoding="utf-8").strip()
+        if model_path_file.exists()
+        else None
+    )
+    payload = solution_manifest(
+        interface,
+        artifact_path=artifact_path or None,
+        node_id=str(node.id),
+        method_family=str(getattr(node, "method_family", "unknown") or "unknown"),
+    )
+    (target_dir / "solution_manifest.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return payload
+
+
 def save_best_solution(agent, result_node, submission_file_path) -> None:
     """Save best solution code, submission, and meta to disk (thread-safe via agent.save_node_lock)."""
     best_solution_dir = agent.cfg.workspace_dir / "best_solution"
@@ -114,6 +154,7 @@ def save_best_solution(agent, result_node, submission_file_path) -> None:
             f.write(str(result_node.id))
 
         copy_model_artifacts(agent, result_node, best_solution_dir)
+        write_solution_manifest(agent, result_node, best_solution_dir)
 
         write_metric_file(
             best_solution_dir / "metric.txt",
@@ -127,7 +168,13 @@ def update_top_candidates(agent, new_node: SearchNode) -> None:
     Only consider nodes that are not buggy and have a valid metric value.
     Each branch contributes at most 5 candidates to ensure diversity.
     """
-    if not new_node or new_node.is_buggy or not new_node.metric or new_node.metric.value is None or new_node.is_valid is False:
+    if (
+        not new_node
+        or not getattr(new_node, "search_eligible", False)
+        or getattr(new_node, "is_valid", None) is False
+        or not new_node.metric
+        or new_node.metric.value is None
+    ):
         return
 
     # Avoid duplicates (by node id)
@@ -201,6 +248,7 @@ def save_top_candidates(agent) -> None:
                     agent.metric_maximize,
                 )
                 copy_model_artifacts(agent, node, rank_dir)
+                write_solution_manifest(agent, node, rank_dir)
             except Exception as e:
                 logger.error(f"Failed to save top{rank} solution files for node {node.id}: {e}")
 
@@ -230,6 +278,197 @@ def save_top_candidates(agent) -> None:
                             except Exception as e:
                                 logger.error(f"Failed to copy alternative submission for node {node.id}: {e}")
                             break
+
+
+def rebuild_top_candidates(agent) -> list[SearchNode]:
+    """Rebuild the deliverable Top-K from the durable journal after resume/interrupt."""
+    agent.top_candidates = []
+    for node in agent.journal.nodes:
+        update_top_candidates(agent, node)
+    return list(agent.top_candidates)
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    data = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(path)
+
+
+def _remove_stale_rank_dirs(root: Path, keep_count: int) -> None:
+    if not root.exists():
+        return
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        match = re.fullmatch(r"top(\d+)", child.name)
+        if match and int(match.group(1)) > keep_count:
+            shutil.rmtree(child)
+
+
+def _save_checkpoint_candidates(agent, nodes: list[SearchNode]) -> list[dict]:
+    """Export searchable candidates without presenting them as delivery-ready Top-K."""
+    root = agent.cfg.workspace_dir / "checkpoint_candidates"
+    rows: list[dict] = []
+    with agent.save_node_lock:
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for rank, node in enumerate(nodes[: agent.top_k], start=1):
+            rank_dir = root / f"top{rank}"
+            rank_dir.mkdir(parents=True, exist_ok=True)
+            (rank_dir / "solution.py").write_text(node.code or "", encoding="utf-8")
+            (rank_dir / "node_id.txt").write_text(str(node.id), encoding="utf-8")
+            write_metric_file(rank_dir / "metric.txt", node, agent.metric_maximize)
+            copy_model_artifacts(agent, node, rank_dir)
+            write_solution_manifest(agent, node, rank_dir)
+
+            submission_source = (
+                agent.cfg.workspace_dir / "submission" / f"submission_{node.id}.csv"
+            )
+            if submission_source.exists():
+                shutil.copy2(submission_source, rank_dir / "submission.csv")
+            rows.append(
+                {
+                    "rank": rank,
+                    "node_id": str(node.id),
+                    "metric": node.metric.value,
+                    "maximize": node.metric.maximize,
+                    "stage": node.stage,
+                    "method_mode": getattr(node, "method_mode", "unknown"),
+                    "delivery_ready": bool(getattr(node, "delivery_ready", False)),
+                    "solution_path": str(rank_dir / "solution.py"),
+                    "submission_path": str(rank_dir / "submission.csv"),
+                    "model_artifacts_dir": str(rank_dir / "model_artifacts"),
+                }
+            )
+    return rows
+
+
+def persist_resumable_checkpoint(
+    agent,
+    *,
+    status: str,
+    reason: str,
+    active_actions: list[dict] | None = None,
+    manifest_filename: str = "checkpoint_manifest.json",
+    materialize_artifacts: bool = True,
+) -> dict:
+    """Commit an artifact index after journal/search-state writes.
+
+    User interruption uses ``materialize_artifacts=False`` because accepted Top-K
+    nodes are already exported when they enter Top-K. Re-copying every model and
+    solution here delays process termination without improving resumability.
+    """
+    top_nodes = rebuild_top_candidates(agent)
+    if materialize_artifacts and top_nodes:
+        save_top_candidates(agent)
+        _remove_stale_rank_dirs(
+            agent.cfg.workspace_dir / "top_solution",
+            len(top_nodes),
+        )
+        best = top_nodes[0]
+        agent.best_node = best
+        submission_path = (
+            agent.cfg.workspace_dir / "submission" / f"submission_{best.id}.csv"
+        )
+        save_best_solution(agent, best, submission_path)
+
+    provisional_nodes = [
+        node
+        for node in agent.journal.nodes
+        if getattr(node, "search_eligible", False)
+        and node.metric
+        and node.metric.value is not None
+    ]
+    provisional_nodes.sort(key=lambda node: node.metric, reverse=True)
+    checkpoint_candidate_rows = (
+        _save_checkpoint_candidates(agent, provisional_nodes)
+        if materialize_artifacts
+        else [
+            {
+                "rank": rank,
+                "node_id": str(node.id),
+                "metric": node.metric.value,
+                "maximize": node.metric.maximize,
+                "stage": node.stage,
+                "method_mode": getattr(node, "method_mode", "unknown"),
+                "delivery_ready": bool(getattr(node, "delivery_ready", False)),
+                "materialized": False,
+                "source": "journal",
+            }
+            for rank, node in enumerate(provisional_nodes[: agent.top_k], start=1)
+        ]
+    )
+
+    top_rows = []
+    for rank, node in enumerate(top_nodes, start=1):
+        rank_dir = agent.cfg.workspace_dir / "top_solution" / f"top{rank}"
+        top_rows.append(
+            {
+                "rank": rank,
+                "node_id": str(node.id),
+                "metric": node.metric.value,
+                "maximize": node.metric.maximize,
+                "stage": node.stage,
+                "method_mode": getattr(node, "method_mode", "unknown"),
+                "delivery_certified": bool(
+                    getattr(node, "delivery_certified", False)
+                ),
+                "solution_path": str(rank_dir / "solution.py"),
+                "submission_path": str(rank_dir / "submission.csv"),
+                "model_artifacts_dir": str(rank_dir / "model_artifacts"),
+                "materialized": (rank_dir / "solution.py").is_file(),
+            }
+        )
+
+    payload = {
+        "schema_version": "mlevolve.checkpoint.v1",
+        "checkpoint_id": uuid.uuid4().hex,
+        "status": status,
+        "reason": reason,
+        "resumable": status == "interrupted_resumable",
+        "artifacts_materialized": materialize_artifacts,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "completed_nodes": max(0, len(agent.journal) - 1),
+        "journal_path": str(agent.cfg.log_dir / "journal.json"),
+        "filtered_journal_path": str(agent.cfg.log_dir / "filtered_journal.json"),
+        "search_state_path": str(
+            agent.cfg.log_dir
+            / str(
+                getattr(
+                    getattr(agent.cfg, "runtime", None),
+                    "search_state_filename",
+                    "search_state.json",
+                )
+                or "search_state.json"
+            )
+        ),
+        "best_solution_dir": str(agent.cfg.workspace_dir / "best_solution"),
+        "top_solution_dir": str(agent.cfg.workspace_dir / "top_solution"),
+        "top_solutions": top_rows,
+        "checkpoint_candidates_dir": str(
+            agent.cfg.workspace_dir / "checkpoint_candidates"
+        ),
+        "provisional_top": checkpoint_candidate_rows,
+        "active_actions": active_actions or [],
+    }
+    log_manifest = agent.cfg.log_dir / manifest_filename
+    workspace_manifest = agent.cfg.workspace_dir / manifest_filename
+    _atomic_write_json(log_manifest, payload)
+    _atomic_write_json(workspace_manifest, payload)
+    logger.info(
+        "Committed %s checkpoint: top=%s provisional=%s active_actions=%s",
+        status,
+        len(top_rows),
+        len(payload["provisional_top"]),
+        len(payload["active_actions"]),
+    )
+    return payload
 
 
 def get_branch_top_nodes(agent, branch_id: int, top_k: int = 3) -> List[SearchNode]:
@@ -263,26 +502,37 @@ def get_branch_top_nodes(agent, branch_id: int, top_k: int = 3) -> List[SearchNo
 
 
 def update_best_solution(agent, node):
-    """Update top-K candidates and global best node."""
+    """Update Top-K/best from the accepted Result Review set."""
     if not node.metric or node.metric.value is None:
         return
 
     submission_file_path = agent.cfg.workspace_dir / "submission" / f"submission_{node.id}.csv"
 
+    if getattr(node, "search_eligible", False):
+        provisional = getattr(agent, "provisional_best_node", None)
+        if provisional is None or provisional.metric < node.metric:
+            agent.provisional_best_node = node
+            logger.info(
+                "[provisional-best] updated: node %s, metric=%s",
+                node.id,
+                node.metric.value,
+            )
+
+    if not getattr(node, "search_eligible", False) or getattr(node, "is_valid", None) is False:
+        return
+
     update_top_candidates(agent, node)
     save_top_candidates(agent)
 
     if agent.best_node is None or agent.best_node.metric < node.metric:
-        if agent.best_node is None or node.is_valid is True:
-            agent.best_node = node
-            save_best_solution(agent, node, submission_file_path)
-            logger.info(f"[best] updated: node {node.id}, metric={node.metric.value}")
-        else:
-            logger.debug(f"Node {node.id} is invalid, skipped")
+        agent.best_node = node
+        save_best_solution(agent, node, submission_file_path)
+        certification = "certified" if getattr(node, "delivery_certified", False) else "provisional-score"
+        logger.info(
+            "[best] updated: node %s, metric=%s, status=%s",
+            node.id,
+            node.metric.value,
+            certification,
+        )
     else:
-        if agent.best_node.is_valid is False:
-            agent.best_node = node
-            save_best_solution(agent, node, submission_file_path)
-            logger.info(f"[best] updated: node {node.id}, metric={node.metric.value}")
-        else:
-            logger.debug(f"Node {node.id} not the best (current best: {agent.best_node.id})")
+        logger.debug(f"Node {node.id} not the best (current best: {agent.best_node.id})")

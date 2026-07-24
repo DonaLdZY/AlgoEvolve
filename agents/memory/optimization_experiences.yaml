@@ -1,0 +1,124 @@
+schema_version: mlevolve.optimization_experiences.v1
+
+cards:
+  - experience_id: bounded_aggregate_state_milp_lns
+    title: Bounded aggregate-state linearization with exact large-neighborhood search
+    provenance: Generalized from a first-place bounded-state assignment optimization write-up.
+    summary: >-
+      For discrete decision problems whose nonlinear objective depends on a small bounded
+      integer aggregate state or adjacent aggregate states, enumerate the aggregate-state
+      combinations, linearize their costs, tighten the formulation with lower/upper bounds,
+      and combine a feasible incumbent with exact large-neighborhood optimization.
+    problem_signature:
+      - discrete assignment, scheduling, routing, packing, or resource-allocation decisions
+      - bounded integer aggregate state such as load, occupancy, count, inventory, or capacity usage
+      - nonlinear or table-valued cost depending on one aggregate state or a short transition
+      - a deterministic evaluator and at least one feasible incumbent or computable relaxation
+    trigger_groups:
+      - label: discrete_decisions
+        weight: 1.0
+        terms:
+          - assignment
+          - assign
+          - allocation
+          - scheduling
+          - routing
+          - packing
+          - resource allocation
+          - integer decision
+          - combinatorial
+          - 分配
+          - 调度
+          - 路由
+          - 装箱
+          - 资源配置
+          - 组合优化
+      - label: bounded_aggregate_state
+        weight: 1.5
+        terms:
+          - bounded aggregate
+          - occupancy
+          - daily load
+          - load range
+          - capacity range
+          - integer state
+          - inventory level
+          - number of people
+          - 每日人数
+          - 人数范围
+          - 负载范围
+          - 容量范围
+          - 库存水平
+          - 聚合状态
+      - label: local_state_transition_cost
+        weight: 1.5
+        terms:
+          - adjacent day
+          - consecutive day
+          - previous state
+          - next state
+          - transition cost
+          - neighboring state
+          - 相邻日期
+          - 连续日期
+          - 前一状态
+          - 后一状态
+          - 状态转移成本
+          - 相邻状态
+      - label: nonlinear_aggregate_cost
+        weight: 1.5
+        terms:
+          - nonlinear objective
+          - nonlinear cost
+          - accounting penalty
+          - piecewise cost
+          - aggregate penalty
+          - 非线性目标
+          - 非线性成本
+          - 分段成本
+          - 聚合惩罚
+          - 会计惩罚
+      - label: bounds_or_exact_solver
+        weight: 0.75
+        terms:
+          - lower bound
+          - upper bound
+          - optimality gap
+          - mip
+          - milp
+          - cp-sat
+          - exact solver
+          - 下界
+          - 上界
+          - 最优间隙
+          - 精确求解
+          - 整数规划
+    core_transform:
+      - Freeze the official evaluator before formulating the solver.
+      - Enumerate the bounded aggregate state, or short tuples of adjacent aggregate states.
+      - Replace the nonlinear/table-valued term with binary state-selection variables and constant costs.
+      - Link consecutive state tuples with flow-conservation or consistency constraints when transitions overlap.
+      - Couple aggregate-state variables to the original decision variables without changing the evaluator.
+    solve_trajectory:
+      - Solve a tractable relaxation to obtain a valid lower bound.
+      - Obtain a feasible incumbent and upper bound from a heuristic, existing solution, or early exact solve.
+      - Use the difference between the upper and lower bounds to remove impossible state combinations or decisions.
+      - Warm-start the reduced exact model from the incumbent.
+      - If the full model remains too large, solve exact large neighborhoods around the incumbent, such as bounded aggregate-load deviations or fix-and-optimize subsets.
+      - Recompute the final solution with the shared evaluator; only claim optimality when a trustworthy solver bound closes the gap.
+    runtime_evidence:
+      - solver family and solve status
+      - incumbent objective and independently recomputed objective
+      - best bound, absolute/relative gap, and whether optimality was proven
+      - variable/constraint counts before and after reduction
+      - relaxation used, pruning rule, warm-start source, and neighborhood definition
+    failure_lessons:
+      - A solver-reported objective or generated submission can be wrong when the evaluator or variable-to-output mapping has a bug; independently replay the evaluator.
+      - A relaxation may not map directly to a feasible original solution; state the relaxation gap and implement reconstruction or repair when needed.
+      - Enumerating all state combinations without bound-based pruning can make the model unnecessarily large.
+      - A heuristic incumbent is valuable even when it is not globally optimal because it tightens the upper bound and seeds exact neighborhoods.
+    not_applicable_when:
+      - the aggregate state is continuous or has an impractically large range
+      - the nonlinear objective depends on high-dimensional global history that cannot be localized
+      - no deterministic evaluator or safe feasibility model can be constructed
+      - the reduced exact model still cannot fit the configured solver, memory, or time budget

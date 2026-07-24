@@ -7,15 +7,64 @@ across the whole run for similarity search and guidance. Task-scoped (one direct
 
 import json
 import logging
+import os
+import re
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
+from urllib.parse import urlparse
 
 from .record import MemRecord
 from .retriever import HybridRetriever
 from .embedding_models import EmbeddingModel
 
 logger = logging.getLogger("memory")
+
+
+def _memory_synchronized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        memory_lock = getattr(self, "_memory_lock", None)
+        if memory_lock is None:
+            memory_lock = self._memory_lock = threading.RLock()
+        with memory_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def _is_local_embedding_endpoint(base_url: str) -> bool:
+    if not base_url:
+        return False
+    hostname = (urlparse(base_url).hostname or "").lower()
+    return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _validate_remote_embedding_config(
+    backend: str,
+    api_key: str,
+    base_url: str,
+) -> None:
+    """Reject configurations that can only fail after expensive retries."""
+    if re.search(r"\{[^{}]+\}", base_url or ""):
+        raise ValueError(
+            "memory_embedding_base_url contains an unresolved placeholder: "
+            f"{base_url!r}"
+        )
+    if _is_local_embedding_endpoint(base_url):
+        return
+
+    env_key = (
+        os.environ.get("AZURE_OPENAI_API_KEY", "")
+        if backend == "azure"
+        else os.environ.get("OPENAI_API_KEY", "")
+    )
+    if not (api_key or env_key).strip():
+        raise ValueError(
+            f"memory_embedding_api_key is required for remote {backend} embedding backend"
+        )
 
 
 class GlobalMemoryLayer:
@@ -38,6 +87,8 @@ class GlobalMemoryLayer:
         self.memory_dir = Path(memory_dir)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.similarity_threshold = similarity_threshold
+        self.disabled_reason: Optional[str] = None
+        self._memory_lock = threading.RLock()
 
         backend = (embedding_backend or "local").lower()
         if backend == "local":
@@ -49,6 +100,7 @@ class GlobalMemoryLayer:
         elif backend == "openai":
             if not embedding_model:
                 raise ValueError("memory_embedding_model is required for openai embedding backend")
+            _validate_remote_embedding_config(backend, embedding_api_key, embedding_base_url)
             self.embedding_model = EmbeddingModel(
                 model_type="openai",
                 model_name=embedding_model,
@@ -58,6 +110,7 @@ class GlobalMemoryLayer:
         elif backend == "azure":
             if not embedding_model:
                 raise ValueError("memory_embedding_model is required for azure embedding backend")
+            _validate_remote_embedding_config(backend, embedding_api_key, embedding_base_url)
             self.embedding_model = EmbeddingModel(
                 model_type="azure",
                 model_name=embedding_model,
@@ -67,6 +120,7 @@ class GlobalMemoryLayer:
         elif backend == "custom":
             if not embedding_model:
                 raise ValueError("memory_embedding_model is required for custom embedding backend")
+            _validate_remote_embedding_config(backend, embedding_api_key, embedding_base_url)
             self.embedding_model = EmbeddingModel(
                 model_type="custom",
                 model_name=embedding_model,
@@ -83,11 +137,15 @@ class GlobalMemoryLayer:
 
         logger.info(f"[GlobalMemory] Initialized with {len(self.records)} existing records")
 
+    @_memory_synchronized
     def save_node(self, node, parent_node: Optional = None) -> bool:
         """Save a search node to global memory. Returns True if saved."""
+        if self.disabled_reason:
+            return False
         if not self._should_save_node(node):
             return False
 
+        record: Optional[MemRecord] = None
         try:
             code_summary = self._extract_code_summary(node)
             label = self._determine_label(node, parent_node)
@@ -113,6 +171,7 @@ class GlobalMemoryLayer:
                 "exec_time": exec_time,
                 "parent_metric": parent_metric,
                 "current_metric": current_metric,
+                "decision_signals": getattr(node, "decision_signals", None),
             }
             if node.stage == "debug" and parent_node:
                 parent_error = getattr(parent_node, "term_out", "") or getattr(
@@ -138,9 +197,13 @@ class GlobalMemoryLayer:
             return True
 
         except Exception as e:
-            logger.error(f"[GlobalMemory] Failed to save node {node.id}: {e}")
+            if record is not None:
+                self.records = [r for r in self.records if r.record_id != record.record_id]
+                self.node_metadata_map.pop(record.record_id, None)
+            self._disable(f"save failed for node {node.id}: {e}")
             return False
 
+    @_memory_synchronized
     def retrieve_similar_records(
         self,
         query_text: str,
@@ -152,6 +215,8 @@ class GlobalMemoryLayer:
         min_score: float = 0.0,
     ) -> List[Tuple[MemRecord, float]]:
         """Retrieve similar or dissimilar records. Returns list of (record, score)."""
+        if self.disabled_reason:
+            return []
         if not self.records:
             logger.info("[GlobalMemory] No records available for retrieval")
             return []
@@ -168,7 +233,11 @@ class GlobalMemoryLayer:
                 f"label={label_filter}, stage={stage_filter}: {len(debug_records)} records"
             )
 
-        all_results = self.retriever.search(query_text, top_k=len(self.records), alpha=alpha)
+        try:
+            all_results = self.retriever.search(query_text, top_k=len(self.records), alpha=alpha)
+        except Exception as e:
+            self._disable(f"retrieval failed: {e}")
+            return []
         logger.debug(f"[GlobalMemory] Retriever returned {len(all_results)} results for query (length={len(query_text)})")
 
         if label_filter is not None:
@@ -196,6 +265,15 @@ class GlobalMemoryLayer:
             f"after_label_stage_filter={len(all_results)}, after_min_score_filter={len(filtered_results)})"
         )
         return result
+
+    def _disable(self, reason: str) -> None:
+        if self.disabled_reason:
+            return
+        self.disabled_reason = str(reason)
+        logger.warning(
+            "[GlobalMemory] Disabled for the rest of this run after provider failure: %s",
+            self.disabled_reason,
+        )
 
     def generate_guidance_prompt(
         self,
@@ -360,7 +438,7 @@ class GlobalMemoryLayer:
 
             for item in records_data:
                 metadata = {}
-                for key in ("exec_time", "parent_metric", "current_metric", "parent_error"):
+                for key in ("exec_time", "parent_metric", "current_metric", "parent_error", "decision_signals"):
                     if key in item:
                         metadata[key] = item.pop(key)
 
@@ -374,8 +452,9 @@ class GlobalMemoryLayer:
                 self.retriever.build_index(self.records, texts)
                 logger.info(f"[GlobalMemory] Loaded {len(self.records)} records from disk")
         except Exception as e:
-            logger.error(f"[GlobalMemory] Failed to load memory: {e}")
+            self._disable(f"failed to load memory index: {e}")
             self.records = []
+            self.node_metadata_map = {}
 
     def _save_memory(self) -> None:
         records_file = self.memory_dir / "records.json"
@@ -385,7 +464,7 @@ class GlobalMemoryLayer:
                 d = r.to_dict()
                 if r.record_id in self.node_metadata_map:
                     meta = self.node_metadata_map[r.record_id]
-                    for key in ("exec_time", "parent_metric", "current_metric", "parent_error"):
+                    for key in ("exec_time", "parent_metric", "current_metric", "parent_error", "decision_signals"):
                         if meta.get(key) is not None:
                             d[key] = meta[key]
                 records_data.append(d)

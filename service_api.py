@@ -46,6 +46,22 @@ def _is_interrupted_exit_code(exit_code: int | None) -> bool:
     return exit_code in {3221225786, -1073741510, 130, -2, -15}
 
 
+def _native_exit_reason(exit_code: int | None) -> str | None:
+    reasons = {
+        3221225725: "Windows STATUS_STACK_OVERFLOW (0xC00000FD)",
+        -1073741571: "Windows STATUS_STACK_OVERFLOW (0xC00000FD)",
+    }
+    return reasons.get(exit_code)
+
+
+def _memory_child_guard_threshold(memory_limit_bytes: int, hard_limit_active: bool) -> int:
+    """Leave allocation headroom for the controller before a hard process-tree cap."""
+    if memory_limit_bytes <= 0 or not hard_limit_active or memory_limit_bytes < 1024**3:
+        return memory_limit_bytes
+    reserve = max(512 * 1024**2, min(2 * 1024**3, memory_limit_bytes // 10))
+    return max(memory_limit_bytes // 2, memory_limit_bytes - reserve)
+
+
 class TaskResourceLimits(BaseModel):
     cpu_cores: int = Field(default=4, ge=1, le=4096)
     memory_limit_gb: float = Field(default=8.0, ge=0, le=1048576)
@@ -99,6 +115,9 @@ class JobStatus(BaseModel):
     memory_enforcement: dict[str, Any] = Field(default_factory=dict)
     resource_violation: str | None = None
     resource_warning: str | None = None
+    checkpoint_ready: bool = False
+    resumable: bool = False
+    checkpoint_manifest_path: str | None = None
 
 
 @dataclass
@@ -117,7 +136,7 @@ class JobRuntime:
     stderr_tail: str = ""
     stop_requested: bool = False
     job_status_tail_chars: int = 60000
-    stop_wait_seconds: float = 20.0
+    stop_wait_seconds: float = 30.0
     resource_limits: dict[str, Any] = field(default_factory=dict)
     assigned_cpu_ids: list[int] = field(default_factory=list)
     cpu_enforcement: dict[str, Any] = field(default_factory=dict)
@@ -126,6 +145,9 @@ class JobRuntime:
     memory_enforcement: dict[str, Any] = field(default_factory=dict)
     resource_violation: str | None = None
     resource_warning: str | None = None
+    checkpoint_ready: bool = False
+    resumable: bool = False
+    checkpoint_manifest_path: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -145,7 +167,7 @@ class JobStore:
     ) -> JobRuntime:
         with self._lock:
             for job in self._jobs.values():
-                if job.task_id != task_id or job.status != "running":
+                if job.task_id != task_id or job.status not in {"pending", "running", "stopping"}:
                     continue
                 proc = job.process
                 if proc is not None and proc.poll() is not None:
@@ -217,6 +239,9 @@ class JobStore:
             memory_enforcement=dict(runtime.memory_enforcement),
             resource_violation=runtime.resource_violation,
             resource_warning=runtime.resource_warning,
+            checkpoint_ready=runtime.checkpoint_ready,
+            resumable=runtime.resumable,
+            checkpoint_manifest_path=runtime.checkpoint_manifest_path,
         )
 
 
@@ -350,6 +375,65 @@ def _resolve_run_layout(req: StartMLEvolveRequest, run_timestamp: str) -> tuple[
     return (log_root / final_name).resolve(), (workspace_root / final_name).resolve(), final_name
 
 
+def _timestamp_path_variants(path: Path) -> list[Path]:
+    """Return equivalent run paths for quoted and legacy numeric timestamps."""
+
+    def alternate_name(name: str) -> str | None:
+        quoted = re.match(r"^(\d{8})_(\d{6})(_.+)$", name)
+        if quoted:
+            return f"{quoted.group(1)}{quoted.group(2)}{quoted.group(3)}"
+        legacy = re.match(r"^(\d{14})(_.+)$", name)
+        if legacy:
+            stamp = legacy.group(1)
+            return f"{stamp[:8]}_{stamp[8:]}{legacy.group(2)}"
+        return None
+
+    variants = [path]
+    direct_name = alternate_name(path.name)
+    if direct_name:
+        variants.append(path.with_name(direct_name))
+    parent_name = alternate_name(path.parent.name)
+    if parent_name:
+        variants.append(path.parent.with_name(parent_name) / path.name)
+    return variants
+
+
+def _timestamp_run_identity(path: Path) -> str:
+    for name in (path.name, path.parent.name):
+        quoted = re.match(r"^(\d{8})_(\d{6})_(.+)$", name)
+        if quoted:
+            return f"{quoted.group(1)}{quoted.group(2)}|{quoted.group(3)}"
+        legacy = re.match(r"^(\d{14})_(.+)$", name)
+        if legacy:
+            return f"{legacy.group(1)}|{legacy.group(2)}"
+    return ""
+
+
+def _resolve_interrupted_checkpoint_layout(
+    log_dir: Path,
+    workspace_dir: Path,
+) -> tuple[Path, Path]:
+    """Locate checkpoints written before run timestamps were string-quoted."""
+    for candidate_log in _timestamp_path_variants(log_dir):
+        for candidate_workspace in _timestamp_path_variants(workspace_dir):
+            log_identity = _timestamp_run_identity(candidate_log)
+            workspace_identity = _timestamp_run_identity(candidate_workspace)
+            if log_identity and workspace_identity and log_identity != workspace_identity:
+                continue
+            manifest_name = str(
+                _saved_config_value(
+                    candidate_log,
+                    "runtime.checkpoint_manifest_filename",
+                    "checkpoint_manifest.json",
+                )
+            )
+            if (candidate_log / manifest_name).is_file() and (
+                candidate_workspace / manifest_name
+            ).is_file():
+                return candidate_log, candidate_workspace
+    return log_dir, workspace_dir
+
+
 def _safe_read_text(path: Path, limit: int = 60000) -> str:
     if not path.exists() or not path.is_file():
         return ""
@@ -389,6 +473,122 @@ def _is_search_budget_exhausted(log_dir: Path) -> bool:
         or "MLEvolve search budget exhausted" in log_tail
         or "Time limit reached (configured=" in log_tail
     )
+
+
+def _mark_service_budget_completed(log_dir: Path, time_limit_secs: int) -> None:
+    """Normalize a watchdog-finalized run to the same status as an engine timeout."""
+    status_name = str(_saved_config_value(log_dir, "runtime.run_status_filename", "run_status.json"))
+    status_path = log_dir / status_name
+    payload = _safe_read_json_dict(status_path)
+    payload.update(
+        {
+            "schema_version": payload.get("schema_version") or "mlevolve.run_status.v1",
+            "status": "completed",
+            "termination_reason": "time_limit_exhausted",
+            "time_limit_secs": int(time_limit_secs),
+            "service_forced_finalize": True,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+    )
+    try:
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _inspect_interrupted_checkpoint(
+    log_dir: Path,
+    workspace_dir: Path,
+) -> tuple[bool, str | None, str]:
+    """Verify that resume-critical files were durably committed."""
+    log_dir, workspace_dir = _resolve_interrupted_checkpoint_layout(log_dir, workspace_dir)
+    manifest_name = str(
+        _saved_config_value(
+            log_dir,
+            "runtime.checkpoint_manifest_filename",
+            "checkpoint_manifest.json",
+        )
+    )
+    search_state_name = str(
+        _saved_config_value(log_dir, "runtime.search_state_filename", "search_state.json")
+    )
+    run_status_name = str(
+        _saved_config_value(log_dir, "runtime.run_status_filename", "run_status.json")
+    )
+    log_manifest_path = log_dir / manifest_name
+    workspace_manifest_path = workspace_dir / manifest_name
+    manifest = _safe_read_json_dict(log_manifest_path)
+    workspace_manifest = _safe_read_json_dict(workspace_manifest_path)
+    run_status = _safe_read_json_dict(log_dir / run_status_name)
+
+    required_paths = [
+        log_dir / "journal.json",
+        log_dir / search_state_name,
+        log_dir / run_status_name,
+        log_manifest_path,
+        workspace_manifest_path,
+    ]
+    missing = [str(path) for path in required_paths if not path.is_file()]
+    status_ok = run_status.get("status") == "interrupted_resumable"
+    checkpoint_ids = [
+        str(payload.get("checkpoint_id") or "")
+        for payload in (manifest, workspace_manifest)
+    ]
+    checkpoint_ids_ok = not any(checkpoint_ids) or (
+        all(checkpoint_ids) and checkpoint_ids[0] == checkpoint_ids[1]
+    )
+    manifests_ok = all(
+        payload.get("status") == "interrupted_resumable"
+        and payload.get("resumable") is True
+        for payload in (manifest, workspace_manifest)
+    ) and checkpoint_ids_ok
+    ready = not missing and status_ok and manifests_ok
+    if ready:
+        return True, str(log_manifest_path), ""
+
+    details: list[str] = []
+    if missing:
+        details.append("missing=" + ", ".join(missing))
+    if not status_ok:
+        details.append(f"run_status={run_status.get('status') or 'missing'}")
+    if not manifests_ok:
+        details.append(
+            "manifest was not committed as resumable or checkpoint ids differ"
+        )
+    return False, str(log_manifest_path) if log_manifest_path.exists() else None, "; ".join(details)
+
+
+def _interrupted_checkpoint_marker(log_dir: Path, workspace_dir: Path) -> tuple[Any, ...]:
+    """Return a cheap identity for detecting a newly committed manifest pair."""
+    log_dir, workspace_dir = _resolve_interrupted_checkpoint_layout(log_dir, workspace_dir)
+    manifest_name = str(
+        _saved_config_value(
+            log_dir,
+            "runtime.checkpoint_manifest_filename",
+            "checkpoint_manifest.json",
+        )
+    )
+    marker: list[Any] = []
+    for path in (log_dir / manifest_name, workspace_dir / manifest_name):
+        payload = _safe_read_json_dict(path)
+        try:
+            stat = path.stat()
+            marker.extend(
+                (
+                    str(path),
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                    stat.st_size,
+                    str(payload.get("checkpoint_id") or ""),
+                )
+            )
+        except OSError:
+            marker.extend((str(path), None, None, None, ""))
+    return tuple(marker)
 
 
 def _safe_tail_lines(path: Path, limit: int = 400, byte_limit: int = 512_000) -> list[str]:
@@ -452,23 +652,21 @@ def _read_pending_nodes(log_dir: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _resolve_best_node_id(log_dir: Path, workspace_dir: Path, nodes: list[dict[str, Any]]) -> str | None:
-    best_file = workspace_dir / "best_solution" / "node_id.txt"
-    if best_file.exists():
-        try:
-            best_id = best_file.read_text(encoding="utf-8", errors="ignore").strip()
-            if best_id:
-                return best_id
-        except Exception:
-            pass
-
+def _best_metric_node_id(
+    nodes: list[dict[str, Any]],
+) -> str | None:
     best_metric = None
     best_id = None
     best_maximize: bool | None = None
     for node in nodes:
         metric = node.get("metric")
         maximize = node.get("maximize")
-        if metric is None:
+        if metric is None or node.get("is_buggy") is True:
+            continue
+        accepted = node.get("search_eligible")
+        if accepted is None:
+            accepted = node.get("delivery_ready") is True
+        if accepted is not True:
             continue
         if best_metric is None:
             best_metric = metric
@@ -476,15 +674,35 @@ def _resolve_best_node_id(log_dir: Path, workspace_dir: Path, nodes: list[dict[s
             best_maximize = maximize
             continue
         compare_maximize = True if best_maximize is None else best_maximize
-        if compare_maximize:
-            if metric > best_metric:
-                best_metric = metric
-                best_id = node.get("id")
-        else:
-            if metric < best_metric:
-                best_metric = metric
-                best_id = node.get("id")
-    return best_id
+        if (compare_maximize and metric > best_metric) or (
+            not compare_maximize and metric < best_metric
+        ):
+            best_metric = metric
+            best_id = node.get("id")
+    return str(best_id) if best_id else None
+
+
+def _resolve_best_node(
+    log_dir: Path,
+    workspace_dir: Path,
+    nodes: list[dict[str, Any]],
+) -> tuple[str | None, str | None]:
+    best_file = workspace_dir / "best_solution" / "node_id.txt"
+    if best_file.exists():
+        try:
+            best_id = best_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if best_id:
+                return best_id, "delivery"
+        except Exception:
+            pass
+    accepted_best = _best_metric_node_id(nodes)
+    if accepted_best:
+        return accepted_best, "delivery"
+    return None, None
+
+
+def _resolve_best_node_id(log_dir: Path, workspace_dir: Path, nodes: list[dict[str, Any]]) -> str | None:
+    return _resolve_best_node(log_dir, workspace_dir, nodes)[0]
 
 
 def _parse_log_events(log_path: Path, limit: int = 400) -> list[dict[str, Any]]:
@@ -601,6 +819,16 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
                     "maximize": maximize,
                     "is_buggy": node.get("is_buggy"),
                     "is_valid": node.get("is_valid"),
+                    "runtime_ok": node.get("runtime_ok"),
+                    "search_eligible": node.get("search_eligible"),
+                    "score_recomputed": node.get("score_recomputed"),
+                    "contract_valid": node.get("contract_valid"),
+                    "artifact_ready": node.get("artifact_ready"),
+                    "delivery_ready": node.get("delivery_ready"),
+                    "delivery_certified": node.get("delivery_certified"),
+                    "certification_source": node.get("certification_source"),
+                    "certification_notes": node.get("certification_notes"),
+                    "method_mode": node.get("method_mode"),
                     "visits": node.get("visits"),
                     "total_reward": node.get("total_reward"),
                     "uct": node.get("_uct"),
@@ -616,12 +844,36 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
         node for node in _read_pending_nodes(log_dir)
         if str(node.get("id")) not in journal_node_ids
     ]
-    best_node_id = _resolve_best_node_id(log_dir, workspace_dir or Path("."), node_rows)
+    best_node_id, best_node_kind = _resolve_best_node(
+        log_dir,
+        workspace_dir or Path("."),
+        node_rows,
+    )
     best_solution_code = _safe_read_text(
         (workspace_dir / "best_solution" / "solution.py") if workspace_dir else Path(""),
         limit=snapshot_text_limit,
     )
     best_metric_text = _safe_read_text((workspace_dir / "best_solution" / "metric.txt") if workspace_dir else Path(""), limit=20000)
+    task_automl_root = log_dir.parent.parent if log_dir.parent.name == "logs" else None
+    dependency_installations = _safe_read_text(
+        log_dir / "dependency_installations.jsonl",
+        limit=snapshot_text_limit,
+    )
+    dependency_summary = _safe_read_json(
+        log_dir / "dependency_installations_summary.json",
+        {},
+    )
+    if task_automl_root is not None:
+        if not dependency_installations:
+            dependency_installations = _safe_read_text(
+                task_automl_root / "dependency_installations.jsonl",
+                limit=snapshot_text_limit,
+            )
+        if not dependency_summary:
+            dependency_summary = _safe_read_json(
+                task_automl_root / "dependency_installations_summary.json",
+                {},
+            )
 
     return {
         "engine": "mlevolve",
@@ -631,6 +883,7 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
         "nodes": node_rows,
         "pending_nodes": pending_nodes,
         "best_node_id": best_node_id,
+        "best_node_kind": best_node_kind,
         "journal_source": journal_source,
         "best_solution_code": best_solution_code,
         "best_metric_text": best_metric_text,
@@ -641,6 +894,8 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
         "service_stdout": _safe_read_text(log_dir / "_service_stdout.log", limit=snapshot_text_limit),
         "service_stderr": _safe_read_text(log_dir / "_service_stderr.log", limit=snapshot_text_limit),
         "resource_usage": _safe_read_json(log_dir / "resource_usage.json", {}),
+        "dependency_installations": dependency_installations,
+        "dependency_installation_summary": dependency_summary,
     }
 
 
@@ -653,6 +908,10 @@ def _monitor_task_resources(
     hard_memory_limit_active: bool = False,
 ) -> None:
     memory_limit_bytes = int(float(limits.memory_limit_gb) * (1024**3))
+    guard_threshold = _memory_child_guard_threshold(memory_limit_bytes, hard_memory_limit_active)
+    guard_enabled = memory_limit_bytes > 0 and (
+        not hard_memory_limit_active or guard_threshold < memory_limit_bytes
+    )
     interval = max(0.1, float(limits.monitor_interval_seconds))
     peak_memory = 0
     while not stop_event.is_set() and proc.poll() is None:
@@ -664,13 +923,14 @@ def _monitor_task_resources(
             current_memory_bytes=current_memory,
             peak_memory_bytes=peak_memory,
         )
-        if memory_limit_bytes > 0 and current_memory > memory_limit_bytes and not hard_memory_limit_active:
-            action = relieve_process_tree_memory_pressure(proc.pid, memory_limit_bytes)
+        if guard_enabled and current_memory > guard_threshold:
+            action = relieve_process_tree_memory_pressure(proc.pid, guard_threshold)
             if action.action == "terminated_child":
                 warning = (
                     "memory_limit_child_guard: stopped memory-heavy execution child "
                     f"pid={action.child_pid} after task memory reached {format_bytes(action.observed_bytes)}; "
-                    f"configured limit={format_bytes(action.limit_bytes)}. MLEvolve controller continues."
+                    f"controller guard={format_bytes(action.limit_bytes)}, "
+                    f"configured limit={format_bytes(memory_limit_bytes)}. MLEvolve controller continues."
                 )
             elif action.action == "controller_over_limit":
                 warning = (
@@ -688,7 +948,9 @@ def _monitor_task_resources(
 def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actual_workspace_dir: Path, run_timestamp: str) -> None:
     limits = req.resources or _resolve_resource_limits(req)
     run_args = list(req.args)
-    run_args = _with_cli_override(run_args, "runtime.run_timestamp", run_timestamp)
+    # OmegaConf interprets 20260722_015005 as an integer with a numeric
+    # separator unless the dot-list value is explicitly quoted.
+    run_args = _with_cli_override(run_args, "runtime.run_timestamp", json.dumps(run_timestamp))
     run_args = _with_cli_override(run_args, "runtime.resume_run", req.resume)
 
     def runtime_value(name: str, default: Any) -> Any:
@@ -701,10 +963,14 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
     service_log_tail_chars = max(0, int(float(runtime_value("service_log_tail_chars", 200000))))
     service_last_error_chars = max(1, int(float(runtime_value("service_last_error_chars", 300))))
     termination_wait_default = max(0.0, float(runtime_value("termination_wait_seconds", 20)))
+    interruption_checkpoint_wait = max(
+        0.0,
+        float(runtime_value("interruption_checkpoint_wait_seconds", 30)),
+    )
     store.update(
         job_id,
         job_status_tail_chars=job_status_tail_chars,
-        stop_wait_seconds=termination_wait_default,
+        stop_wait_seconds=interruption_checkpoint_wait,
     )
     cmd = [req.python_executable or "python", "run.py", *run_args]
     workdir = req.working_dir.strip() or DEFAULT_WORKDIR
@@ -738,6 +1004,7 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
         env.pop("MLEVOLVE_CONFIG_PATH", None)
     env["MLEVOLVE_RUN_TIMESTAMP"] = run_timestamp
     env["MLEVOLVE_RESUME_RUN"] = "1" if req.resume else "0"
+    env.setdefault("PYTHONFAULTHANDLER", "1")
 
     memory_limit_bytes = int(float(limits.memory_limit_gb) * (1024**3))
     memory_limiter = None
@@ -867,7 +1134,19 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
                 )
             except Exception:
                 shutdown_buffer = int(runtime_value("graceful_shutdown_buffer_seconds", 600))
-            total_timeout = time_limit_secs + max(0, shutdown_buffer)
+            configured_startup_buffer = _extract_cli_override(
+                run_args,
+                "runtime.service_startup_buffer_seconds",
+            )
+            try:
+                startup_buffer = (
+                    max(0, int(float(configured_startup_buffer)))
+                    if configured_startup_buffer is not None
+                    else max(0, int(runtime_value("service_startup_buffer_seconds", 1800)))
+                )
+            except Exception:
+                startup_buffer = max(0, int(runtime_value("service_startup_buffer_seconds", 1800)))
+            total_timeout = time_limit_secs + startup_buffer + max(0, shutdown_buffer)
             try:
                 out, err = proc.communicate(timeout=total_timeout)
             except subprocess.TimeoutExpired:
@@ -906,15 +1185,31 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
     current_job = store.get(job_id)
     stop_requested = bool(current_job.stop_requested or current_job.status in {"stopping", "stopped"})
     resource_violation = str(current_job.resource_violation or "").strip()
-    budget_exhausted = _is_search_budget_exhausted(actual_log_dir)
+    native_exit_reason = _native_exit_reason(exit_code)
+    checkpoint_ready = False
+    checkpoint_path: str | None = None
+    checkpoint_error = ""
+    checkpoint_log_dir, checkpoint_workspace_dir = _resolve_interrupted_checkpoint_layout(
+        actual_log_dir,
+        actual_workspace_dir,
+    )
     if resource_violation:
         status = "failed"
-    elif timed_out and budget_exhausted and not stop_requested:
-        status = "completed"
+    elif stop_requested:
+        checkpoint_ready, checkpoint_path, checkpoint_error = _inspect_interrupted_checkpoint(
+            checkpoint_log_dir,
+            checkpoint_workspace_dir,
+        )
+        status = "interrupted_resumable" if checkpoint_ready else "interrupted_incomplete"
     elif timed_out:
-        status = "failed"
-    elif stop_requested or _is_interrupted_exit_code(exit_code):
-        status = "stopped"
+        status = "completed"
+        _mark_service_budget_completed(actual_log_dir, int(time_limit_secs or 0))
+    elif _is_interrupted_exit_code(exit_code):
+        checkpoint_ready, checkpoint_path, checkpoint_error = _inspect_interrupted_checkpoint(
+            checkpoint_log_dir,
+            checkpoint_workspace_dir,
+        )
+        status = "interrupted_resumable" if checkpoint_ready else "interrupted_incomplete"
     elif exit_code == 0:
         status = "completed"
     else:
@@ -922,25 +1217,43 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
     last_error = None
     if resource_violation:
         last_error = resource_violation
-    elif timed_out and budget_exhausted and not stop_requested:
-        last_error = (
-            "MLEvolve search budget was exhausted and the service finalized the run "
-            "with current best artifacts. "
-            f"search_limit={time_limit_secs}s, grace={int(shutdown_buffer)}s."
-        )
     elif timed_out:
-        last_error = (
-            "MLEvolve exceeded service timeout and was terminated by service. "
-            f"search_limit={time_limit_secs}s, grace={int(shutdown_buffer)}s."
+        completion_note = (
+            "MLEvolve search budget was exhausted; the service finalized the saved "
+            "search tree and current Top-K artifacts normally. "
+            f"search_limit={time_limit_secs}s, startup_buffer={int(startup_buffer)}s, "
+            f"grace={int(shutdown_buffer)}s."
         )
-    elif status == "stopped":
-        if stop_requested:
-            last_error = "MLEvolve stopped by user."
-        else:
-            last_error = f"MLEvolve interrupted by console/control signal (exit code {exit_code})."
+        out = "\n".join(part for part in ((out or "").rstrip(), completion_note) if part)
+    elif status == "interrupted_resumable":
+        last_error = (
+            "MLEvolve was interrupted after committing the durable search tree, "
+            "generated-code resume actions, and the existing Top-K artifact index. "
+            "It can be resumed or reported now."
+        )
+    elif status == "interrupted_incomplete":
+        actor = "user stop" if stop_requested else f"signal exit code {exit_code}"
+        last_error = (
+            f"MLEvolve was terminated after {actor}, but the resumable checkpoint "
+            f"could not be verified: {checkpoint_error or 'unknown checkpoint error'}"
+        )
+    elif native_exit_reason:
+        tail = (err or out or "").strip()
+        secondary = tail.splitlines()[-1][:service_last_error_chars] if tail else ""
+        last_error = (
+            f"MLEvolve native crash: {native_exit_reason}. "
+            f"Peak task memory={format_bytes(current_job.peak_memory_bytes)}, "
+            f"configured limit={format_bytes(memory_limit_bytes)}."
+        )
+        if secondary:
+            last_error += f" Last stderr/output: {secondary}"
     elif exit_code != 0:
         tail = (err or out or "").strip()
         last_error = tail.splitlines()[-1][:service_last_error_chars] if tail else f"MLEvolve exited with code {exit_code}"
+
+    if checkpoint_ready:
+        actual_log_dir = checkpoint_log_dir
+        actual_workspace_dir = checkpoint_workspace_dir
 
     try:
         actual_log_dir.mkdir(parents=True, exist_ok=True)
@@ -980,12 +1293,19 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
     store.update(
         job_id,
         status=status,
-        exit_code=exit_code,
+        exit_code=(0 if timed_out and status == "completed" else exit_code),
         last_error=last_error,
         stdout_tail=_tail_text(out or "", service_log_tail_chars),
         stderr_tail=_tail_text(err or "", service_log_tail_chars),
         log_dir=str(actual_log_dir),
         workspace_dir=str(actual_workspace_dir),
+        checkpoint_ready=(status == "interrupted_resumable"),
+        resumable=(status == "interrupted_resumable"),
+        checkpoint_manifest_path=(
+            checkpoint_path
+            if status in {"interrupted_resumable", "interrupted_incomplete"}
+            else None
+        ),
     )
 
 
@@ -1054,30 +1374,58 @@ def get_job(job_id: str) -> dict[str, Any]:
     return store.status(job_id).model_dump()
 
 
+def _stop_process_after_checkpoint_window(
+    proc: subprocess.Popen[str],
+    wait_seconds: float,
+    log_dir: Path,
+    workspace_dir: Path,
+) -> None:
+    baseline_marker = _interrupted_checkpoint_marker(log_dir, workspace_dir)
+    try:
+        if os.name == "nt":
+            proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[arg-type]
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        terminate_process_tree(proc.pid)
+        return
+
+    process_deadline = time.monotonic() + max(0.0, wait_seconds)
+    while proc.poll() is None and time.monotonic() < process_deadline:
+        checkpoint_ready, _, _ = _inspect_interrupted_checkpoint(log_dir, workspace_dir)
+        if (
+            checkpoint_ready
+            and _interrupted_checkpoint_marker(log_dir, workspace_dir) != baseline_marker
+        ):
+            # The manifest pair is the final commit marker. Kill the whole
+            # process tree now instead of waiting for running LLM threads.
+            terminate_process_tree(proc.pid)
+            return
+        time.sleep(0.05)
+    if proc.poll() is None:
+        terminate_process_tree(proc.pid)
+
+
 @app.post("/jobs/stop")
 def stop_job(req: StopRequest) -> dict[str, Any]:
     job = store.get(req.job_id)
     proc = job.process
     if proc is None or proc.poll() is not None:
-        return {"status": "not_running", "job_id": req.job_id}
+        return store.status(req.job_id).model_dump()
+    if job.status == "stopping":
+        return store.status(req.job_id).model_dump()
     store.update(req.job_id, status="stopping", stop_requested=True, last_error="stop requested by user")
-    try:
-        if os.name == "nt":
-            proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[arg-type]
-            try:
-                proc.wait(timeout=max(0.0, float(job.stop_wait_seconds)))
-            except subprocess.TimeoutExpired:
-                terminate_process_tree(proc.pid)
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=max(0.0, float(job.stop_wait_seconds)))
-            except subprocess.TimeoutExpired:
-                terminate_process_tree(proc.pid)
-    except Exception:
-        terminate_process_tree(proc.pid)
-    store.update(req.job_id, status="stopped", last_error="stopped by user")
-    return {"status": "stopping", "job_id": req.job_id}
+    threading.Thread(
+        target=_stop_process_after_checkpoint_window,
+        args=(
+            proc,
+            float(job.stop_wait_seconds),
+            Path(job.log_dir),
+            Path(job.workspace_dir),
+        ),
+        daemon=True,
+    ).start()
+    return store.status(req.job_id).model_dump()
 
 
 @app.post("/snapshot")

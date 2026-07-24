@@ -20,6 +20,7 @@ def _journal() -> tuple[Journal, SearchNode, SearchNode, SearchNode]:
         branch_id=2,
         visits=4,
         total_reward=7.5,
+        _uct=2.25,
     )
     best = SearchNode(
         code="best",
@@ -27,6 +28,16 @@ def _journal() -> tuple[Journal, SearchNode, SearchNode, SearchNode]:
         parent=root,
         metric=MetricValue(10, maximize=False),
         is_buggy=False,
+        is_valid=True,
+        runtime_ok=True,
+        search_eligible=True,
+        contract_valid=True,
+        artifact_ready=True,
+        delivery_ready=True,
+        delivery_certified=False,
+        certification_source="candidate_reported_score",
+        certification_notes=["Independent evaluator not available."],
+        method_mode="non_rl_solver",
         expected_child_count=3,
     )
     other = SearchNode(
@@ -74,7 +85,13 @@ def test_snapshot_round_trip_rebuilds_graph_metrics_and_locks() -> None:
     assert restored_root.branch_id == 2
     assert restored_root.visits == 4
     assert restored_root.total_reward == 7.5
+    assert restored_root._uct == 2.25
     assert restored_best.expected_child_count == 3
+    assert restored_best.search_eligible is True
+    assert restored_best.delivery_ready is True
+    assert restored_best.delivery_certified is False
+    assert restored_best.method_mode == "non_rl_solver"
+    assert restored_best.certification_notes == ["Independent evaluator not available."]
     assert restored_root.child_count_lock is not root_lock
     assert restored_root.child_count_lock is not restored_best.child_count_lock
     assert hasattr(restored_root.child_count_lock, "acquire")

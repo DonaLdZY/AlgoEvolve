@@ -32,6 +32,7 @@ IGNORED_ARTIFACT_DIRS = {
     "best_submission",
     "top_solution",
     "top_solution_llm",
+    "checkpoint_candidates",
     "global_memory",
 }
 

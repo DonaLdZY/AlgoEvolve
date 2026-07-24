@@ -17,7 +17,6 @@ from typing import Dict, Any, Union
 
 from llm import generate, compile_prompt_to_md
 from llm.model_profiles import thinking_json_incompatible
-from agents.prompts.shared import is_optimization_or_rl_task
 from agents.prompt_cache import dataset_reference_sentence, task_section
 
 logger = logging.getLogger("MLEvolve")
@@ -25,13 +24,26 @@ logger = logging.getLogger("MLEvolve")
 
 # ============ Planning constants ============
 
-BASE_PLANNING_ALLOWED_MODULES = [
-    "data_processing_and_feature_engineering",
-    "model_design",
-    "training_evaluation",
+PREDICTION_PLANNING_MODULES = [
+    "data_and_validation",
+    "model_and_training",
+    "inference_and_artifact",
 ]
-RL_PLANNING_MODULES = ["rl_environment_design"]
-PLANNING_ALLOWED_MODULES = BASE_PLANNING_ALLOWED_MODULES + RL_PLANNING_MODULES
+DECISION_PLANNING_MODULES = [
+    "problem_and_evaluator",
+    "decision_method",
+    "solve_rollout_and_artifact",
+]
+OPTIMIZATION_PLANNING_MODULES = DECISION_PLANNING_MODULES
+RL_PLANNING_MODULES = DECISION_PLANNING_MODULES
+BASE_PLANNING_ALLOWED_MODULES = PREDICTION_PLANNING_MODULES
+PLANNING_ALLOWED_MODULES = list(
+    dict.fromkeys(
+        PREDICTION_PLANNING_MODULES
+        + OPTIMIZATION_PLANNING_MODULES
+        + RL_PLANNING_MODULES
+    )
+)
 
 
 def get_planning_allowed_modules(
@@ -39,13 +51,20 @@ def get_planning_allowed_modules(
     task_desc: str = "",
     coldstart_description: str = "",
 ) -> list[str]:
-    """Return planner modules, adding RL environment design only for optimization/RL tasks."""
+    """Return the actual stepwise modules for the task's generation route."""
     if agent_instance is not None:
         task_desc = task_desc or getattr(agent_instance, "task_desc", "")
         coldstart_description = coldstart_description or getattr(agent_instance, "coldstart_description", "")
-    if is_optimization_or_rl_task(task_desc, coldstart_description):
-        return PLANNING_ALLOWED_MODULES
-    return BASE_PLANNING_ALLOWED_MODULES.copy()
+        autorealize_context = getattr(agent_instance, "data_preview", "")
+    else:
+        autorealize_context = ""
+
+    from agents.prompts import infer_task_mode
+
+    task_mode = infer_task_mode(task_desc, coldstart_description, autorealize_context)
+    if task_mode in {"rl", "optimization", "decision"}:
+        return DECISION_PLANNING_MODULES.copy()
+    return PREDICTION_PLANNING_MODULES.copy()
 
 
 def build_planning_json_format(allowed_modules: list[str] | None = None) -> str:
@@ -108,8 +127,11 @@ PLANNING_JSON_SCHEMA = build_planning_json_schema(PLANNING_ALLOWED_MODULES)
 def get_component_descriptions() -> Dict[str, str]:
     """Get module name to description mapping from StepAgent definitions."""
     from agents.coder.stepwise_coder import create_default_step_agents  # lazy to avoid circular import
-    step_agents = create_default_step_agents(include_rl=True)
-    return {agent.name: agent.description for agent in step_agents}
+    descriptions: Dict[str, str] = {}
+    for task_mode in ("prediction", "optimization", "rl"):
+        for agent in create_default_step_agents(task_mode=task_mode):
+            descriptions.setdefault(agent.name, agent.description)
+    return descriptions
 
 
 # ============ Model-specific prompt formatting ============

@@ -1,15 +1,28 @@
 """Code Review Agent: LLM-based code review and fix for node code."""
 
 import logging
+import json
 import time
 from typing import cast
 
 from llm import FunctionSpec, query
+from agents.coder import plan_and_code_query
+from agents.planner import build_chat_prompt_for_model
 from engine.search_node import SearchNode
 from agents.prompts.validation_template_prompts import get_code_review_prompt
 from agents.prompts import get_internet_clarification
 from agents.prompt_cache import task_section
-from utils.autorealize_context import select_autorealize_context_for_stage
+from agents.prompt_policy import (
+    configured_output_language,
+    infer_task_family,
+    output_language_instruction,
+)
+from engine.solution_protocol import (
+    SolutionInterface,
+    interface_contract_text,
+    interface_for,
+    preflight_code,
+)
 
 from agents.coder.diff_coder import SearchReplacePatcher
 
@@ -65,13 +78,18 @@ CODE_REVIEW_SPEC = FunctionSpec(
 def run(agent, node: SearchNode) -> str:
     logger.debug(f"[review] node {node.id}")
 
-    review_context = select_autorealize_context_for_stage(
-        str(getattr(agent, "autorealize_context", "") or ""),
-        "code_review",
+    review_context = str(
+        getattr(agent, "autorealize_context", "")
+        or getattr(agent, "data_preview", "")
+        or ""
     )
     review_task_desc = str(agent.task_desc or "")
-    if review_context:
-        review_task_desc = f"{review_task_desc}\n\n{review_context}".strip()
+    task_family = infer_task_family(agent)
+    interface = interface_for(
+        task_family=task_family,
+        method_family=str(getattr(node, "method_family", "unknown") or "unknown"),
+    )
+    preflight = preflight_code(node.code, interface)
     prompt = get_code_review_prompt(
         task_desc=review_task_desc,
         code=node.code,
@@ -84,6 +102,15 @@ def run(agent, node: SearchNode) -> str:
         prompt["Instructions"]["Implementation guideline"].extend(internet_clarification)
     else:
         prompt["Instructions"]["⚠️ Internet Access Clarification"] = internet_clarification
+    prompt["Instructions"]["Generated solution interface and safety preflight"] = [
+        "Repair every deterministic preflight issue in this review while preserving the chosen method and evaluator.",
+        f"Required interface: {interface}",
+        "The corrected code must contain these exact leading parameter names and order:",
+        interface_contract_text(interface),
+        f"Current preflight: {preflight}",
+        "Do not introduce eval(), exec(), os.system(), or subprocess shell=True.",
+        output_language_instruction(configured_output_language(agent)),
+    ]
 
     use_diff_for_review = agent.acfg.use_diff_mode
     retry_cfg = getattr(agent.acfg, "retries", None)
@@ -120,8 +147,21 @@ def run(agent, node: SearchNode) -> str:
                         "Instructions": prompt.get("Instructions", {}),
                     },
                     user_message=(
-                        f"{task_section(review_task_desc)}\n"
-                        f"# Code to review\n{prompt.get('Code to review', '')}"
+                        f"{task_section(review_task_desc, review_context)}\n"
+                        f"# Code to review\n{prompt.get('Code to review', '')}\n\n"
+                        "# Latest deterministic preflight evidence\n"
+                        + json.dumps(
+                            {
+                                "task_family": task_family,
+                                "required_interface": interface.__dict__,
+                                "preflight": preflight.__dict__,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        )
+                        + "\n\n"
+                        + output_language_instruction(configured_output_language(agent))
                     ),
                     func_spec=CODE_REVIEW_SPEC,
                     model=stage_cfg.model,
@@ -208,3 +248,68 @@ def run(agent, node: SearchNode) -> str:
 
     logger.error("Code review: Unexpected exit from retry loop, returning original code")
     return node.code
+
+
+def regenerate_after_preflight_failure(
+    agent,
+    node: SearchNode,
+    interface: SolutionInterface,
+    preflight,
+    *,
+    attempt: int,
+) -> tuple[str, str]:
+    """Regenerate one candidate in place using exact deterministic failure evidence."""
+
+    introduction = (
+        "You are the corrective code-generation stage of an automated ML and decision search system. "
+        "A complete candidate was rejected before execution by deterministic interface or safety checks. "
+        "Regenerate the complete Python solution while preserving the candidate's method, evaluator, data contract, "
+        "output schema, and useful implementation. The deterministic contract below is authoritative."
+    )
+    stable_context = task_section(
+        str(getattr(agent, "task_desc", "") or ""),
+        str(
+            getattr(agent, "autorealize_context", "")
+            or getattr(agent, "data_preview", "")
+            or ""
+        ),
+    )
+    exact_contract = interface_contract_text(interface)
+    user_prompt = (
+        f"{stable_context}\n"
+        "# Stable regeneration rules\n"
+        "- Preserve the selected algorithmic trajectory; this is a correctness regeneration, not a new search branch.\n"
+        "- Return a complete executable Python program, not a patch and not partial snippets.\n"
+        "- Preserve the official evaluator and validate the exact returned prediction or decision artifact.\n"
+        "- Do not use eval(), exec(), os.system(), or subprocess shell=True.\n"
+        f"- Required callable contract:\n{exact_contract}\n"
+        f"- {output_language_instruction(configured_output_language(agent))}\n\n"
+        "# Current rejected candidate\n"
+        f"Plan:\n{str(getattr(node, 'plan', '') or '')}\n\n"
+        f"Code:\n```python\n{str(getattr(node, 'code', '') or '')}\n```\n\n"
+        "# Latest deterministic rejection evidence (authoritative)\n"
+        f"Regeneration attempt: {attempt}\n"
+        + json.dumps(
+            {
+                "required_interface": interface.__dict__,
+                "exact_callable_contract": exact_contract,
+                "preflight": preflight.__dict__,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    )
+    assistant_prefix = (
+        "I will preserve the method and return a concise corrected plan followed by one complete fenced Python code block."
+    )
+    prompt = build_chat_prompt_for_model(
+        agent.acfg.code.model,
+        introduction,
+        user_prompt,
+        assistant_prefix,
+    )
+    plan, code = plan_and_code_query(agent, prompt)
+    if not str(code or "").strip():
+        raise RuntimeError("Preflight regeneration returned no executable code")
+    return plan, code

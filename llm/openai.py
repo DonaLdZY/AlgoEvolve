@@ -5,6 +5,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -17,7 +18,6 @@ from .model_profiles import (
     thinking_json_incompatible,
 )
 from .usage import (
-    estimate_text_tokens,
     infer_prompt_name,
     log_llm_usage,
     prompt_parts_from_messages,
@@ -36,6 +36,7 @@ CACHE_FRIENDLY_SYSTEM = (
     "When a JSON/tool schema is supplied, return data that satisfies it exactly."
 )
 AGENT_INSTRUCTIONS_TITLE = "# Agent/System Instructions"
+TASK_CONTEXT_END_MARKER = "# End stable task/data context"
 
 
 def _strip_visible_thinking(text: str) -> str:
@@ -47,6 +48,10 @@ def _strip_visible_thinking(text: str) -> str:
 
 def _finish_reason_is_length(finish_reason: str | None) -> bool:
     return str(finish_reason or "").strip().lower() in {"length", "max_tokens", "max_output_tokens"}
+
+
+def _finish_reason_is_resource_limited(finish_reason: str | None) -> bool:
+    return str(finish_reason or "").strip().lower() == "insufficient_system_resource"
 
 
 def _append_with_overlap(
@@ -78,16 +83,18 @@ def _build_continuation_instruction(max_tokens: int | None, round_index: int) ->
 
 
 def _build_continuation_messages(
-    original_messages: list[dict[str, str]],
+    original_messages: list[dict[str, Any]],
     raw_assistant_so_far: str,
     *,
     max_tokens: int | None,
     round_index: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Replay the original prompt plus the partial assistant output, then ask for only the tail."""
     messages = [dict(m) for m in original_messages]
     if messages and messages[-1].get("role") == "assistant":
         messages[-1]["content"] = str(messages[-1].get("content", "") or "") + raw_assistant_so_far
+        messages[-1].pop("prefix", None)
+        messages[-1].pop("reasoning_content", None)
     else:
         messages.append({"role": "assistant", "content": raw_assistant_so_far})
     messages.append(
@@ -197,6 +204,11 @@ def _insert_after_task_section(user_message: str, section: str) -> str:
     if not inserted.strip():
         return user
 
+    marker_index = user.find(TASK_CONTEXT_END_MARKER)
+    if marker_index >= 0:
+        split_at = marker_index + len(TASK_CONTEXT_END_MARKER)
+        return f"{user[:split_at].rstrip()}\n\n{inserted}\n\n{user[split_at:].lstrip()}"
+
     stripped_offset = len(user) - len(user.lstrip())
     search_start = stripped_offset + len("# Task description")
     # The AutoRealize context uses mostly "##" headings. The next top-level
@@ -272,12 +284,22 @@ def _stage_max_tokens(stage) -> int | None:
     return tokens if tokens > 0 else None
 
 
+def _stage_minimum_output_tokens(stage) -> int:
+    try:
+        tokens = int(getattr(stage, "minimum_output_tokens", 32768) or 0)
+    except (TypeError, ValueError):
+        tokens = 32768
+    return max(0, tokens)
+
+
 def _resolve_max_tokens(explicit_value: Any, stage) -> int | None:
     try:
         explicit = int(explicit_value) if explicit_value is not None else 0
     except (TypeError, ValueError):
         explicit = 0
-    return explicit if explicit > 0 else _stage_max_tokens(stage)
+    requested = explicit if explicit > 0 else int(_stage_max_tokens(stage) or 0)
+    effective = max(requested, _stage_minimum_output_tokens(stage))
+    return effective or None
 
 
 def _resolve_use_thinking(stage, func_spec: FunctionSpec | None, json_schema: dict | None = None) -> bool | None:
@@ -329,20 +351,26 @@ def _normalize_deepseek_reasoning_effort(effort: str | None) -> str | None:
     return mapping.get(normalized, normalized)
 
 
-def _apply_provider_thinking_override(
+def _apply_deepseek_request_options(
+    params: dict[str, Any],
     stage,
     model: str,
-    extra_body: dict[str, Any],
-    use_thinking: bool,
-) -> dict[str, Any]:
-    """Inject provider-specific thinking controls when supported."""
-    body = dict(extra_body)
-    if is_deepseek_model(model):
-        body["thinking"] = {"type": "enabled" if use_thinking else "disabled"}
+    use_thinking: bool | None,
+) -> None:
+    """Apply the current DeepSeek OpenAI-format thinking contract."""
+    if not is_deepseek_model(model):
+        return
+    thinking_active = use_thinking is not False
+    if thinking_active:
+        for ignored_parameter in ["temperature", "top_p", "presence_penalty", "frequency_penalty"]:
+            params.pop(ignored_parameter, None)
         effort = getattr(stage, "reasoning_effort", None)
-        if use_thinking and effort:
-            body["reasoning_effort"] = _normalize_deepseek_reasoning_effort(effort)
-    return body
+        if effort:
+            params["reasoning_effort"] = _normalize_deepseek_reasoning_effort(effort)
+    if use_thinking is not None:
+        body = dict(params.get("extra_body") or {})
+        body["thinking"] = {"type": "enabled" if use_thinking else "disabled"}
+        params["extra_body"] = body
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -375,6 +403,7 @@ def _is_retryable_error(exc: Exception) -> bool:
                 "积极拒绝",
                 "temporary failure",
                 "temporarily unavailable",
+                "insufficient_system_resource",
                 "bad gateway",
             "502",
             "503",
@@ -413,7 +442,14 @@ def _create_with_retry(
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return client.chat.completions.create(**params)
+            completion = client.chat.completions.create(**params)
+            choices = getattr(completion, "choices", None) or []
+            finish_reason = str(getattr(choices[0], "finish_reason", "") or "") if choices else ""
+            if is_deepseek_model(str(params.get("model", ""))) and _finish_reason_is_resource_limited(
+                finish_reason
+            ):
+                raise RuntimeError("DeepSeek returned finish_reason=insufficient_system_resource")
+            return completion
         except Exception as exc:
             last_exc = exc
             retryable = _is_retryable_error(exc)
@@ -501,6 +537,10 @@ def _collect_stream_response(
             final_usage = getattr(chunk, "usage", None)
         if chunk.choices and getattr(chunk.choices[0], "finish_reason", None):
             final_finish_reason = str(chunk.choices[0].finish_reason or "")
+    if is_deepseek_model(str(params.get("model", ""))) and _finish_reason_is_resource_limited(
+        final_finish_reason
+    ):
+        raise RuntimeError("DeepSeek returned finish_reason=insufficient_system_resource")
     return full_text, final_finish_reason, final_usage, time.time() - t0
 
 
@@ -583,9 +623,6 @@ def query(
         extra_body["top_k"] = profile["top_k"]
     if use_thinking is not None and "enable_thinking" in profile:
         extra_body["enable_thinking"] = profile["enable_thinking"]
-    if use_thinking is not None:
-        extra_body = _apply_provider_thinking_override(stage, model, extra_body, use_thinking)
-
     params: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -600,6 +637,7 @@ def query(
         params["presence_penalty"] = profile["presence_penalty"]
     if extra_body:
         params["extra_body"] = extra_body
+    _apply_deepseek_request_options(params, stage, model, use_thinking)
     if func_spec is not None:
         tool_dict = _build_tool_dict(model, func_spec)
         params["tools"] = [tool_dict]
@@ -691,20 +729,21 @@ def query(
                 prompt_parts=prompt_parts,
                 estimated_completion_text=message.content or "",
             )
-            json_params = {
+            json_params: dict[str, Any] = {
                 "model": model,
                 "messages": _build_json_mode_messages(system_message, user_message, func_spec),
-                "temperature": params["temperature"],
                 "response_format": {"type": "json_object"},
             }
-            if params.get("max_tokens") is not None:
-                json_params["max_tokens"] = params["max_tokens"]
-            if "top_p" in params:
-                json_params["top_p"] = params["top_p"]
-            if "presence_penalty" in params:
-                json_params["presence_penalty"] = params["presence_penalty"]
-            if extra_body:
-                json_params["extra_body"] = extra_body
+            for key in [
+                "temperature",
+                "max_tokens",
+                "top_p",
+                "presence_penalty",
+                "reasoning_effort",
+                "extra_body",
+            ]:
+                if key in params:
+                    json_params[key] = params[key]
 
             fallback_t0 = time.time()
             completion = _create_with_retry(
@@ -739,6 +778,7 @@ def query(
             info = {
                 "model": getattr(completion, "model", model),
                 "created": getattr(completion, "created", int(time.time())),
+                "usage": usage_to_dict(getattr(completion, "usage", None)),
             }
             return output, req_time, in_tok, out_tok, info
         else:
@@ -749,20 +789,55 @@ def query(
     info = {
         "model": getattr(completion, "model", model),
         "created": getattr(completion, "created", int(time.time())),
+        "usage": usage_to_dict(getattr(completion, "usage", None)),
     }
     return output, req_time, in_tok, out_tok, info
 
 
-def _prompt_to_messages(prompt: str | dict | list, model: str = "") -> list[dict[str, str]]:
+def _is_deepseek_beta_base_url(base_url: str) -> bool:
+    try:
+        return urlparse(str(base_url or "").strip()).path.rstrip("/").endswith("/beta")
+    except ValueError:
+        return False
+
+
+def _prompt_to_messages(
+    prompt: str | dict | list,
+    model: str = "",
+    base_url: str = "",
+) -> list[dict[str, Any]]:
     """Convert prompt to chat messages. Supports Qwen/OpenAI chat format: {system, user, assistant}.
 
     For GPT models, assistant content is appended to the user message instead of
     being sent as a separate assistant message, because GPT models may return
     empty responses when they see a trailing assistant prefill.
     """
+    if isinstance(prompt, list) and all(
+        isinstance(message, dict) and message.get("role") in {"system", "user", "assistant"}
+        for message in prompt
+    ):
+        messages: list[dict[str, Any]] = [
+            {
+                "role": str(message["role"]),
+                "content": str(message.get("content", "") or ""),
+            }
+            for message in prompt
+            if str(message.get("content", "") or "").strip()
+        ]
+        if not messages:
+            raise ValueError("Chat message list must contain at least one non-empty message")
+        if (
+            is_deepseek_model(model)
+            and _is_deepseek_beta_base_url(base_url)
+            and messages[-1].get("role") == "assistant"
+        ):
+            messages[-1]["prefix"] = True
+        return messages
+
     if isinstance(prompt, dict) and ("system" in prompt or "user" in prompt or "assistant" in prompt):
         messages = []
         is_gpt = (model or "").lower().startswith("gpt")
+        use_deepseek_prefix = is_deepseek_model(model) and _is_deepseek_beta_base_url(base_url)
         system_content = str(prompt["system"]) if prompt.get("system") else ""
         user_content = str(prompt["user"]) if prompt.get("user") else ""
         assistant_content = str(prompt["assistant"]) if prompt.get("assistant") else ""
@@ -781,7 +856,10 @@ def _prompt_to_messages(prompt: str | dict | list, model: str = "") -> list[dict
         if user_content:
             messages.append({"role": "user", "content": user_content})
         if assistant_content and not is_gpt:
-            messages.append({"role": "assistant", "content": assistant_content})
+            assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant_content}
+            if use_deepseek_prefix:
+                assistant_message["prefix"] = True
+            messages.append(assistant_message)
 
         if not messages:
             raise ValueError("Chat dict must have at least one of: system, user, assistant")
@@ -803,7 +881,7 @@ def generate(
     """Streaming text generation via OpenAI-compatible Chat API. Supports chat format {system, user, assistant} for Qwen."""
     stage = cfg.agent.code
     model = stage.model
-    messages = _prompt_to_messages(prompt, model=model)
+    messages = _prompt_to_messages(prompt, model=model, base_url=stage.base_url)
     client = OpenAI(
         api_key=stage.api_key,
         base_url=stage.base_url or None,
@@ -870,9 +948,6 @@ def generate(
         extra_body["top_k"] = profile["top_k"]
     if use_thinking is not None and "enable_thinking" in profile:
         extra_body["enable_thinking"] = profile["enable_thinking"]
-    if use_thinking is not None:
-        extra_body = _apply_provider_thinking_override(stage, model, extra_body, use_thinking)
-
     params: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -888,6 +963,7 @@ def generate(
         params["presence_penalty"] = profile["presence_penalty"]
     if extra_body:
         params["extra_body"] = extra_body
+    _apply_deepseek_request_options(params, stage, model, use_thinking)
     if stop_tokens:
         params["stop"] = stop_tokens
     if json_schema is not None:

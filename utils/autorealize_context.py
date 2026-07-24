@@ -19,12 +19,36 @@ CONTEXT_MARKER = "AutoRealize Structured Context"
 MIN_PROMPT_READY_CONTEXT_CHARS = 900
 
 _STAGE_CONTEXT_SECTIONS: dict[str, set[str] | None] = {
+    "fast_draft": {
+        "autorealize structured context",
+        "priority rules",
+        "exact source schema contract",
+        "executable data read recipes",
+        "source alias guard",
+        "entity alias candidates",
+        "minimal task reference",
+        "method strategy",
+        "evaluation contract reference",
+        "output contract reference",
+        "relation cards",
+        "problem boundary reference",
+        "constraints reference",
+        "pitfalls",
+        "problem and goal",
+        "evaluation contract",
+        "output contract",
+        "data access",
+        "modeling boundary",
+        "constraints",
+    },
     # Data loading owns the full physical schema and all table-level caveats.
     "data_processing_and_feature_engineering": None,
+    "decision_data_and_contract": None,
     "evaluator_and_constraint_checker": {
         "autorealize structured context",
         "priority rules",
         "exact source schema contract",
+        "executable data read recipes",
         "source alias guard",
         "entity alias candidates",
         "minimal task reference",
@@ -41,7 +65,40 @@ _STAGE_CONTEXT_SECTIONS: dict[str, set[str] | None] = {
         "modeling boundary",
         "constraints",
     },
-    "rl_environment_design": {
+    "solver_design": {
+        "autorealize structured context",
+        "priority rules",
+        "minimal task reference",
+        "method strategy",
+        "evaluation contract reference",
+        "output contract reference",
+        "relation cards",
+        "problem boundary reference",
+        "constraints reference",
+        "pitfalls",
+        "problem and goal",
+        "evaluation contract",
+        "output contract",
+        "modeling boundary",
+        "constraints",
+    },
+    "solve_evaluate_and_artifact": {
+        "autorealize structured context",
+        "priority rules",
+        "minimal task reference",
+        "method strategy",
+        "evaluation contract reference",
+        "output contract reference",
+        "problem boundary reference",
+        "constraints reference",
+        "pitfalls",
+        "problem and goal",
+        "evaluation contract",
+        "output contract",
+        "modeling boundary",
+        "constraints",
+    },
+    "decision_process_design": {
         "autorealize structured context",
         "priority rules",
         "entity alias candidates",
@@ -50,6 +107,70 @@ _STAGE_CONTEXT_SECTIONS: dict[str, set[str] | None] = {
         "evaluation contract reference",
         "output contract reference",
         "relation cards",
+        "problem boundary reference",
+        "constraints reference",
+        "pitfalls",
+        "problem and goal",
+        "evaluation contract",
+        "output contract",
+        "modeling boundary",
+        "constraints",
+    },
+    "environment_implementation": {
+        "autorealize structured context",
+        "priority rules",
+        "entity alias candidates",
+        "minimal task reference",
+        "method strategy",
+        "evaluation contract reference",
+        "output contract reference",
+        "relation cards",
+        "problem boundary reference",
+        "constraints reference",
+        "pitfalls",
+        "problem and goal",
+        "evaluation contract",
+        "output contract",
+        "modeling boundary",
+        "constraints",
+    },
+    "policy_and_algorithm_design": {
+        "autorealize structured context",
+        "priority rules",
+        "minimal task reference",
+        "method strategy",
+        "evaluation contract reference",
+        "output contract reference",
+        "problem boundary reference",
+        "constraints reference",
+        "pitfalls",
+        "problem and goal",
+        "evaluation contract",
+        "output contract",
+        "modeling boundary",
+        "constraints",
+    },
+    "training_strategy": {
+        "autorealize structured context",
+        "priority rules",
+        "minimal task reference",
+        "method strategy",
+        "evaluation contract reference",
+        "problem boundary reference",
+        "constraints reference",
+        "pitfalls",
+        "problem and goal",
+        "evaluation contract",
+        "modeling boundary",
+        "constraints",
+    },
+    "rollout_and_artifact": {
+        "autorealize structured context",
+        "priority rules",
+        "minimal task reference",
+        "method strategy",
+        "evaluation contract reference",
+        "output contract reference",
         "problem boundary reference",
         "constraints reference",
         "pitfalls",
@@ -113,6 +234,7 @@ _STAGE_CONTEXT_SECTIONS: dict[str, set[str] | None] = {
         "autorealize structured context",
         "priority rules",
         "exact source schema contract",
+        "executable data read recipes",
         "source alias guard",
         "minimal task reference",
         "evaluation contract reference",
@@ -323,11 +445,52 @@ def _markdown_is_prompt_ready(text: str) -> bool:
 
 def has_autorealize_context(input_dir: Path) -> bool:
     contracts = _load_contracts(Path(input_dir))
-    if str(contracts.get("automl_md") or "").strip():
-        return True
     return _pack_is_prompt_ready(contracts.get("automl_pack")) or _markdown_is_prompt_ready(
         str(contracts.get("automl_md") or "")
     )
+
+
+def infer_autorealize_task_mode(text: str) -> str | None:
+    """Read the task-method route authored by AutoRealize.
+
+    Returns ``None`` for standalone previews so callers can use conservative
+    keyword fallback without overriding a structured method contract.
+    """
+
+    source = str(text or "")
+    lowered = source.lower()
+    if CONTEXT_MARKER.lower() not in lowered:
+        return None
+
+    def _value(key: str) -> str:
+        match = re.search(rf"(?im)^\s*-\s*{re.escape(key)}\s*:\s*`?([^`\r\n]+)", source)
+        return match.group(1).strip().lower() if match else ""
+
+    rl_required = _value("rl_required") in {"true", "yes", "1"}
+    first_method = _value("first_draft_method")
+    required_block = ""
+    required_match = re.search(
+        r"(?ims)^\s*-\s*required_method_families\s*:\s*(.*?)(?=^\s*-\s*[a-z_]+\s*:|^#{2,3}\s|\Z)",
+        source,
+    )
+    if required_match:
+        required_block = required_match.group(1).lower()
+    if rl_required or "reinforcement_learning" in first_method or "reinforcement" in required_block:
+        return "rl"
+
+    structure = _value("problem_structure")
+    paradigm = _value("problem_paradigm")
+    if structure == "native_sequential_control":
+        return "rl"
+    if structure == "decision_optimization":
+        return "optimization"
+    if paradigm in {"static_optimization", "hybrid_ml_optimization"}:
+        return "optimization"
+    if paradigm == "reinforcement_learning":
+        return "rl"
+    if structure == "prediction" or paradigm == "ml_dl_prediction":
+        return "prediction"
+    return None
 
 
 def _render_from_pack(pack: dict[str, Any]) -> str:
@@ -402,6 +565,10 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
         lines.append("")
     lines.append("### Problem And Goal")
     lines.append(f"- problem_paradigm: `{pack.get('problem_paradigm') or 'unknown_but_executable'}`")
+    for key in ["problem_structure", "decision_temporality", "environment_source"]:
+        value = pack.get(key)
+        if value not in (None, ""):
+            lines.append(f"- {key}: `{value}`")
     if pack.get("task_goal"):
         lines.append(f"- task_goal: {_truncate(pack.get('task_goal'), 1600)}")
     lines.append("")
@@ -409,16 +576,50 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
     method = pack.get("method_strategy") if isinstance(pack.get("method_strategy"), dict) else {}
     if method:
         lines.append("### Method Strategy")
-        for key in ["problem_paradigm", "explicit_rl_requested", "rl_as_required_paradigm"]:
+        for key in [
+            "problem_paradigm",
+            "problem_structure",
+            "decision_temporality",
+            "environment_source",
+            "explicit_rl_requested",
+            "rl_as_required_paradigm",
+            "rl_required",
+            "first_draft_method",
+        ]:
             if key in method:
                 lines.append(f"- {key}: `{method.get(key)}`")
-        families = _nonempty(method.get("recommended_solver_families"), limit=10)
-        if families:
-            lines.append("- recommended_solver_families: " + ", ".join(f"`{x}`" for x in families))
-        for key in ["first_draft_policy", "rl_branch_policy"]:
+        for key in ["required_method_families", "allowed_method_families", "recommended_solver_families"]:
+            families = _nonempty(method.get(key), limit=16)
+            if families:
+                lines.append(f"- {key}: " + ", ".join(f"`{x}`" for x in families))
+        for key in ["first_draft_policy"]:
             value = str(method.get(key, "") or "").strip()
             if value:
                 lines.append(f"- {key}: {_truncate(value, 1000)}")
+        candidates = method.get("rl_formulation_candidates")
+        if isinstance(candidates, list) and candidates:
+            lines.append("- rl_formulation_candidates:")
+            for index, candidate in enumerate(candidates[:8], 1):
+                if not isinstance(candidate, dict):
+                    continue
+                lines.append(
+                    f"  - candidate_{index}: formulation_type={candidate.get('formulation_type')}; "
+                    f"generalization_target={candidate.get('generalization_target')}"
+                )
+                for candidate_key in [
+                    "state_candidates",
+                    "action_candidates",
+                    "transition_description",
+                    "action_mask_basis",
+                    "reward_alignment",
+                    "terminal_condition",
+                    "episode_generation",
+                    "evidence_refs",
+                    "unresolved_points",
+                ]:
+                    candidate_value = candidate.get(candidate_key)
+                    if candidate_value not in (None, "", [], {}):
+                        lines.append(f"    - {candidate_key}: {_truncate(candidate_value, 1000)}")
         notes = _nonempty(method.get("method_routing_notes"), limit=8)
         if notes:
             lines.append("- method_routing_notes:")
@@ -430,6 +631,9 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
         lines.append("### Evaluation Contract")
         final_formula = str(evaluation.get("final_score_formula") or evaluation.get("metric_formula") or "").strip()
         for key in [
+            "passed",
+            "executable",
+            "authority_status",
             "primary_metric",
             "metric_direction",
             "prediction_unit",
@@ -440,6 +644,11 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
             value = str(evaluation.get(key, "") or "").strip()
             if value:
                 lines.append(f"- {key}: {_truncate(value, 1800)}")
+        for key in ["assumptions", "residual_issues"]:
+            values = _nonempty(evaluation.get(key), limit=12)
+            if values:
+                lines.append(f"- {key}:")
+                lines.extend(f"  - {_truncate(x, 800)}" for x in values)
         if final_formula:
             lines.append(f"- final_score_formula: {_truncate(final_formula, 1800)}")
         lines.append("- final_validation_score: print exactly one numeric `Final Validation Score` using `final_score_formula`; do not create or optimize another metric.")
@@ -490,6 +699,25 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
             if notes:
                 lines.append("  - parsing_notes: " + "; ".join(_truncate(x, 280) for x in notes))
         lines.append("")
+
+        read_contracts = [
+            entry.get("read_contract")
+            for entry in data_access[:40]
+            if isinstance(entry, dict)
+            and isinstance(entry.get("read_contract"), dict)
+            and entry.get("read_contract")
+        ]
+        if read_contracts:
+            lines.append("### Executable Data Read Recipes")
+            lines.append(
+                "- These recipes were produced from successful AutoRealize reads. Prefer reusing them. "
+                "They are not an immutable host-level gate: if runtime evidence conflicts, adjust explicitly "
+                "and report the observed shape and columns."
+            )
+            lines.append("```json")
+            lines.append(json.dumps(read_contracts, ensure_ascii=False, sort_keys=True, indent=2))
+            lines.append("```")
+            lines.append("")
 
     for title, key in [
         ("Modeling Boundary", "modeling_boundary"),

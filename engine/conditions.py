@@ -2,12 +2,13 @@
 
 import logging
 import time
+from agents.prompt_policy import infer_task_family, method_family_for_node
 
 logger = logging.getLogger("MLEvolve")
 
 
 def should_trigger_branch_fusion(agent) -> bool:
-    """Whether to trigger multi-branch aggregation: time window, min branches with success, global stagnation, under max attempts."""
+    """Gate root aggregation by half-time, evidence diversity, stagnation, and headroom."""
     if agent.fusion_draft_count >= agent.max_fusion_drafts:
         return False
 
@@ -16,7 +17,11 @@ def should_trigger_branch_fusion(agent) -> bool:
 
     scfg = agent.scfg
     elapsed_time = time.time() - agent.search_start_time
-    if elapsed_time < scfg.fusion_min_time_hours * 3600 or elapsed_time > scfg.fusion_max_time_hours * 3600:
+    total_time = max(0.0, float(getattr(agent.acfg, "time_limit", 0) or 0))
+    if total_time > 0 and elapsed_time < total_time / 2:
+        return False
+    remaining_time = total_time - elapsed_time if total_time > 0 else float("inf")
+    if remaining_time < max(0, int(getattr(scfg, "fusion_min_remaining_seconds", 300))):
         return False
 
     successful_branches = [
@@ -26,85 +31,130 @@ def should_trigger_branch_fusion(agent) -> bool:
     if len(successful_branches) < scfg.fusion_min_branches:
         return False
 
+    task_family = infer_task_family(agent)
+    method_families = {
+        method_family_for_node(node, task_family=task_family)
+        for branch_id in successful_branches
+        for node in agent.branch_successful_nodes.get(branch_id, [])
+    }
+    if len(method_families) < 2:
+        return False
+
     if not is_globally_stagnant(agent):
         return False
 
     logger.info(
         f"Branch fusion conditions met at {elapsed_time/3600:.1f}h "
-        f"with {len(successful_branches)} successful branches"
+        f"with {len(successful_branches)} successful branches and families={sorted(method_families)}"
     )
     return True
 
 
+def should_trigger_node_fusion(agent, parent_node) -> bool:
+    """Use the same evidence gates for a cross-branch Fusion child."""
+
+    if not agent.search_start_time:
+        return False
+    elapsed = time.time() - agent.search_start_time
+    total = max(0.0, float(getattr(agent.acfg, "time_limit", 0) or 0))
+    if total > 0 and elapsed < total / 2:
+        return False
+    if total > 0 and total - elapsed < max(
+        0, int(getattr(agent.scfg, "fusion_min_remaining_seconds", 300))
+    ):
+        return False
+    family = infer_task_family(agent)
+    parent_family = method_family_for_node(parent_node, task_family=family)
+    alternatives = {
+        method_family_for_node(node, task_family=family)
+        for branch_id, nodes in agent.branch_successful_nodes.items()
+        if branch_id != getattr(parent_node, "branch_id", None)
+        for node in nodes
+        if getattr(node, "search_eligible", False)
+    }
+    return bool(alternatives - {parent_family})
+
+
 def is_branch_stagnant(agent, branch_id: int, threshold: int = 3) -> bool:
-    """True if branch has no improvement over branch best for the last threshold attempts."""
+    """Compare recent branch attempts with the best score that preceded them."""
     if branch_id not in agent.branch_successful_nodes:
         return False
 
     successful_nodes = agent.branch_successful_nodes[branch_id]
-    if len(successful_nodes) < 1:
+    if len(successful_nodes) <= threshold:
         return False
 
     maximize = agent.metric_maximize if agent.metric_maximize is not None else True
 
-    sorted_nodes = sorted(
-        successful_nodes,
-        key=lambda n: n.metric.value if n.metric and n.metric.value is not None else (
-            float('-inf') if maximize else float('inf')),
-        reverse=maximize
-    )
-
-    branch_best_metric = sorted_nodes[0].metric.value
-    if branch_best_metric is None:
+    scored = [
+        node
+        for node in successful_nodes
+        if node.metric and node.metric.value is not None
+    ]
+    if len(scored) <= threshold:
         return False
-
-    consecutive_no_improvement = 0
-    max_consecutive = threshold
-
-    recent_nodes = successful_nodes[-max_consecutive:] if len(
-        successful_nodes) >= max_consecutive else successful_nodes
-
-    for node in recent_nodes:
-        if node.metric and node.metric.value is not None:
-            if maximize:
-                if node.metric.value >= branch_best_metric:
-                    break
-            else:
-                if node.metric.value <= branch_best_metric:
-                    break
-            consecutive_no_improvement += 1
-
-    if consecutive_no_improvement >= len(recent_nodes) and len(recent_nodes) >= 2:
+    historical = scored[:-threshold]
+    recent = scored[-threshold:]
+    historical_best = (
+        max(node.metric.value for node in historical)
+        if maximize
+        else min(node.metric.value for node in historical)
+    )
+    recent_best = (
+        max(node.metric.value for node in recent)
+        if maximize
+        else min(node.metric.value for node in recent)
+    )
+    improvement = (
+        recent_best - historical_best
+        if maximize
+        else historical_best - recent_best
+    )
+    stagnant = improvement <= float(agent.scfg.metric_improvement_threshold)
+    if stagnant:
         logger.info(
-            f"Branch {branch_id} stagnant: {consecutive_no_improvement} consecutive attempts "
-            f"didn't exceed branch best {branch_best_metric}")
-        return True
-
-    return False
+            "Branch %s stagnant: recent_best=%s historical_best=%s threshold=%s",
+            branch_id,
+            recent_best,
+            historical_best,
+            agent.scfg.metric_improvement_threshold,
+        )
+    return stagnant
 
 
 def is_globally_stagnant(agent) -> bool:
-    """True if no significant improvement in the last window_size nodes."""
-    if not agent.best_node or not agent.best_node.metric:
-        return False
-
+    """Compare the recent window with the best score that existed before it."""
     window_size = agent.stagnation_threshold
-
-    if len(agent.journal.nodes) < window_size:
+    scored_nodes = [
+        node
+        for node in agent.journal.nodes
+        if getattr(node, "search_eligible", False)
+        and node.metric
+        and node.metric.value is not None
+    ]
+    if len(scored_nodes) <= window_size:
         return False
 
-    recent_nodes = agent.journal.nodes[-window_size:]
-    current_best_metric = agent.best_node.metric
-
-    for node in recent_nodes:
-        if node.is_buggy is False and node.metric and node.metric.value is not None:
-            if agent.metric_maximize:
-                improvement = node.metric.value - current_best_metric.value
-            else:
-                improvement = current_best_metric.value - node.metric.value
-
-            if improvement > agent.scfg.metric_improvement_threshold:
-                return False
+    historical = scored_nodes[:-window_size]
+    recent = scored_nodes[-window_size:]
+    maximize = True if agent.metric_maximize is None else bool(agent.metric_maximize)
+    historical_best = (
+        max(node.metric.value for node in historical)
+        if maximize
+        else min(node.metric.value for node in historical)
+    )
+    recent_best = (
+        max(node.metric.value for node in recent)
+        if maximize
+        else min(node.metric.value for node in recent)
+    )
+    improvement = (
+        recent_best - historical_best
+        if maximize
+        else historical_best - recent_best
+    )
+    if improvement > agent.scfg.metric_improvement_threshold:
+        return False
 
     logger.info(f"Global stagnation detected: no improvement beyond threshold in last {window_size} nodes")
     return True

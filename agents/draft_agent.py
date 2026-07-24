@@ -1,7 +1,6 @@
 """Draft Agent: initial plan and code draft."""
 
 import logging
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,15 +14,44 @@ from agents.prompts import (
     prompt_resp_fmt,
     get_prompt_environment,
     get_impl_guideline_from_agent,
-    is_optimization_or_rl_task,
+    infer_task_mode,
 )
 from agents.planner import build_chat_prompt_for_model
 from agents.prompt_cache import dataset_reference_sentence, task_section
+from agents.memory.optimization_experience import build_optimization_experience_for_agent
+from engine.expansion_profile import ExpansionProfile
+from agents.prompt_policy import (
+    autonomous_method_selection_guidance,
+    dynamic_expansion_instruction,
+    ensure_expansion_profile,
+    scoped_search_memory,
+)
 
 logger = logging.getLogger("MLEvolve")
 
 
-def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
+def run(
+    agent,
+    init_solution_path: Optional[str] = None,
+    expansion_profile: ExpansionProfile | None = None,
+    *,
+    fast_draft_mode: bool | None = None,
+    use_stepwise_generation: bool | None = None,
+) -> SearchNode:
+    fast_draft_mode = (
+        bool(getattr(agent, "fast_draft_mode", False))
+        if fast_draft_mode is None
+        else bool(fast_draft_mode)
+    )
+    use_stepwise_generation = (
+        bool(getattr(agent, "use_stepwise_generation", True))
+        if use_stepwise_generation is None
+        else bool(use_stepwise_generation)
+    )
+    expansion_profile = ensure_expansion_profile(
+        agent, agent.virtual_root, expansion_profile, "draft"
+    )
+    prompt_data_context = agent.data_preview
     """Generate initial draft. If init_solution_path is provided and readable, use file content directly."""
     if init_solution_path:
         try:
@@ -55,18 +83,19 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
         "Your solution will be evaluated on a real leaderboard. Treat this with professionalism.\n\n"
     )
 
-    optimization_or_rl = is_optimization_or_rl_task(
+    task_mode = infer_task_mode(
         task_desc=getattr(agent, "task_desc", ""),
         coldstart_description=getattr(agent, "coldstart_description", ""),
+        autorealize_context=getattr(agent, "data_preview", ""),
     )
-    if optimization_or_rl:
+    if task_mode in {"optimization", "rl"}:
         professional_identity = (
             "You are an expert competition solver for optimization, reinforcement learning, and decision problems.\n\n"
             "**Your Standards**:\n"
-            "- Freeze the official objective, output schema, and hard constraints before optimizing.\n"
+            "- Freeze the shared evaluator, output schema, and task-defined constraints before optimizing.\n"
             "- Build a real feasible solution/action plan, not placeholder predictions.\n"
-            "- Validate feasibility with deterministic checks and report one official scalar score.\n"
-            "- For the first runnable draft, prefer a deterministic greedy/repair/local-search or OR baseline; use RL as a later comparable branch unless the task has an official interactive environment.\n\n"
+            "- Validate the generated decision artifact and report the one task-aligned scalar score.\n"
+            "- Keep each search node to one coherent method; comparison between methods belongs to the search tree.\n\n"
             "Your solution will be evaluated on a real leaderboard. Treat this with professionalism.\n\n"
         )
 
@@ -80,10 +109,11 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
     prompt: Any = {
         "Introduction": introduction,
         "Task description": agent.task_desc,
-        "Memory": agent.virtual_root.fetch_child_memory(),
+        "Memory": scoped_search_memory(agent, agent.virtual_root, "draft"),
         "Instructions": {},
     }
     prompt["Instructions"] |= prompt_resp_fmt()
+    prompt["Instructions"]["Method selection autonomy"] = autonomous_method_selection_guidance()
 
     prompt["Instructions"] |= {
         "🔬 Critical: Scientific Approach to Design": [
@@ -116,7 +146,7 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
 
     prompt["Instructions"] |= {
         "Solution sketch guideline": [
-            "- This first solution design should be relatively simple — avoid complex ensemble strategies or extensive hyperparameter searches at this stage.\n",
+            "- Follow the active simple/normal/complex profile at the end of this prompt. The profile controls implementation cost and risk, not the method family.\n",
             "- 🎯 **CRITICAL: NOVELTY & DIVERSITY REQUIREMENT**:\n",
             "  • **Mandatory**: Your solution MUST be NOVEL compared to ALL existing attempts in Memory.\n",
             "  • **Step 1**: Carefully analyze the core idea of EACH previous attempt in Memory.\n",
@@ -138,25 +168,55 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
         "Coding & Execution Guidelines (CRITICAL)": [
             "- **NO PROGRESS BARS**: You MUST NOT use `tqdm`. Assume `tqdm` is not installed. Use standard Python loops only. Do not use `verbose=1`.",
             "- **MINIMAL LOGGING**: Print ONLY 1 line per epoch (e.g. loss/accuracy). Do NOT print batch-level logs.",
-            "- **FINAL OUTPUT**: The VERY LAST line of execution MUST be `print(f'Final Validation Score: {score}')`. This is required for the score parser."
+            "- **FINAL OUTPUT**: The VERY LAST line of execution MUST be `print(f'Final Validation Score: {score}')` so the result reviewer can identify the candidate-reported task score."
         ]
     }
-    if optimization_or_rl:
+    if task_mode in {"optimization", "rl"}:
+        method_requirement = (
+            "- REQUIRED METHOD: this draft must implement an actual RL solution path. Construct or use a decision environment, "
+            "train or configure a policy, use that policy for the evaluated rollout, save its artifact, and expose `train_policy(data, artifact_dir)` plus `rollout(model_path, data)` without retraining.\n"
+            if task_mode == "rl"
+            else "- METHOD SCOPE: implement one coherent optimization method in this node; do not add an unrelated competing method inside the same draft.\n"
+        )
         prompt["Instructions"]["Solution sketch guideline"].extend(
             [
-                "- FIRST DRAFT POLICY for optimization/RL-like tasks: implement a deterministic baseline before expensive learning. Build `load_problem_data`, `validate_solution`, `score_solution`, evaluator self-tests, and a greedy/repair/local-search solver that produces a real solution artifact or partial solution.\n",
-                "- Do NOT make the first draft depend on successful PPO/DQN/neural RL training. If RL is requested, leave clear extension points (`Environment`, action mask, reward tied to `score_solution`) but still run and score the deterministic baseline in this draft.\n",
+                method_requirement,
+                "- Build `load_problem_data`, `validate_solution`, and `score_solution` once and use that same evaluator for method selection, training reward alignment, rollout validation, and the final score.\n",
                 "- Candidate generation must mask illegal actions before scoring/selection whenever constraints are known. Use the task's exact entities, feasibility rules, resource availability, capacity, time/budget limits, uniqueness rules, and other hard constraints before choosing any action.\n",
-                "- If no legal action exists for an item/job/state, handle it as a first-class branch according to the task contract: mark it infeasible/undecided when allowed, try an allowed repair/new-resource/backtracking fallback, and include task-defined counts/examples in `Decision Validation Summary`. Never pick an illegal action just to avoid an empty candidate set.\n",
+                "- If no legal action exists for an item/job/state, handle it as a first-class branch according to the task contract before logits/softmax: mark it infeasible/undecided when allowed, try an allowed repair/new-resource/backtracking fallback, and include task-defined counts/examples in `Decision Validation Summary`. Never softmax an all-invalid mask into NaN probabilities or pick an illegal action just to avoid an empty candidate set.\n",
+                "- If this node chooses RL/hybrid, explicitly assess curriculum learning. When suitable, progress from small instances, relaxed constraints, short horizons, or heuristic demonstrations toward the full task using success/feasibility/evaluator thresholds; otherwise state why it is unsuitable. Final selection must replay the original full-scale environment, hard constraints, complete horizon, and official evaluator.\n",
                 "- A partial, infeasible, empty, or diagnostic solution may still be useful if it is scored by the official deterministic evaluator/formula and the limitations are explicit.\n",
-                "- If you print `Decision Validation Summary`, keep it task-appropriate: objective components, validator status, and short examples for the dominant failure reason. It is diagnostic only; the parser accepts nodes by the final scalar score.\n",
-                "- The first draft should maximize the chance of producing a retained search-tree node, then later improve/debug nodes can add RL, CP-SAT/MILP, richer local search, or learned scoring.\n",
+                "- If you print `Decision Validation Summary`, keep it task-appropriate: objective components, validator status, and short examples for the dominant failure reason. It is diagnostic evidence for the result reviewer, not an automatic acceptance signal.\n",
+                "- The draft must finish the selected method end to end: data contract, evaluator, solver or policy, reusable artifact, the documented `solve` or `train_policy`/`rollout` interface, solution generation, and final evaluation.\n",
             ]
         )
+    if task_mode == "optimization":
+        optimization_experience = build_optimization_experience_for_agent(
+            agent,
+            task_mode=task_mode,
+            extra_context=str(prompt.get("Memory", "") or ""),
+        )
+        experience_guidance = [
+            "- For optimization, 'relatively simple first solution' means one coherent executable method, not necessarily a greedy heuristic. A compact exact formulation is valid when the structure assessment shows it fits the configured time and memory budget.",
+            "- Before choosing the method, assess whether the task has bounded aggregate integer states, local/adjacent nonlinear costs, useful relaxations, computable lower/upper bounds, or a feasible incumbent that can seed exact or large-neighborhood optimization.",
+            "- Use a retrieved experience only when its applicability checks match this task. It is a reusable hypothesis, not a requirement to use MILP, CP-SAT, a commercial solver, or any particular algorithm.",
+            "- Let the search tree provide method diversity: if Memory already contains a heuristic branch, consider an untried exact or hybrid branch when applicable, and vice versa. Keep this node itself to one coherent method trajectory.",
+            "- Preserve any fast feasible solution as an incumbent/upper bound when useful, and independently replay `validate_solution` plus `score_solution` after every solver path.",
+        ]
+        # Stepwise mode injects the full card only into solver_design; avoid
+        # repeating the same stable context in every specialized step.
+        if not use_stepwise_generation and not fast_draft_mode:
+            experience_guidance.append(optimization_experience)
+        prompt["Instructions"]["Optimization structure and experience guidance"] = experience_guidance
     prompt["Instructions"] |= get_impl_guideline_from_agent(agent)
     prompt["Instructions"] |= prompt_leakage_prevention()
 
-    if agent.use_coldstart and (agent.coldstart_description != "None model"):
+    if fast_draft_mode and task_mode in {"optimization", "rl"}:
+        coldstart_guideline = [
+            "Fast draft: use the one method family most directly supported by the task contract and installed runtime. "
+            "Do not enumerate unrelated ML/RL/optimization families inside this node."
+        ]
+    elif agent.use_coldstart and (agent.coldstart_description != "None model"):
         if "Reference pattern" in str(agent.coldstart_description):
             coldstart_guideline = [
                 f"""
@@ -166,8 +226,8 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
 
             These are method-level references, not fixed pretrained-model snippets.
             - Adapt the reference pattern to the current task; do NOT copy it blindly.
-            - If the task is an optimization problem, first compare OR/heuristic baselines with any RL formulation.
-            - Use RL only when a state/action/transition/reward formulation is natural and evaluable.
+            - Follow the AutoRealize required-method contract. A static optimization task may require RL constructed from static problem instances.
+            - If RL is required, implement the complete RL path in this node rather than replacing it with another solver family.
             - If a `Reference pattern` conflicts with the task description, the task description and metric take priority.
             """
             ]
@@ -197,26 +257,33 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
 
     prompt["Instructions"]["Implementation guideline"].extend(coldstart_guideline)
     prompt["Instructions"] |= get_prompt_environment()
-    prompt["Instructions"] |= ROBUSTNESS_GENERALIZATION_STRATEGY
+    if task_mode == "prediction":
+        prompt["Instructions"] |= ROBUSTNESS_GENERALIZATION_STRATEGY
 
-    instructions = f"\n# Instructions\n\n"
+    instructions = "\n# Instructions\n\n"
     instructions += compile_prompt_to_md(prompt["Instructions"], 2)
 
     memory_section = ""
     if prompt.get("Memory", "").strip():
         memory_section = f"\n# Memory\nBelow is a record of previous solution attempts and their outcomes:\n {prompt['Memory']}\n"
 
-    user_prompt = f"{task_section(prompt['Task description'], agent.data_preview)}\n{instructions}{memory_section}"
+    expansion_control = dynamic_expansion_instruction(
+        agent, expansion_profile, operator="draft"
+    )
+    user_prompt = (
+        f"{task_section(prompt['Task description'], prompt_data_context)}\n"
+        f"{instructions}{memory_section}\n{expansion_control}"
+    )
     assistant_prefix = (
         "Let me approach this systematically.\n"
-        f"{dataset_reference_sentence(prompt['Task description'], agent.data_preview)}"
+        f"{dataset_reference_sentence(prompt['Task description'], prompt_data_context)}"
     )
     prompt_complete = build_chat_prompt_for_model(
         agent.acfg.code.model, introduction, user_prompt, assistant_prefix
     )
     agent.virtual_root.add_expected_child_count()
 
-    if agent.use_stepwise_generation:
+    if use_stepwise_generation and expansion_profile.complexity != "simple":
         plan, code = stepwise_plan_and_code_query(
             agent_instance=agent,
             prompt_base=prompt,
@@ -224,6 +291,7 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
             context={
                 "stage": "draft",
                 "memory": prompt.get("Memory", ""),
+                "expansion_control": expansion_control,
             },
         )
     else:
