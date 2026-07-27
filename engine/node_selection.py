@@ -8,7 +8,7 @@ from typing import List
 
 from engine.search_node import SearchNode
 from engine.conditions import should_trigger_branch_fusion
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def _subtree_load(node: SearchNode) -> int:

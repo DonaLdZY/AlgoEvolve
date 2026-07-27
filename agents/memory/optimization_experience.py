@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 import yaml
 
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 DEFAULT_LIBRARY_PATH = Path(__file__).with_name("optimization_experiences.yaml")
 
 

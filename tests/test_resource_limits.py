@@ -17,7 +17,7 @@ import service_api
 from engine.executor import Interpreter, memory_limited_subprocess_command
 from service_api import (
     JobStore,
-    StartMLEvolveRequest,
+    StartAlgoEvolveRequest,
     TaskResourceLimits,
     _memory_child_guard_threshold,
     _monitor_task_resources,
@@ -117,7 +117,7 @@ def test_cross_platform_cpu_capability_matrix_and_macos_budget() -> None:
     assert linux["backend"] == "process_affinity"
     assert macos["backend"] == "worker_and_thread_budget"
     assert macos["hard_limit"] is False
-    assert macos_env["MLEVOLVE_CPU_WORKER_CAP"] == "4"
+    assert macos_env["ALGOEVOLVE_CPU_WORKER_CAP"] == "4"
     assert macos_env["VECLIB_MAXIMUM_THREADS"] == "1"
 
 
@@ -186,7 +186,7 @@ def test_start_job_rejects_unknown_selected_accelerator(tmp_path: Path, monkeypa
             "torch": {},
         },
     )
-    request = StartMLEvolveRequest(
+    request = StartAlgoEvolveRequest(
         task_id="unknown-device",
         args=["exp_name=unknown-device"],
         log_dir=str(tmp_path / "logs"),
@@ -240,7 +240,7 @@ def test_service_resource_request_reads_task_yaml(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    request = StartMLEvolveRequest(
+    request = StartAlgoEvolveRequest(
         task_id="resource-yaml",
         log_dir="logs",
         workspace_dir="workspace",
@@ -266,7 +266,7 @@ def test_parallel_search_can_share_a_smaller_cpu_set(tmp_path: Path) -> None:
 
 
 def test_soft_cpu_worker_cap_limits_parallel_execution_slots(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("MLEVOLVE_CPU_WORKER_CAP", "2")
+    monkeypatch.setenv("ALGOEVOLVE_CPU_WORKER_CAP", "2")
     cfg = SimpleNamespace(
         start_cpu_id="0",
         cpu_number="4",
@@ -282,8 +282,8 @@ def test_posix_memory_fallback_wraps_generated_node_only(tmp_path: Path) -> None
     command = ["python", "runfile.py"]
     guard = tmp_path / "resource_guard.py"
     environment = {
-        "MLEVOLVE_MEMORY_ENFORCEMENT_MODE": "posix_rlimit_as_plus_child_guard",
-        "MLEVOLVE_MEMORY_LIMIT_BYTES": "1073741824",
+        "ALGOEVOLVE_MEMORY_ENFORCEMENT_MODE": "posix_rlimit_as_plus_child_guard",
+        "ALGOEVOLVE_MEMORY_LIMIT_BYTES": "1073741824",
     }
 
     wrapped = memory_limited_subprocess_command(
@@ -315,7 +315,7 @@ def test_posix_memory_fallback_wraps_generated_node_only(tmp_path: Path) -> None
 def test_run_job_without_config_path_applies_task_environment(tmp_path: Path, monkeypatch) -> None:
     local_store = JobStore()
     monkeypatch.setattr(service_api, "store", local_store)
-    monkeypatch.delenv("MLEVOLVE_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("ALGOEVOLVE_CONFIG_PATH", raising=False)
     monkeypatch.delenv("PYTHONFAULTHANDLER", raising=False)
     cpu_ids = choose_cpu_ids(1)
     workdir = tmp_path / "service-workdir"
@@ -333,7 +333,7 @@ def test_run_job_without_config_path_applies_task_environment(tmp_path: Path, mo
                 "print(json.dumps({",
                 "    'affinity': psutil.Process().cpu_affinity(),",
                 "    'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),",
-                "    'config_path_present': bool(os.environ.get('MLEVOLVE_CONFIG_PATH')),",
+                "    'config_path_present': bool(os.environ.get('ALGOEVOLVE_CONFIG_PATH')),",
                 "    'python_faulthandler': os.environ.get('PYTHONFAULTHANDLER'),",
                 "}))",
             ]
@@ -341,7 +341,7 @@ def test_run_job_without_config_path_applies_task_environment(tmp_path: Path, mo
         encoding="utf-8",
     )
     limits = TaskResourceLimits(cpu_cores=1, memory_limit_gb=0, accelerator_mode="none")
-    request = StartMLEvolveRequest(
+    request = StartAlgoEvolveRequest(
         task_id="service-environment",
         python_executable=sys.executable,
         working_dir=str(workdir),
@@ -437,7 +437,7 @@ def test_service_memory_limit_keeps_controller_alive_after_child_oom(tmp_path: P
         encoding="utf-8",
     )
     limits = TaskResourceLimits(cpu_cores=1, memory_limit_gb=0.12, monitor_interval_seconds=0.1)
-    request = StartMLEvolveRequest(
+    request = StartAlgoEvolveRequest(
         task_id="service-memory-limit",
         python_executable=sys.executable,
         working_dir=str(workdir),
@@ -551,7 +551,7 @@ def test_hard_memory_limit_reserves_controller_headroom(monkeypatch, tmp_path: P
     status = local_store.status(job.job_id)
     assert observed["threshold"] == guard_threshold
     assert status.resource_warning is not None
-    assert "MLEvolve controller continues" in status.resource_warning
+    assert "AlgoEvolve controller continues" in status.resource_warning
     assert "configured limit=8.00 GiB" in status.resource_warning
 
 
@@ -606,5 +606,5 @@ def test_memory_fallback_stops_child_but_preserves_controller(tmp_path: Path, mo
     assert int(out.strip()) != 0
     assert status.resource_violation is None
     assert status.resource_warning is not None
-    assert "MLEvolve controller continues" in status.resource_warning
+    assert "AlgoEvolve controller continues" in status.resource_warning
     assert status.peak_memory_bytes > int(0.03 * (1024**3))

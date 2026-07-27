@@ -1,233 +1,231 @@
-# MLEvolve-Alter
+# AlgoEvolve
 
-生成方案采用有限、可供其他系统调用的接口协议，详见
-[`docs/solution_interface.md`](docs/solution_interface.md)。每个导出的 best/Top-K
-方案都会包含机器可读的 `solution_manifest.json`。
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
+[![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 
-MLEvolve-Alter 是 AutoDecision 的方案搜索与代码执行引擎。它读取任务说明、数据和 AutoRealize 生成的结构化上下文，通过多轮 draft、debug 和 improve 搜索可执行方案，并保存最佳代码、指标、模型或求解器 artifact、Top-K 候选和完整搜索记录。
+**核心定位：不只搜索机器学习预测模型，也把部分决策优化与强化学习问题纳入同一套自动搜索、执行、评审和交付流程。**
 
-项目支持传统机器学习、深度学习、时序预测、数学优化、组合决策和强化学习。对于优化与 RL，系统允许候选代码自由设计状态、动作、约束、策略和求解流程，但要求最终方案能通过统一 evaluator 得到可比较分数，并提供可复用入口。
+AlgoEvolve 是一个面向预测与决策任务的自动机器学习方案搜索引擎。机器学习预测是当前最完整的核心能力；在此基础上，项目还部分支持数学优化、组合决策、启发式搜索、强化学习及其混合方案。它读取任务说明、数据和可选的 AutoRealize 结构化上下文，让多个闭环 Worker 在同一棵搜索树上生成、执行、评审并改进 Python 方案，最终导出最佳方案、Top-K 候选、可复用模型、策略或求解器产物，以及完整的可恢复搜索状态。
 
-## 输入与输出
+> [!IMPORTANT]
+> AlgoEvolve 是 [InternScience/MLEvolve](https://github.com/InternScience/MLEvolve) 的大幅修改版，由 AlgoEvolve 贡献者独立维护。它拥有独立名称，不是 MLEvolve 官方发行版，也不代表 InternScience、上海人工智能实验室或原 MLEvolve 团队对本项目的认可。上游版权、修改说明和许可证信息见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
 
-主要输入：
+## 能做什么
 
-- 数据目录或 AutoRealize 输出目录。
-- `description.md`，或命令行中的简短 `goal`。
-- 可选的 `realize_report/automl_context.md`。
-- 带注释的 YAML 配置或 OmegaConf 点号覆盖参数。
+AlgoEvolve 的重点不是只让 LLM 写一份训练代码，而是让预测模型、优化算法和部分 RL 策略都能进入可验证、可比较、可恢复的搜索过程。
 
-主要输出：
+| 问题类型               | 当前定位             | 已接入的能力                                                                              |
+| ---------------------- | -------------------- | ----------------------------------------------------------------------------------------- |
+| **机器学习预测** | 核心支持             | 分类、回归、时序等任务的数据处理、验证、训练、推理、artifact 保存和 Top-K 比较            |
+| **决策与优化**   | 部分支持             | 数学规划、组合优化、调度、分配、路径规划、启发式、局部搜索、元启发式及混合方法            |
+| **强化学习**     | 部分支持、实验性更强 | 环境定义、策略训练、rollout、artifact 保存，以及和启发式或优化方法在统一 evaluator 下比较 |
 
-- 搜索树和 `journal.json`。
-- 每个候选节点的代码、执行输出、指标、LLM insight 和程序解析事实。
-- `best_solution` 与 `top_solution`。
-- 模型、策略、预处理器或求解器 artifact。
-- 运行状态、资源用量、LLM token 和简略/详细日志。
+“部分支持”表示这些任务已经进入正式工作流，而不是仅在提示词里提到：它们可以生成专用方案、执行代码、接受 Result Review、参与搜索树评分，并通过 Decision/RL 接口导出。但是，决策与 RL 的可靠性更依赖任务是否提供明确的约束、状态转移、可行性校验器和统一评分函数；本项目并不宣称能够解决任意形式的决策或 RL 问题。
 
-## 搜索流程
+主要能力包括：
 
-```text
-任务说明 + AutoRealize context + 数据
-                  |
-                  v
-         初始 draft 生成与执行
-                  |
-                  v
-      evaluator 解析、结果反馈、入树
-                  |
-                  v
-     debug / improve / 新分支并行搜索
-                  |
-                  v
-       最佳方案、Top-K 与交付产物
+- **预测任务**：分类、回归、时序预测及其他从数据学习预测函数的任务。
+- **部分决策任务**：数学优化、组合优化、调度、分配、路径规划和其他能够定义明确约束与 evaluator 的任务。Optimization 归入 Decision，而不是独立的问题类型。
+- **部分强化学习任务**：当问题能够构造可信的 state、action、transition、reward 和终止条件时，可以训练并评估策略，尤其适用于部分序贯决策或可合理序贯化的静态优化任务。
+- **开放方法空间**：模型可选择传统机器学习、深度学习、启发式、局部搜索、元启发式、数学规划、强化学习或混合方法，不受固定算法清单限制，也不会为了使用 RL 而强行把不合适的问题改造成 RL。
+- **并行树搜索**：多个 Worker 并行选择不同父节点，每个 Worker 独立完成生成、执行、评审和提交。
+- **可信结果评审**：结合完整代码、原始输出、指标、执行事实和任务约束，识别崩溃、分数绕过、空解、约束失效和不可信的极端指标。
+- **稳定恢复**：保存 journal、UCT 统计、随机状态、Top-K 清单和在途动作；中断后可以在原搜索树上继续。
+- **可复用交付**：最佳方案与 Top-K 方案使用有限的 Prediction、Decision 或 RL 接口，并附带机器可读的 `solution_manifest.json`。
+- **服务化运行**：FastAPI 服务可启动、查询、停止任务，限制任务级 CPU、内存和加速器，并为前端提供搜索快照。
+
+本项目会执行 LLM 生成的代码。请只在隔离环境中处理可信数据，并为任务设置合理的 CPU、内存、磁盘和时间限制。
+
+## 系统工作流
+
+```mermaid
+flowchart TD
+    A["任务说明、数据、AutoRealize context"] --> B["加载配置并准备隔离工作区"]
+    B --> C["识别 Prediction 或 Decision，并固定 evaluator 语义"]
+    C --> D["Worker 原子选择可扩展父节点"]
+    D --> E["添加临时 virtual visits 并锁定父节点"]
+    E --> F["Draft / Debug / Improve / Evolution / Fusion"]
+    F --> G["确定性预检查与可选 LLM 代码评审修复"]
+    G --> H["隔离执行候选代码"]
+    H --> I["Result Review 与确定性验收"]
+    I -->|拒绝| J["记录失败原因，供后续 Debug 使用"]
+    I -->|接受| K["提交节点、回传真实 reward"]
+    J --> K
+    K --> L["更新 best、Top-K 与检查点"]
+    L --> M{"预算是否耗尽"}
+    M -->|否| D
+    M -->|是| N["导出方案、模型/求解器产物和搜索记录"]
 ```
 
-DeepSeek 的 `/beta` endpoint 是有意保留的：draft、improve、fusion 等生成代理会把末尾 `assistant_prefix` 作为 Chat Prefix Completion 发送，并设置 `prefix: true`。thinking 默认开启时不发送无效的采样参数，`reasoning_effort` 使用顶层字段；上下文缓存仍由 DeepSeek 根据稳定消息前缀自动命中。
+### 1. 加载任务与准备工作区
 
-Stepwise 将固定 task/evaluator/workflow 放在会话前缀，后续阶段只追加动态轮次。接近配置的 context headroom 时，较早动态轮次会由 LLM 压缩，最近轮次保留原文；压缩前的精确消息写入 `context_snapshots/`，模型可用 `REQUEST_CONTEXT_SNAPSHOT` 请求宿主回填一次原文。task contract、当前完整代码和最新错误位于受保护的基础上下文，不参与该动态压缩。
+系统按优先级合并默认 YAML、外部 YAML 和命令行点号覆盖参数。`data_dir` 必填，并且必须提供 `desc_file` 或内联 `goal`；仅使用 `goal` 时可用 `eval` 补充评估规则。
 
-### Draft
+启动时会准备：
 
-- `agent.initial_drafts` 决定初始草稿总数，不因预测、优化或 RL 任务类型而改变。
-- 每个父节点的第 1-2 个 sibling 使用 simple prompt；simple draft 使用单次生成，第 3-4 个使用 normal prompt，第 5 个起使用 complex prompt。该序号在并发提交时原子保留并写入断点状态。
-- 达到 `agent.initial_drafts` 后，新 Draft 以 `agent.search.root_new_draft_probability` 与更深层 UCT 扩展竞争，不再机械填满 root。
-- 前端可从 `pending_nodes.json` 显示尚在生成或执行的灰色节点。
+- `workspace/input`：供候选代码读取的输入数据；
+- `workspace/working`：节点生成、执行和中间文件；
+- `workspace/submission`：任务要求的提交产物；
+- `logs`：journal、检查点、运行状态、模型调用用量和日志。
 
-### Debug 与 Improve
+如果输入目录来自 AutoRealize，系统还会读取 `realize_report/automl_context.md`，使用其中的数据读取合同、字段语义、约束和 evaluator 定义。该文件是给模型的机器可执行说明，不替代真实数据或确定性校验器。
 
-- 执行失败或代码缺陷进入 debug，输入当前错误、相关上下文和父节点代码。
-- 已成功且有可比较分数的节点进入 improve，继续改进指标、稳健性或交付完整性。
-- Result Review 一次返回 verdict、reason codes、debug hint、技术总结和前端 insight；只有极端或不确定分数才追加一次裁决调用。
+### 2. 识别问题族与评估方向
 
-### Prediction 与 Decision
+系统将任务归为两类：
 
-- 问题族只有 Prediction 和 Decision；优化属于 Decision。启发式、局部/元启发式搜索、数学优化、RL 和混合方法是与问题族正交的方法族。
-- Prediction Stepwise 为 Data & Validation、Model & Training、Inference & Artifact；Decision Stepwise 为 Problem & Evaluator、Decision Method、Solve/Rollout & Artifact，最后都由 MetaAgent 忠实合并。
-- RL 可以从静态优化数据构造环境，定义 state、candidate/action、transition、reward、terminal 和合法动作 mask。
-- 声称使用 RL 的节点应实际完成环境交互、policy 训练或配置化策略、rollout 和 artifact 保存，不能只保留未使用的 RL 类。
-- 搜索树负责比较不同节点；单个 RL 节点不需要在内部强制生成另一个 baseline 分支。
+- **Prediction**：学习 `data -> prediction`。
+- **Decision**：生成满足约束的决策或求解结果；传统优化与 RL 都属于可选方法族。
 
-## 节点与验证语义
+指标必须在所有节点间保持同一语义、同一方向和同一计算公式。确定性规则会检查有限数值和指标方向，Result Review 则结合任务合同、代码与运行输出判断分数是否可信。若指标含糊不清，会导致LLM幻觉，进而导致搜不出合法方案。
 
-- **生成后预检/修复**：运行前检查语法、危险调用和任务族要求的有限接口；修复后仍失败则不执行。
-- **Result Review**：结合完整代码、原始输出、metric、运行事实和 artifact/interface 证据判断结果是否可信、是否有 bug。
-- 进程异常、缺失/非有限 metric、evaluator mismatch、不可读输出和危险代码仍是确定性否决。artifact 与接口信息写入 manifest/notes，不再形成第三个 `delivery_ready` 资格层。
+
+### 3. 并行选择待扩展节点
+
+每个空闲 Worker 从当前已提交的搜索树原子选择一个父节点。父节点同一时刻只能被一个 Worker 扩展；如果最高优先级节点已被占用，就尝试下一个可调度节点。
+
+UCT 使用持久访问次数与临时 virtual visits：
+
+```text
+effective_visits = persistent_visits + virtual_visits
+
+UCT = total_reward / effective_visits
+    + C * sqrt(log(parent_effective_visits) / effective_visits)
+```
+
+- 未访问节点优先级为正无穷。
+- 选择父节点后，系统立即沿祖先路径增加临时 virtual visits，让后来的 Worker 更倾向于其他分支。
+- 临时访问只影响并发调度，不作为已完成搜索统计写入最终 UCT 状态；在途动作失败或被中断时会撤销。
+- 节点评审结束后，系统移除临时访问并回传真实 reward。
+- 探索常数 `C` 随搜索进度分段衰减。
+- 搜索中后段会按时间进度把 UCT 探索与 Top-K 利用做软切换；Top-K 对单一根分支设配额，避免候选全部来自一条分支。
+
+初始强制生成 `agent.initial_drafts` 个根草稿。之后，新根 Draft 以 `agent.search.root_new_draft_probability` 与更深层扩展竞争，不会机械地先填满所有根草稿。兄弟节点使用渐进的复杂度提示：第 1–2 个为 `simple`，第 3–4 个为 `normal`，第 5 个起为 `complex`。复杂度表示运行成本和策略风险，不指定算法角色；模型仍需根据问题结构选择最合适的方法。
+
+### 4. 生成候选方案
+
+系统可产生以下节点：
+
+- **Draft**：从根节点提出独立方案。
+- **Debug**：读取失败代码、最新错误、评审原因和必要上下文，修复可执行性或逻辑缺陷。
+- **Improve**：在可信父节点上提高指标、稳健性或交付完整性。
+- **Evolution**：分支停滞时改变该分支的方法或关键假设。
+- **Fusion Draft / Fusion**：在证据充分时转移多个分支的互补技术；要求重新整合，禁止直接拼接完整程序。
+
+除快速首稿外，后续 Draft 通常使用 stepwise 生成：
+
+| 问题族     | 阶段 1              | 阶段 2           | 阶段 3                   | 最终合并           |
+| ---------- | ------------------- | ---------------- | ------------------------ | ------------------ |
+| Prediction | Data & Validation   | Model & Training | Inference & Artifact     | MetaAgent 忠实合并 |
+| Decision   | Problem & Evaluator | Decision Method  | Solve/Rollout & Artifact | MetaAgent 忠实合并 |
+
 
 ## 环境要求
 
-- Conda、Miniconda 或 Miniforge
-- Python 3.11 或 3.12，推荐 Python 3.12
-- 可访问 OpenAI-compatible LLM API
-- 足够的 CPU、内存和磁盘空间执行候选代码
-- 可选 GPU、NPU 或其他加速卡
+- Conda、Miniconda 或 Miniforge；
+- **Python 3.12**；
+- 可访问的 OpenAI-compatible LLM API；
+- 足够的 CPU、内存和磁盘空间；
+- GPU、NPU 或其他加速器可选。
 
-生成代码会根据任务动态导入数据处理、机器学习和优化库。基础与机器学习依赖由默认 requirements 提供，特殊领域库按需安装。
-
-## Conda 环境安装
-
-### 在 AutoDecision 主仓库中使用
+## 使用 Conda 安装
 
 ```bash
-cd AutoDecision
-conda env create -f environment.yml
-conda activate automl
+git clone https://github.com/DonaLdZY/AlgoEvolve.git
+cd AlgoEvolve
+
+conda create -n algoevolve python=3.12 pip -y
+conda activate algoevolve
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### 独立安装 MLEvolve-Alter
-
-```bash
-git clone https://github.com/DonaLdZY/MLEvolve-Alter.git
-cd MLEvolve-Alter
-conda create -n mlevolve python=3.12 pip -y
-conda activate mlevolve
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-`requirements.txt` 会安装基础运行依赖和常用机器学习依赖。需要视觉、NLP、音频、地理、化学等较重的可选库时：
+`requirements.txt` 安装编排运行时和通用数据科学、深度学习、优化、RL 依赖。视觉、NLP、音频、地理、化学和其他较重领域依赖按需安装：
 
 ```bash
 python -m pip install -r requirements_domain.txt
 ```
 
-如需 GPU 版 PyTorch，请先使用 PyTorch 或硬件厂商官网给出的匹配命令安装，再安装其余依赖。项目不固定某个 CUDA、ROCm、XPU、MPS 或 Ascend 版本。
-
-验证当前环境：
+开发与测试依赖：
 
 ```bash
-python -c "import sys, torch; print(sys.executable); print(torch.__version__); print(torch.cuda.is_available())"
+python -m pip install -r requirements-dev.txt
 ```
 
-## 配置
+如果使用 GPU 版 PyTorch，请先按 [PyTorch 官方安装器](https://pytorch.org/get-started/locally/) 给出的、与你的 CUDA/ROCm/硬件匹配的命令安装，再安装项目其余依赖。本项目不固定某个 GPU 后端版本。
 
-默认配置文件是 [`config/config.yaml`](config/config.yaml)，包含中英文注释。配置优先级为：
-
-```text
-config/config.yaml
-  < MLEVOLVE_CONFIG_PATH 指定的 YAML
-  < run.py 的 key=value 点号覆盖
-  < 服务请求中的任务临时配置
-```
-
-主要配置区：
-
-| 配置区 | 作用 |
-| --- | --- |
-| `data_dir` / `desc_file` | 数据与任务说明路径 |
-| `agent.steps` / `agent.time_limit` | 搜索步数和总时限 |
-| `agent.initial_drafts` | 搜索开始时生成的初始草稿数 |
-| `agent.code` / `agent.feedback` | 编码模型、评审模型和 API 参数 |
-| `agent.output_language` | 模型生成的 plan/review/debug hint/summary/insight 统一语言：`english` 或 `chinese` |
-| `agent.draft` | fast first draft、stepwise、review 和重试策略 |
-| `agent.search` | 并行搜索、最大草稿数、debug 和 improve 分支预算 |
-| `agent.memory_*` | 全局记忆与 Embedding 后端 |
-| `resources` | 每任务 CPU、总内存和可见加速卡 |
-| `runtime` | 继续任务、journal、状态与产物文件 |
-| `logging` | 简略日志、详细日志、控制台和 LLM usage |
-
-一个最小覆盖示例：
-
-```yaml
-data_dir: "/path/to/autorealize-output"
-desc_file: "/path/to/autorealize-output/description.md"
-exp_id: "demo"
-exp_name: "demo"
-log_dir: "./runs"
-workspace_dir: "./runs"
-
-agent:
-  steps: 50
-  time_limit: 10800
-  initial_drafts: 3
-  code:
-    model: "deepseek-v4-pro"
-    base_url: "https://api.deepseek.com/beta"
-    api_key: ""
-    max_tokens: null
-  feedback:
-    model: "deepseek-v4-pro"
-    base_url: "https://api.deepseek.com/beta"
-    api_key: ""
-    max_tokens: null
-  search:
-    parallel_search_num: 4
-    num_drafts: 8
-    num_improves: 5
-```
-
-API Key 优先级：
-
-1. YAML、点号覆盖或服务任务配置中的非空 `api_key`。
-2. `MLEVOLVE_CODE_API_KEY` / `MLEVOLVE_FEEDBACK_API_KEY`。
-3. `DEEPSEEK_API_KEY`。
-
-Embedding 优先读取配置中的 key，其次读取 `MLEVOLVE_EMBEDDING_API_KEY` 或 `EMBEDDING_API_KEY`。resolved config 和快照不会保留明文密钥。
-
-Linux / macOS 环境变量示例：
+检查解释器和 PyTorch：
 
 ```bash
-export DEEPSEEK_API_KEY="..."
-export MLEVOLVE_CODE_API_KEY="..."
-export MLEVOLVE_FEEDBACK_API_KEY="..."
-export MLEVOLVE_EMBEDDING_API_KEY="..."
+python -c "import sys, torch; print(sys.version); print(sys.executable); print(torch.__version__); print(torch.cuda.is_available())"
 ```
+
+## 配置 LLM
+
+不要把 API Key 提交到 YAML 或 Git。DeepSeek 的最小配置可以保留默认 `config/config.yaml` 中的 `/beta` 地址，只设置环境变量：
 
 Windows PowerShell：
 
 ```powershell
-$env:DEEPSEEK_API_KEY = "..."
-$env:MLEVOLVE_CODE_API_KEY = "..."
-$env:MLEVOLVE_FEEDBACK_API_KEY = "..."
-$env:MLEVOLVE_EMBEDDING_API_KEY = "..."
+$env:DEEPSEEK_API_KEY = "your-api-key"
 ```
 
-## 直接运行
+Linux/macOS：
 
-`run.py` 使用 OmegaConf 点号参数覆盖配置：
+```bash
+export DEEPSEEK_API_KEY="your-api-key"
+```
+
+也可以分别给生成、评审和 embedding 配置不同的 Key：
+
+```text
+ALGOEVOLVE_CODE_API_KEY
+ALGOEVOLVE_FEEDBACK_API_KEY
+ALGOEVOLVE_EMBEDDING_API_KEY
+```
+
+API Key 优先级：
+
+1. YAML、CLI 覆盖或服务请求中的非空 `api_key`；
+2. `ALGOEVOLVE_CODE_API_KEY` / `ALGOEVOLVE_FEEDBACK_API_KEY`；
+3. `DEEPSEEK_API_KEY`。
+
+Embedding Key 优先读取配置，其次是 `ALGOEVOLVE_EMBEDDING_API_KEY` 和 `EMBEDDING_API_KEY`。为了让既有部署平滑迁移，旧 `MLEVOLVE_*` 环境变量仍作为低优先级兼容别名。最终解析配置与检查点会清除明文 Key。
+
+其他 OpenAI-compatible provider 可以覆盖 `agent.code.model`、`agent.code.base_url`、`agent.feedback.model` 和 `agent.feedback.base_url`。仅当后端实际兼容时才使用 DeepSeek 专有的 prefix completion 或 thinking 能力。
+
+## 准备输入
+
+推荐目录：
+
+```text
+task-input/
+|-- description.md
+|-- <data files>
+`-- realize_report/
+    `-- automl_context.md   # 可选，通常由 AutoRealize 生成
+```
+
+`description.md` 至少应明确：
+
+- 目标与业务语义；
+- 输入文件、表、sheet、列和类型；
+- 训练/验证边界，或决策变量与约束；
+- 唯一的 evaluator 公式和越大/越小越好；
+- 输出格式与允许使用的数据。
+
+如果不提供 `description.md`，可通过 `goal="..."` 和 `eval="..."` 直接运行，但复杂任务更适合使用文件化说明。
+
+## 命令行运行
+
+查看参数说明：
 
 ```bash
 python run.py --help
 ```
 
-最小示例：
-
-```bash
-python run.py \
-  data_dir=/path/to/autorealize-output \
-  desc_file=/path/to/autorealize-output/description.md \
-  exp_id=demo \
-  exp_name=demo \
-  log_dir=./runs \
-  workspace_dir=./runs \
-  agent.steps=50 \
-  agent.time_limit=10800 \
-  agent.search.parallel_search_num=4
-```
-
-Windows PowerShell：
+Windows PowerShell 示例：
 
 ```powershell
 python .\run.py `
@@ -238,73 +236,189 @@ python .\run.py `
   log_dir=".\runs" `
   workspace_dir=".\runs" `
   agent.steps=50 `
-  agent.time_limit=10800
+  agent.time_limit=10800 `
+  agent.search.parallel_search_num=4 `
+  agent.output_language="chinese"
 ```
 
-也可以把完整配置放在其他位置：
-
-```bash
-MLEVOLVE_CONFIG_PATH=/path/to/config.yaml python run.py
-```
-
-## 继续任务
-
-继续任务必须指向原运行实际使用的日志目录和工作区目录：
+Linux/macOS 示例：
 
 ```bash
 python run.py \
-  runtime.resume_run=true \
-  log_dir=/path/to/existing/logs \
-  workspace_dir=/path/to/existing/workspace \
-  data_dir=/path/to/original/data \
-  desc_file=/path/to/original/description.md
+  data_dir=/data/demo/autorealize \
+  desc_file=/data/demo/autorealize/description.md \
+  exp_id=demo \
+  exp_name=demo \
+  log_dir=./runs \
+  workspace_dir=./runs \
+  agent.steps=50 \
+  agent.time_limit=10800 \
+  agent.search.parallel_search_num=4 \
+  agent.output_language=english
 ```
 
-也可以设置：
+当 `log_dir` 与 `workspace_dir` 指向同一根目录，新任务会写入：
+
+```text
+runs/<YYYYMMDD_HHMMSS>_<exp_name>/
+|-- logs/
+`-- workspace/
+```
+
+### 外部配置文件
+
+默认配置为 [`config/config.yaml`](config/config.yaml)。可用环境变量指定另一份 YAML：
+
+PowerShell：
+
+```powershell
+$env:ALGOEVOLVE_CONFIG_PATH = "D:\configs\my-algoevolve.yaml"
+python .\run.py data_dir="D:\data" desc_file="D:\data\description.md"
+```
+
+Bash：
 
 ```bash
-MLEVOLVE_RESUME_RUN=1
+ALGOEVOLVE_CONFIG_PATH=/configs/my-algoevolve.yaml \
+python run.py data_dir=/data desc_file=/data/description.md
 ```
 
-继续时会恢复 journal、最佳节点和已预处理数据，但不会恢复已退出 Python 进程的堆内存、模型实例或缓存，因此继续后的内存占用通常低于停止前。
+配置优先级从低到高：
 
-## 服务模式
+```text
+config/config.yaml
+< ALGOEVOLVE_CONFIG_PATH 指向的 YAML
+< run.py 的 key=value 点号覆盖
+< service 生成的任务级覆盖
+```
+
+## 关键配置
+
+完整配置及中英注释见 [`config/config.yaml`](config/config.yaml)。下列项目对耗时、成本和搜索行为影响最大：
+
+| 配置                                        |        默认值 | 作用                                             |
+| ------------------------------------------- | ------------: | ------------------------------------------------ |
+| `agent.steps`                             |        `50` | 最多提交的搜索节点数                             |
+| `agent.time_limit`                        |     `10800` | 整体搜索时限，秒                                 |
+| `agent.initial_drafts`                    |         `3` | 正常 UCT 搜索前强制完成的根草稿数                |
+| `agent.search.parallel_search_num`        |         `4` | 并行闭环 Worker 数；同时影响 LLM、CPU 和内存压力 |
+| `agent.search.num_drafts`                 |         `8` | 根节点允许的最大 Draft 子节点数                  |
+| `agent.search.num_bugs`                   |         `1` | 单个 buggy 节点的最大 Debug 子节点数             |
+| `agent.search.num_improves`               |         `5` | 普通成功节点的最大 Improve 子节点数              |
+| `agent.search.root_new_draft_probability` |      `0.25` | 初始草稿后继续创建根分支的概率                   |
+| `agent.search.explore_switch_start/end`   | `0.5 / 0.7` | UCT 向 Top-K 利用软切换的时间进度区间            |
+| `exec.timeout`                            |      `1800` | 单节点执行超时，秒                               |
+| `resources.cpu_cores`                     |         `4` | 整个任务进程树共享的逻辑 CPU 配额                |
+| `resources.memory_limit_gb`               |       `8.0` | 整个任务进程树共享的内存目标；`0` 表示不限     |
+| `agent.output_language`                   |   `english` | 模型生成内容语言：`english` 或 `chinese`     |
+| `agent.draft.stepwise_context_max_tokens` |     `90000` | 触发较早动态上下文压缩的估算输入预算             |
+| `runtime.resume_budget_mode`              |     `total` | 恢复时预算按累计总量或新增量解释                 |
+
+`agent.code` 与 `agent.feedback` 分别配置生成模型和评审模型，包括 model、base URL、temperature、thinking、reasoning effort、输出上限、超时和网络重试。网络重试与角色级审查次数是不同概念，避免同时调高造成意外成本。
+
+## 继续已有搜索
+
+直接 CLI 恢复时，`log_dir` 和 `workspace_dir` 必须指向上次运行实际使用的两个目录，而不是它们的共同父目录：
+
+```powershell
+python .\run.py `
+  runtime.resume_run=true `
+  runtime.resume_budget_mode="additional" `
+  log_dir="D:\runs\20260727_120000_demo\logs" `
+  workspace_dir="D:\runs\20260727_120000_demo\workspace" `
+  data_dir="D:\runs\demo\autorealize" `
+  desc_file="D:\runs\demo\autorealize\description.md" `
+  agent.steps=20 `
+  agent.time_limit=3600
+```
+
+- `total`：`agent.steps` 和 `agent.time_limit` 是包含既有工作在内的最终总预算。
+- `additional`：本次设置的步数和时间追加到已完成工作之上。
+
+也可设置 `ALGOEVOLVE_RESUME_RUN=1`。旧 `MLEVOLVE_RESUME_RUN` 仍兼容。恢复会沿用持久搜索统计和产物，但不会恢复已退出 Python 进程的堆内存、模型实例或临时缓存。
+
+## FastAPI 服务
+
+启动服务：
 
 ```bash
 python -m uvicorn service_api:app --host 127.0.0.1 --port 18103
 ```
 
-常用接口：
+打开 [http://127.0.0.1:18103/docs](http://127.0.0.1:18103/docs) 查看 OpenAPI。主要端点：
 
-- `GET /health`
-- `GET /resources/inventory`
-- `POST /jobs/start`
-- `GET /jobs/{job_id}`
-- `POST /jobs/stop`
-- `POST /snapshot`
+| 方法     | 路径                     | 作用                       |
+| -------- | ------------------------ | -------------------------- |
+| `GET`  | `/health`              | 健康检查                   |
+| `GET`  | `/resources/inventory` | 探测 CPU、内存和加速器     |
+| `POST` | `/jobs/start`          | 启动独立搜索进程           |
+| `GET`  | `/jobs/{job_id}`       | 查询状态、资源和日志尾部   |
+| `POST` | `/jobs/stop`           | 触发可恢复中断并停止进程树 |
+| `POST` | `/snapshot`            | 读取前端所需的搜索快照     |
 
-访问 `http://127.0.0.1:18103/docs` 查看 OpenAPI 文档。AutoDecision Gateway 通过服务接口启动独立搜索进程，不在 Gateway 进程内直接执行候选代码。
+PowerShell 启动任务：
 
-## 每任务资源限制
+```powershell
+$body = @{
+  task_id = "demo"
+  python_executable = (Get-Command python).Source
+  working_dir = (Get-Location).Path
+  config_path = ""
+  args = @(
+    "data_dir=D:\runs\demo\autorealize",
+    "desc_file=D:\runs\demo\autorealize\description.md",
+    "exp_name=demo",
+    "agent.steps=50",
+    "agent.time_limit=10800",
+    "agent.search.parallel_search_num=4"
+  )
+  log_dir = "D:\runs"
+  workspace_dir = "D:\runs"
+  resume = $false
+  resources = @{
+    cpu_cores = 4
+    memory_limit_gb = 8.0
+    accelerator_mode = "selected"
+    accelerator_device_ids = @("cuda:0")
+    monitor_interval_seconds = 0.5
+  }
+} | ConvertTo-Json -Depth 6
 
-```yaml
-resources:
-  cpu_cores: 4
-  memory_limit_gb: 8.0
-  accelerator_mode: "selected"  # all | selected | none
-  accelerator_device_ids: ["cuda:0"]
-  monitor_interval_seconds: 0.5
+$job = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:18103/jobs/start" `
+  -ContentType "application/json" `
+  -Body $body
+
+$job
 ```
 
-- `cpu_cores` 是整个任务进程树共享的逻辑核心预算。
-- `memory_limit_gb` 是控制器和全部子进程共享的总内存目标；`0` 表示不限制。
-- `accelerator_mode` 控制任务看到全部、指定或不看到加速卡。
+查询、停止和获取快照：
 
-Windows 使用 CPU affinity 与 Job Object；Linux 优先使用 CPU affinity 与 cgroup v2；macOS 使用 worker/线程预算和进程资源限制。CUDA、ROCm、XPU 和 Ascend 通过对应可见性环境变量隔离；Apple MPS 可检测，但不能可靠地按进程隐藏。
+```powershell
+$status = Invoke-RestMethod "http://127.0.0.1:18103/jobs/$($job.job_id)"
 
-## 输出产物
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:18103/jobs/stop" `
+  -ContentType "application/json" `
+  -Body (@{ job_id = $job.job_id } | ConvertTo-Json)
 
-日志目录常见文件：
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:18103/snapshot" `
+  -ContentType "application/json" `
+  -Body (@{
+    log_dir = $job.log_dir
+    workspace_dir = $job.workspace_dir
+  } | ConvertTo-Json)
+```
+
+同一 `task_id` 不能同时启动两个活动任务。停止接口先请求任务写出最小可恢复检查点，检查点 manifest 落盘后再终止整个进程树。服务返回的 `interrupted_resumable` 表示可继续，`interrupted_incomplete` 表示检查点不完整。
+
+## 输出目录
+
+常见日志文件：
 
 ```text
 logs/
@@ -312,17 +426,20 @@ logs/
 |-- filtered_journal.json
 |-- run_status.json
 |-- pending_nodes.json
+|-- checkpoint_manifest.json
 |-- config.yaml
 |-- best_solution.py
-|-- MLEvolve.log
-|-- MLEvolve.verbose.log
+|-- AlgoEvolve.log
+|-- AlgoEvolve.verbose.log
 |-- llm_usage.jsonl
 |-- llm_usage_summary.json
 |-- llm_usage_brief.json
+|-- dependency_installations.jsonl
+|-- dependency_installations_summary.json
 `-- resource_usage.json
 ```
 
-工作区常见文件：
+常见工作区：
 
 ```text
 workspace/
@@ -341,69 +458,90 @@ workspace/
     `-- ...
 ```
 
-生成代码使用固定协议：Prediction 提供 `train(data, artifact_dir)` 与 `predict(model_path, data)`；非 RL Decision 提供 `solve(model_path, data)`；RL/hybrid 提供 `train_policy(data, artifact_dir)` 与 `rollout(model_path, data)`。每个导出目录包含 `solution_manifest.json`。
+`llm_usage.jsonl` 记录每次调用的输入、输出、reasoning 和缓存 token；summary 按模型、阶段和调用类型汇总，便于分析成本。自动补库记录精确缺失模块、安装命令、解释器、耗时、结果和 pip 输出尾部。
 
-## 日志与 token 统计
+## 生成方案接口
 
-- `MLEvolve.log`：适合前端和快速统计的简略日志。
-- `MLEvolve.verbose.log`：包含更完整的调试和第三方库日志。
-- `dependency_installations.jsonl`：受控自动补库的逐次明细，包括缺失模块、安装包、当前 Python、命令、耗时、结果和 pip 输出尾部。
-- `dependency_installations_summary.json`：本次 run 的补库汇总，可直接查看 `requirements_candidates` 并回填 requirements。
+详细合同见 [`docs/solution_interface.md`](docs/solution_interface.md)。每个 best/Top-K 目录都应包含 `solution_manifest.json`，其中记录 `interface_version: algoevolve.solution.v1`、任务种类、是否有状态、artifact 路径、方法族和入口函数。恢复逻辑仍接受旧 `mlevolve.solution.v1` 产物。
 
-当 `exec.auto_install_missing_dependencies=true` 时，生成代码可把 import 根名和 PyPI distribution 绑定，例如 `# MLEVOLVE_PIP_INSTALL[sklearn]: pip install scikit-learn`。默认 `exec.dependency_install_policy=ai_declared`，AI 可选择任意语法合法的单个 PyPI distribution；脚本需要多个未知包时，每个声明必须绑定自己的 import 根名。运行时出现精确的 `ModuleNotFoundError` 后，MLEvolve 才会套用已有可信版本范围（如有）、使用当前解释器将包安装到任务隔离目录，并立即重跑同一节点；没有声明时才使用 `dependency_import_map` 兜底。AutoDecision 将目录固定为 `runs/<task>/automl/python_packages`，并只给该任务脚本追加 `PYTHONPATH`，不会修改基础 Conda/系统环境。严格部署可把策略切换为 `allowlist`。同一包每次任务只尝试一次，生成代码直接执行 pip/conda/shell 安装仍会被拒绝。
-- `llm_usage.jsonl`：逐调用 token、reasoning token、缓存、响应模型和后端 fingerprint。
-- `llm_usage_summary.json`：按模型、阶段和调用类型汇总。
-- `llm_usage_brief.json`：供前端和成本分析使用的精简汇总，DeepSeek V4 按官方美元单价估算。
+Prediction：
 
-## 测试
-
-```bash
-conda activate mlevolve
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+```python
+def train(data, artifact_dir): ...
+def predict(model_path, data): ...
 ```
 
-在 AutoDecision 根环境中：
+Decision solver：
 
-```bash
-conda activate automl
-python -m pytest core/MLEvolve-Alter/tests -q
+```python
+def solve(model_path, data): ...
 ```
 
-默认单元测试不应调用真实 LLM、长时间搜索或 GPU 训练。
+RL 或 hybrid Decision：
 
-## 常见问题
+```python
+def train_policy(data, artifact_dir): ...
+def rollout(model_path, data): ...
+```
 
-### Draft 阶段很久没有节点
+`predict` 和 `rollout` 必须加载已有 artifact，不得偷偷重新训练。无状态启发式或数学求解器可以接受 `model_path=None`，但输出仍必须经过任务的确定性 validator 与 scorer。
 
-第一个节点可能仍在等待 LLM 输出、代码 review、请求重试或执行。检查 `pending_nodes.json`、`MLEvolve.log` 和 `llm_usage.jsonl`。启用 `agent.draft.fast_first_draft` 可以缩短首节点等待时间。
+## 缺失依赖自动安装
 
-### 代码读取了不存在的列或 sheet
+当 `exec.auto_install_missing_dependencies=true` 时，候选代码可以声明安全的 import-to-package 绑定，例如：
 
-确认 `data_dir` 指向完整 AutoRealize 输出目录，而不是只复制了 `description.md`。检查是否存在 `realize_report/automl_context.md`，并确认其中的 Exact Source Schema Contract 与实际数据一致。
+```python
+# ALGOEVOLVE_PIP_INSTALL[sklearn]: pip install scikit-learn
+```
 
-### 节点有分数但没有 submission 或 artifact
+只有执行出现精确 `ModuleNotFoundError` 后，系统才会将包安装到当前任务隔离目录并立即重跑同一节点。生成代码直接执行 pip、conda 或 shell 安装仍会被拒绝。严格部署可以把 `exec.dependency_install_policy` 改为 `allowlist`。
 
-Result Review 接受的有限分数可以进入搜索和 best/Top-K；缺失 artifact 或配置输出会保留为证据 warning，并写入 solution manifest/metric 元数据，而不是再经过第三层交付资格评审。
+## 与原版 MLEvolve 的关系
 
-### GlobalMemory 保存返回 404
+本仓库基于原版 [MLEvolve](https://github.com/InternScience/MLEvolve) 修改。上游项目页与论文：
 
-通常表示 Embedding 服务地址、模型或 API Key 不可用。关闭 Embedding memory 不应阻止本地 journal 搜索；需要全局语义记忆时，请检查 Embedding 配置和服务兼容性。
+- [MLEvolve 项目页](https://internscience.github.io/MLEvolve/)
+- [MLEvolve: A Self-Evolving Framework for Automated Machine Learning Algorithm Discovery](https://arxiv.org/abs/2606.06473)
+- [AutoMLGen: Navigating Fine-Grained Optimization for Coding Agents](https://arxiv.org/abs/2510.08511)
+- [InternAgent 1.5](https://arxiv.org/abs/2602.08990)
 
-### 达到时限是否算失败
+AlgoEvolve 相对上游的主要修改包括：
 
-不是。步数用尽和时间预算耗尽都属于正常终止条件。系统应保存已有最佳结果、Top-K、journal 和运行状态，并允许继续任务或生成报告。
+- 原子父节点选择、临时 virtual visits、父节点单扩展锁和并行闭环 Worker；
+- 可恢复的搜索运行态、在途动作、随机状态、journal 快照和中断检查点；
+- Prediction/Decision 问题分类，以及 ML、优化、RL 和混合方法的正交选择；
+- 渐进 Draft、Evolution、证据驱动 Fusion 和优化经验检索；
+- 生成后预检查、代码 Reviewer 修复、Result Review 与异常结果二次裁决；
+- 有限的生成方案接口和 `solution_manifest.json`；
+- provider-friendly 累积上下文、headroom 压缩、精确快照取回和统一输出语言；
+- DeepSeek `/beta`、prefix completion、thinking/reasoning 与用量统计；
+- AutoRealize 上下文接入、FastAPI 服务、任务级资源限制和扩展测试。
 
-### 继续任务后内存下降
+这是一项实质性派生工作，不是简单改名。请勿删除 [NOTICE](NOTICE) 中的上游归属信息。
 
-继续任务恢复的是持久化状态和工作区，不是旧进程的瞬时内存。旧 worker 退出后，新的搜索进程只加载继续运行所需的状态。
+## 许可证与商标
 
-## 上游声明与许可证
+代码按 [Apache License 2.0](LICENSE) 发布。`LICENSE` 同时保留原 MLEvolve 的版权声明，并加入 AlgoEvolve 贡献者的修改版权。分发源码或衍生版本时，应继续：
 
-MLEvolve-Alter 基于 MLEvolve、AutoMLGen 及相关 agentic machine-learning engineering 工作演进。使用或发布前，请确认本仓库与所有上游项目的许可证、署名和引用要求。
+1. 附带完整 Apache-2.0 许可证；
+2. 保留适用的版权、专利、商标和归属声明；
+3. 保留 [NOTICE](NOTICE)；
+4. 在你修改过的文件中醒目标注变更；
+5. 不暗示上游作者或机构对衍生版本背书。
 
-- MLEvolve Project Page: <https://internscience.github.io/MLEvolve/>
-- AutoMLGen: <https://arxiv.org/abs/2510.08511>
-- InternAgent 1.5: <https://arxiv.org/abs/2602.08990>
+Apache-2.0 第 6 条不授予商号、商标、服务标志或产品名称的使用权，仅允许为说明作品来源所必需的合理使用。AlgoEvolve 不使用上游 logo 作为自己的品牌；若要把上游名称或 logo 用于宣传、产品标识或组织标识，请先获得相应权利人的许可。
 
-在仓库加入明确许可证前，不应视为已经授权自由使用、修改或再分发。
+本节是面向开源发布的实践说明，不构成法律意见。对公司发布、商标注册或商业分发有疑问时，请咨询合格法律顾问。
+
+## 引用上游工作
+
+如果研究或产品使用了 AlgoEvolve，请同时注明本派生仓库并按上游要求引用原 MLEvolve：
+
+```bibtex
+@article{du2026mlevolve,
+  title={MLEvolve: A Self-Evolving Framework for Automated Machine Learning Algorithm Discovery},
+  author={Du, Shangheng and Yan, Xiangchao and Shi, Jinxin and Cao, Zongsheng and Feng, Shiyang and Liang, Zichen and Sun, Boyuan and Peng, Tianshuo and Zhou, Yifan and Li, Xin and Zhou, Jie and He, Liang and Zhang, Bo and Bai, Lei},
+  journal={arXiv preprint arXiv:2606.06473},
+  year={2026}
+}
+```

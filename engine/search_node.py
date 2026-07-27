@@ -16,7 +16,7 @@ from config import SearchConfig
 from utils.metric import MetricValue
 from utils.response import trim_long_string
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 @dataclass(eq=False)

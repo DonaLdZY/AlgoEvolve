@@ -8,7 +8,7 @@ import service_api
 
 from service_api import (
     JobStore,
-    StartMLEvolveRequest,
+    StartAlgoEvolveRequest,
     _base_config_value,
     _inspect_interrupted_checkpoint,
     _mark_service_budget_completed,
@@ -39,7 +39,7 @@ def test_job_status_tail_and_request_default_are_config_driven() -> None:
 
     assert store.status(job.job_id).stdout_tail == "efgh"
     assert _tail_text("abcdefgh", 0) == ""
-    request = StartMLEvolveRequest(
+    request = StartAlgoEvolveRequest(
         task_id="task",
         log_dir="logs",
         workspace_dir="workspace",

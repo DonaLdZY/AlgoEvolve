@@ -13,6 +13,9 @@ def test_run_help_exits_before_runtime_or_llm_initialization() -> None:
     env = os.environ.copy()
     for name in (
         "DEEPSEEK_API_KEY",
+        "ALGOEVOLVE_CODE_API_KEY",
+        "ALGOEVOLVE_FEEDBACK_API_KEY",
+        "ALGOEVOLVE_EMBEDDING_API_KEY",
         "MLEVOLVE_CODE_API_KEY",
         "MLEVOLVE_FEEDBACK_API_KEY",
         "MLEVOLVE_EMBEDDING_API_KEY",

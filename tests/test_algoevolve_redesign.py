@@ -355,7 +355,7 @@ def test_solution_manifest_records_cross_system_entrypoint(tmp_path) -> None:
     )
     payload = write_solution_manifest(agent, node, tmp_path)
     saved = json.loads((tmp_path / "solution_manifest.json").read_text(encoding="utf-8"))
-    assert payload["interface_version"] == "mlevolve.solution.v1"
+    assert payload["interface_version"] == "algoevolve.solution.v1"
     assert saved["entrypoint"] == "solve"
     assert saved["stateful"] is False
 

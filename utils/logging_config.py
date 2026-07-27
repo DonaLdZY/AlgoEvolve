@@ -35,14 +35,14 @@ def setup_logging(cfg: Any) -> logging.Logger:
     if bool(getattr(logging_cfg, "suppress_httpx_logs", True)):
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    logger = logging.getLogger("MLEvolve")
+    logger = logging.getLogger("AlgoEvolve")
     logger.handlers.clear()
     logger.propagate = False
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     backup_count = int(getattr(logging_cfg, "log_backup_count", 2) or 0)
 
     if bool(getattr(logging_cfg, "write_brief_log", True)):
-        brief_name = str(getattr(logging_cfg, "brief_log_filename", "MLEvolve.log"))
+        brief_name = str(getattr(logging_cfg, "brief_log_filename", "AlgoEvolve.log"))
         file_handler = _file_handler(
             cfg.log_dir / brief_name,
             max_bytes=int(getattr(logging_cfg, "brief_log_max_bytes", 67108864) or 0),
@@ -53,7 +53,7 @@ def setup_logging(cfg: Any) -> logging.Logger:
         logger.addHandler(file_handler)
 
     if bool(getattr(logging_cfg, "write_verbose_log", True)):
-        verbose_name = str(getattr(logging_cfg, "verbose_log_filename", "MLEvolve.verbose.log"))
+        verbose_name = str(getattr(logging_cfg, "verbose_log_filename", "AlgoEvolve.verbose.log"))
         verbose_file_handler = _file_handler(
             cfg.log_dir / verbose_name,
             max_bytes=int(getattr(logging_cfg, "verbose_log_max_bytes", 268435456) or 0),

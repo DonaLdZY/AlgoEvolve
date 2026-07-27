@@ -19,7 +19,7 @@ from llm import generate, compile_prompt_to_md
 from llm.model_profiles import thinking_json_incompatible
 from agents.prompt_cache import dataset_reference_sentence, task_section
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 # ============ Planning constants ============

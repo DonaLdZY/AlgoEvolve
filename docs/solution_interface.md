@@ -1,7 +1,7 @@
-# Generated Solution Interface v1
+# AlgoEvolve Generated Solution Interface v1
 
-MLEvolve exports one `solution_manifest.json` beside each best/Top-K solution. The
-manifest uses `interface_version: mlevolve.solution.v1` and records the task kind,
+AlgoEvolve exports one `solution_manifest.json` beside each best/Top-K solution. The
+manifest uses `interface_version: algoevolve.solution.v1` and records the task kind,
 statefulness, artifact path, method family, and callable entrypoints.
 
 ## Prediction

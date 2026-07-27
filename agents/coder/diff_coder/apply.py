@@ -12,7 +12,7 @@ from typing import Dict, Any, Tuple, Optional
 
 from .patcher import SearchReplacePatcher
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def apply_diff_with_retry(

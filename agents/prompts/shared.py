@@ -173,7 +173,7 @@ def get_optimization_rl_strategy(task_desc: str = "", coldstart_description: str
             "- Implement a Gymnasium-like environment with `reset(seed=None, options=None)` and `step(action)` returning `(obs, reward, terminated, truncated, info)`.",
             "- Keep reward calculation and constraint checking as deterministic, testable functions.",
             "- For combinatorial actions, expose `valid_action_mask(obs)` and apply it in policy sampling / greedy action selection. Check `mask.any()` before masked logits or softmax: an all-invalid mask must take a deterministic task-valid fallback, backtrack/repair, or terminate with an infeasible reason; never softmax all `-inf`/large-negative logits, create NaN probabilities, or silently pick an illegal action.",
-            "- A search node should represent one coherent method. Do not hide a competing internal comparison method inside an RL node; MLEvolve compares different solution nodes by their final scalar scores.",
+            "- A search node should represent one coherent method. Do not hide a competing internal comparison method inside an RL node; AlgoEvolve compares different solution nodes by their final scalar scores.",
             "- If you claim the node uses RL, the evaluated solution must come from environment interaction plus policy selection/training/configured rollout, and the saved artifact plus `rollout` must reproduce that rollout without retraining.",
             "",
             "**Curriculum learning when RL is chosen:**",

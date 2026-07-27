@@ -216,7 +216,11 @@ def _linux_current_cgroup_dir() -> Path | None:
 
 
 def _linux_cgroup_parent() -> Path | None:
-    configured = str(os.environ.get("MLEVOLVE_CGROUP_ROOT") or "").strip()
+    configured = str(
+        os.environ.get("ALGOEVOLVE_CGROUP_ROOT")
+        or os.environ.get("MLEVOLVE_CGROUP_ROOT")
+        or ""
+    ).strip()
     candidates = [Path(configured).expanduser()] if configured else []
     current = _linux_current_cgroup_dir()
     if current is not None:
@@ -254,13 +258,13 @@ class LinuxCgroupMemoryLimiter(ProcessTreeMemoryLimiter):
         parent = _linux_cgroup_parent()
         if parent is None:
             raise RuntimeError(
-                "no writable cgroup v2 memory delegation; set MLEVOLVE_CGROUP_ROOT to a delegated cgroup"
+                "no writable cgroup v2 memory delegation; set ALGOEVOLVE_CGROUP_ROOT to a delegated cgroup"
             )
         subtree_control = parent / "cgroup.subtree_control"
         enabled = subtree_control.read_text(encoding="utf-8").split()
         if "memory" not in enabled:
             subtree_control.write_text("+memory", encoding="utf-8")
-        self._path = parent / f"mlevolve-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        self._path = parent / f"algoevolve-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         try:
             self._path.mkdir()
             (self._path / "memory.max").write_text(str(self.limit_bytes), encoding="utf-8")
@@ -356,6 +360,8 @@ def cpu_limit_environment(
     cores = max(1, int(cpu_cores))
     workers = max(1, min(int(parallel_workers or 1), cores))
     env = {
+        "ALGOEVOLVE_CPU_LIMIT_MODE": str(capabilities["backend"]),
+        "ALGOEVOLVE_CPU_CORE_BUDGET": str(cores),
         "MLEVOLVE_CPU_LIMIT_MODE": str(capabilities["backend"]),
         "MLEVOLVE_CPU_CORE_BUDGET": str(cores),
     }
@@ -364,6 +370,7 @@ def cpu_limit_environment(
     threads_per_worker = max(1, cores // workers)
     env.update(
         {
+            "ALGOEVOLVE_CPU_WORKER_CAP": str(workers),
             "MLEVOLVE_CPU_WORKER_CAP": str(workers),
             "OMP_NUM_THREADS": str(threads_per_worker),
             "MKL_NUM_THREADS": str(threads_per_worker),
@@ -893,6 +900,8 @@ def accelerator_visibility_env(mode: str, device_ids: Iterable[str]) -> dict[str
     normalized_mode = str(mode or "all").strip().lower()
     selected = sorted({str(item).strip().lower() for item in device_ids if str(item).strip()})
     metadata = {
+        "ALGOEVOLVE_ACCELERATOR_MODE": normalized_mode,
+        "ALGOEVOLVE_VISIBLE_ACCELERATOR_IDS": json.dumps(selected, ensure_ascii=True),
         "MLEVOLVE_ACCELERATOR_MODE": normalized_mode,
         "MLEVOLVE_VISIBLE_ACCELERATOR_IDS": json.dumps(selected, ensure_ascii=True),
     }

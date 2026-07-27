@@ -24,7 +24,7 @@ from agents.prompt_policy import (
     method_family_for_node,
 )
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def _get_fusion_candidates(agent, parent_node: SearchNode) -> List[SearchNode]:

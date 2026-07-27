@@ -6,7 +6,7 @@ import time
 
 import requests
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def get_server_url_list():

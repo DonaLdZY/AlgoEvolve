@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Any
 
 INIT_SOLUTION_JSON = Path(__file__).resolve().parent / "init_solution_paths.json"
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 CATEGORIES = ["General Image", "Detection", "Segmentation", "NLP", "Audio", "Optimization", "Others"]
 

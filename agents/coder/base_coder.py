@@ -14,7 +14,7 @@ from llm import generate
 from utils.response import extract_plan_and_code
 from agents.prompts import plan_and_code_response_format
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 # ============ Response format prompt (rewrite mode specific) ============

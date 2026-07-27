@@ -11,7 +11,7 @@ from llm import generate
 from config import Config
 from engine.validation.format_client import call_validate
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def submission_format_fix_prompt(

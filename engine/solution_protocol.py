@@ -7,7 +7,8 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-INTERFACE_VERSION = "mlevolve.solution.v1"
+INTERFACE_VERSION = "algoevolve.solution.v1"
+LEGACY_INTERFACE_VERSIONS = frozenset({"mlevolve.solution.v1"})
 
 
 @dataclass(frozen=True)

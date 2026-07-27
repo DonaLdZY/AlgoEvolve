@@ -30,7 +30,7 @@ from agents.prompt_policy import (
     scoped_search_memory,
 )
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def _get_branch_trajectory_for_evolution(parent_node: SearchNode) -> str:

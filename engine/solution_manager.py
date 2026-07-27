@@ -16,7 +16,7 @@ from engine.search_node import SearchNode
 from engine.solution_protocol import interface_for, solution_manifest
 from agents.prompt_policy import infer_task_family
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 _STAGE_LABELS = {
@@ -427,7 +427,7 @@ def persist_resumable_checkpoint(
         )
 
     payload = {
-        "schema_version": "mlevolve.checkpoint.v1",
+        "schema_version": "algoevolve.checkpoint.v1",
         "checkpoint_id": uuid.uuid4().hex,
         "status": status,
         "reason": reason,

@@ -16,7 +16,7 @@ def _print_cli_help() -> None:
     print(
         """usage: python run.py [key=value ...]
 
-Run the MLEvolve search engine with OmegaConf dotted-key overrides.
+Run the AlgoEvolve search engine with OmegaConf dotted-key overrides.
 
 Required configuration:
   data_dir=PATH                  Source data or AutoRealize output directory
@@ -35,7 +35,8 @@ Common overrides:
   runtime.resume_run=true        Resume from existing log/workspace paths
 
 Configuration precedence:
-  config/config.yaml < MLEVOLVE_CONFIG_PATH file < key=value overrides
+  config/config.yaml < ALGOEVOLVE_CONFIG_PATH file < key=value overrides
+  (legacy MLEVOLVE_CONFIG_PATH is also accepted)
 
 Examples:
   python run.py data_dir=./input desc_file=./description.md exp_name=demo
@@ -201,7 +202,7 @@ def _write_run_status(
     time_limit_secs: int,
 ) -> None:
     payload = {
-        "schema_version": "mlevolve.run_status.v1",
+        "schema_version": "algoevolve.run_status.v1",
         "status": status,
         "termination_reason": termination_reason,
         "completed_steps": completed_steps,
@@ -245,7 +246,7 @@ def _write_pending_nodes_state(cfg, nodes, status_by_id: dict[str, str], phase: 
         if status:
             rows.append(_pending_node_row(node, status))
     payload = {
-        "schema_version": "mlevolve.pending_nodes.v1",
+        "schema_version": "algoevolve.pending_nodes.v1",
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "phase": phase,
         "nodes": rows,
@@ -275,7 +276,10 @@ def _write_pending_nodes_state(cfg, nodes, status_by_id: dict[str, str], phase: 
 def run():
     cfg = load_cfg()
     runtime_cfg = getattr(cfg, "runtime", None)
-    env_resume = os.environ.get("MLEVOLVE_RESUME_RUN", "").strip().lower()
+    env_resume = (
+        os.environ.get("ALGOEVOLVE_RESUME_RUN", "").strip()
+        or os.environ.get("MLEVOLVE_RESUME_RUN", "").strip()
+    ).lower()
     resume_run = bool(getattr(runtime_cfg, "resume_run", False))
     if env_resume:
         resume_run = env_resume in {"1", "true", "yes", "on"}
@@ -954,7 +958,7 @@ def run():
                 getattr(runtime_cfg, "exit_immediately_after_interrupt_checkpoint", True)
             ):
                 logger.warning(
-                    "Interrupted checkpoint is durable; terminating the MLEvolve process immediately."
+                    "Interrupted checkpoint is durable; terminating the AlgoEvolve process immediately."
                 )
                 _exit_process_immediately(130)
             if sys.version_info >= (3, 9):
@@ -974,7 +978,7 @@ def run():
         logger.info("Search target was already complete; no worker expansion was scheduled")
 
     if timed_out and bool(getattr(runtime_cfg, "force_process_exit_on_timeout", True)):
-        logger.warning(f"MLEvolve search budget exhausted: {time_limit_secs}s")
+        logger.warning(f"AlgoEvolve search budget exhausted: {time_limit_secs}s")
 
     pending_draft_nodes.clear()
     pending_status_by_id.clear()

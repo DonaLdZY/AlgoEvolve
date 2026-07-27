@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "utils" / "autorealize_context.py"
-_SPEC = importlib.util.spec_from_file_location("mlevolve_autorealize_context_for_test", _MODULE_PATH)
+_SPEC = importlib.util.spec_from_file_location("algoevolve_autorealize_context_for_test", _MODULE_PATH)
 assert _SPEC and _SPEC.loader
 _CTX = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_CTX)

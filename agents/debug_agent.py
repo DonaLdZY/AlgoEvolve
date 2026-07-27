@@ -23,7 +23,7 @@ from agents.prompt_policy import (
     scoped_search_memory,
 )
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def _format_debug_memory_guidance(agent, similar_fixes: List[Tuple]) -> str:
@@ -127,7 +127,7 @@ def run(
         "Bugfix improvement sketch guideline": [
             "- You should write a brief natural language description (2-3 sentences) of how the issue in the previous implementation can be fixed.\n",
             "- Don't suggest to do EDA.\n",
-            "- Do not execute pip/conda/shell installation from solution code. For an exact missing-package error, preserve or add only the controlled declaration comment `# MLEVOLVE_PIP_INSTALL: pip install <distribution>` when automatic dependency installation is enabled; the runtime owns installation and retry. Never upgrade or reinstall core libraries.\n",
+            "- Do not execute pip/conda/shell installation from solution code. For an exact missing-package error, preserve or add only the controlled declaration comment `# ALGOEVOLVE_PIP_INSTALL: pip install <distribution>` when automatic dependency installation is enabled; the runtime owns installation and retry. Never upgrade or reinstall core libraries.\n",
         ],
     }
     optimization_or_rl = is_optimization_or_rl_task(

@@ -1,5 +1,6 @@
-# MLEvolve 正式默认配置。
-# 默认读取本文件，也可通过 MLEVOLVE_CONFIG_PATH 指定其他 YAML，并支持 CLI 点号覆盖，例如：
+# AlgoEvolve 正式默认配置。
+# 默认读取本文件，也可通过 ALGOEVOLVE_CONFIG_PATH 指定其他 YAML；旧 MLEVOLVE_CONFIG_PATH 仍兼容。
+# 支持 CLI 点号覆盖，例如：
 # python run.py data_dir=./input desc_file=./description.md agent.steps=50
 
 # Source data directory; required / 原始数据目录；必填
@@ -157,7 +158,7 @@ exec:
     rapidfuzz: "RapidFuzz>=3.6.0,<4"
   dependency_install_log_filename: "dependency_installations.jsonl"
   dependency_install_summary_filename: "dependency_installations_summary.json"
-  # Filled by AutoDecision per task; direct MLEvolve users may set absolute paths / AutoDecision 按任务填写，独立运行也可指定绝对路径
+  # Filled by AutoDecision per task; direct AlgoEvolve users may set absolute paths / AutoDecision 按任务填写，独立运行也可指定绝对路径
   dependency_install_central_log_path: ""
   dependency_install_central_summary_path: ""
 
@@ -186,7 +187,7 @@ agent:
     temp: 1.0
     # DeepSeek beta enables assistant-prefix completion / DeepSeek beta 用于 assistant 前缀续写
     base_url: "https://api.deepseek.com/beta"
-    # Non-empty config wins; empty reads MLEVOLVE_CODE_API_KEY or DEEPSEEK_API_KEY / 配置非空优先；留空读取环境变量
+    # Non-empty config wins; empty reads ALGOEVOLVE_CODE_API_KEY (legacy MLEVOLVE_CODE_API_KEY) or DEEPSEEK_API_KEY / 配置非空优先；留空读取环境变量
     api_key: ""
     # null=provider default / null=服务商默认思考模式
     enable_thinking: null
@@ -223,7 +224,7 @@ agent:
     temp: 1.0
     # DeepSeek beta enables assistant-prefix completion / DeepSeek beta 用于 assistant 前缀续写
     base_url: "https://api.deepseek.com/beta"
-    # Non-empty config wins; empty reads MLEVOLVE_FEEDBACK_API_KEY or DEEPSEEK_API_KEY / 配置非空优先；留空读取环境变量
+    # Non-empty config wins; empty reads ALGOEVOLVE_FEEDBACK_API_KEY (legacy MLEVOLVE_FEEDBACK_API_KEY) or DEEPSEEK_API_KEY / 配置非空优先；留空读取环境变量
     api_key: ""
     # null=provider default / null=服务商默认思考模式
     enable_thinking: null
@@ -326,7 +327,7 @@ agent:
   memory_similarity_threshold: 0.7
   # local|openai / 向量模型后端
   memory_embedding_backend: "openai"
-  # Non-empty config wins; empty reads MLEVOLVE_EMBEDDING_API_KEY or EMBEDDING_API_KEY / 配置非空优先；留空读取环境变量
+  # Non-empty config wins; empty reads ALGOEVOLVE_EMBEDDING_API_KEY (legacy MLEVOLVE_EMBEDDING_API_KEY) or EMBEDDING_API_KEY / 配置非空优先；留空读取环境变量
   memory_embedding_api_key: ""
   # Remote embedding endpoint / 远程向量化地址
   memory_embedding_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -339,7 +340,7 @@ agent:
 
   # Enable deterministic optimization-method experience retrieval / 是否启用确定性的优化方法经验检索
   use_optimization_experience_library: true
-  # Empty uses agents/memory/optimization_experiences.yaml; relative paths resolve from the MLEvolve project / 留空使用内置经验库；相对路径从 MLEvolve 项目解析
+  # Empty uses agents/memory/optimization_experiences.yaml; relative paths resolve from the AlgoEvolve project / 留空使用内置经验库；相对路径从 AlgoEvolve 项目解析
   optimization_experience_library_path: ""
   # Maximum full experience cards injected into one optimization prompt / 单次优化提示词最多注入的完整经验卡数量
   optimization_experience_max_cards: 2
@@ -467,7 +468,7 @@ runtime:
   cleanup_empty_workspace_on_exit: true
   # Exit immediately after timed-out artifacts are saved / 超时保存产物后是否立即退出进程
   force_process_exit_on_timeout: true
-  # Exit the whole MLEvolve process after the minimal resumable interrupt checkpoint is durable / 最小可恢复中断检查点落盘后立即退出整个 MLEvolve 进程
+  # Exit the whole AlgoEvolve process after the minimal resumable interrupt checkpoint is durable / 最小可恢复中断检查点落盘后立即退出整个 AlgoEvolve 进程
   exit_immediately_after_interrupt_checkpoint: true
   # Write pending draft state / 是否写出生成中草稿状态
   write_pending_nodes: true
@@ -532,9 +533,9 @@ logging:
   # Echo compact log to stdout / 是否输出简略日志到控制台
   write_console_log: true
   # Compact log filename / 简略日志文件名
-  brief_log_filename: "MLEvolve.log"
+  brief_log_filename: "AlgoEvolve.log"
   # Detailed log filename / 详细日志文件名
-  verbose_log_filename: "MLEvolve.verbose.log"
+  verbose_log_filename: "AlgoEvolve.verbose.log"
   # Maximum bytes per compact log file; 0 disables rotation / 单个简略日志最大字节数，0 表示不轮转
   brief_log_max_bytes: 67108864
   # Maximum bytes per detailed log file; 0 disables rotation / 单个详细日志最大字节数，0 表示不轮转

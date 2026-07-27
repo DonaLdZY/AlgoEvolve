@@ -36,7 +36,7 @@ from agents.prompt_policy import (
 )
 from engine.solution_protocol import interface_for, preflight_code
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
@@ -58,7 +58,7 @@ class AgentSearch:
         if self.has_autorealize_package and not str(self.autorealize_context or "").strip():
             raise RuntimeError(
                 "AutoRealize package detected, but no prompt-ready automl_context.md was found. "
-                "AutoRealize must generate the complete MLEvolve context before AutoML starts."
+                "AutoRealize must generate the complete AlgoEvolve context before AutoML starts."
             )
         self.has_autorealize_context = bool(str(self.autorealize_context or "").strip())
         if self.has_autorealize_context:
@@ -219,7 +219,7 @@ class AgentSearch:
             self.data_preview = getattr(self, "autorealize_context", "") or ""
             logger.info(
                 "[AgentSearch] Using AutoRealize automl_context as the sole data-preview context; "
-                "standalone MLEvolve preview generation is disabled for provider cache efficiency."
+                "standalone AlgoEvolve preview generation is disabled for provider cache efficiency."
             )
             return
         generate_submission = getattr(self.acfg, "generate_submission", True)

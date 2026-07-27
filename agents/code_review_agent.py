@@ -26,7 +26,7 @@ from engine.solution_protocol import (
 
 from agents.coder.diff_coder import SearchReplacePatcher
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 CODE_REVIEW_SPEC = FunctionSpec(
     name="submit_code_review",

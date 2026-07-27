@@ -27,7 +27,7 @@ from agents.prompt_policy import (
     scoped_search_memory,
 )
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def run(

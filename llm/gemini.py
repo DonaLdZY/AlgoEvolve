@@ -17,7 +17,7 @@ from google.genai import types
 from config import Config
 from .usage import infer_prompt_name, log_llm_usage, estimate_text_tokens
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 NETWORK_RETRY_MAX_ATTEMPTS = 5
 NETWORK_RETRY_BASE_SLEEP_SECONDS = 5.0
 NETWORK_RETRY_MAX_SLEEP_SECONDS = 30.0

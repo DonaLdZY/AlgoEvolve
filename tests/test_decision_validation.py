@@ -6,7 +6,7 @@ from pathlib import Path
 
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "utils" / "decision_validation.py"
 _SPEC = importlib.util.spec_from_file_location(
-    "mlevolve_decision_validation_for_test",
+    "algoevolve_decision_validation_for_test",
     _MODULE_PATH,
 )
 assert _SPEC and _SPEC.loader

@@ -21,7 +21,7 @@ from .prompts import build_base_diff_instructions, build_diff_format_suffix, DIF
 from .apply import apply_diff_with_retry, format_planning_result_for_plan
 from agents.prompt_cache import dataset_reference_sentence, task_section
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 # ============ Public API ============

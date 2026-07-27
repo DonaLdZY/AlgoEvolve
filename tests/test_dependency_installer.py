@@ -65,12 +65,12 @@ def _cfg(
 
 def test_extracts_exact_missing_module_and_safe_single_package_declaration() -> None:
     stderr = "Traceback\nModuleNotFoundError: No module named 'ortools.sat'\n"
-    code = "# MLEVOLVE_PIP_INSTALL: pip install ortools\nimport ortools\n"
+    code = "# ALGOEVOLVE_PIP_INSTALL: pip install ortools\nimport ortools\n"
 
     assert extract_missing_module(stderr) == "ortools"
     assert extract_install_declarations(code) == ["pip install ortools"]
     assert extract_scoped_install_declarations(
-        "# MLEVOLVE_PIP_INSTALL[sklearn]: pip install scikit-learn\n"
+        "# ALGOEVOLVE_PIP_INSTALL[sklearn]: pip install scikit-learn\n"
     ) == [("sklearn", "pip install scikit-learn")]
     assert parse_declared_requirement("pip install ortools>=9.9,<10").name == "ortools"
     assert parse_declared_requirement(f"{sys.executable} -m pip install ortools") is not None
@@ -257,7 +257,7 @@ def test_installs_once_writes_logs_and_refuses_same_package_loop(tmp_path: Path,
     def fake_install(**metadata):
         calls.append(metadata)
         record = {
-            "schema_version": "mlevolve.dependency_installation.v1",
+            "schema_version": "algoevolve.dependency_installation.v1",
             "timestamp": "now",
             "node_id": metadata["node_id"],
             "missing_module": metadata["missing_module"],
@@ -443,13 +443,13 @@ def test_real_pip_installs_unlisted_ai_package_into_task_directory(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    package_name = "mlevolve-local-dependency-fixture"
-    import_name = "mlevolve_local_dependency_fixture"
+    package_name = "algoevolve-local-dependency-fixture"
+    import_name = "algoevolve_local_dependency_fixture"
     version = "0.1.0"
     wheel_dir = tmp_path / "wheels"
     wheel_dir.mkdir()
-    wheel_path = wheel_dir / f"mlevolve_local_dependency_fixture-{version}-py3-none-any.whl"
-    dist_info = f"mlevolve_local_dependency_fixture-{version}.dist-info"
+    wheel_path = wheel_dir / f"algoevolve_local_dependency_fixture-{version}-py3-none-any.whl"
+    dist_info = f"algoevolve_local_dependency_fixture-{version}.dist-info"
     with zipfile.ZipFile(wheel_path, "w") as wheel:
         wheel.writestr(f"{import_name}.py", "VALUE = 314\n")
         wheel.writestr(
@@ -461,7 +461,7 @@ def test_real_pip_installs_unlisted_ai_package_into_task_directory(
         wheel.writestr(
             f"{dist_info}/WHEEL",
             "Wheel-Version: 1.0\n"
-            "Generator: mlevolve-test\n"
+            "Generator: algoevolve-test\n"
             "Root-Is-Purelib: true\n"
             "Tag: py3-none-any\n",
         )

@@ -70,7 +70,7 @@ class TaskResourceLimits(BaseModel):
     monitor_interval_seconds: float = Field(default=0.5, ge=0.1, le=10.0)
 
 
-class StartMLEvolveRequest(BaseModel):
+class StartAlgoEvolveRequest(BaseModel):
     task_id: str
     python_executable: str = "python"
     working_dir: str = DEFAULT_WORKDIR
@@ -93,6 +93,10 @@ class SnapshotRequest(BaseModel):
     workspace_dir: str = ""
     run_dir: str = ""
     task_name: str = ""
+
+
+# Import compatibility for integrations that still use the old class name.
+StartMLEvolveRequest = StartAlgoEvolveRequest
 
 
 class JobStatus(BaseModel):
@@ -175,7 +179,7 @@ class JobStore:
                     job.exit_code = proc.returncode
                     job.updated_at = now_ts()
                     continue
-                raise HTTPException(status_code=400, detail="task already running in MLEvolve service")
+                raise HTTPException(status_code=400, detail="task already running in AlgoEvolve service")
             job_id = uuid.uuid4().hex
             ts = now_ts()
             runtime = JobRuntime(
@@ -246,7 +250,7 @@ class JobStore:
 
 
 store = JobStore()
-app = FastAPI(title="MLEvolve Service API", version="0.1.0")
+app = FastAPI(title="AlgoEvolve Service API", version="0.1.0")
 
 
 def _tail_text(text: str, limit: int = 200000) -> str:
@@ -297,6 +301,20 @@ def _saved_config_value(log_dir: Path, dotted_key: str, default: Any) -> Any:
         return default
 
 
+def _resolved_log_filename(
+    log_dir: Path,
+    dotted_key: str,
+    default_name: str,
+    legacy_name: str,
+) -> str:
+    configured = str(_saved_config_value(log_dir, dotted_key, default_name) or default_name)
+    if (log_dir / configured).exists() or configured != default_name:
+        return configured
+    if (log_dir / legacy_name).exists():
+        return legacy_name
+    return configured
+
+
 def _base_config_value(dotted_key: str, default: Any) -> Any:
     path = ROOT_DIR / "config" / "config.yaml"
     if not path.exists():
@@ -312,7 +330,7 @@ def _base_config_value(dotted_key: str, default: Any) -> Any:
         return default
 
 
-def _resolve_resource_limits(req: StartMLEvolveRequest) -> TaskResourceLimits:
+def _resolve_resource_limits(req: StartAlgoEvolveRequest) -> TaskResourceLimits:
     if req.resources is not None:
         return req.resources
 
@@ -357,10 +375,10 @@ def _extract_time_limit_secs(args: list[str]) -> int | None:
     return None
 
 
-def _resolve_run_layout(req: StartMLEvolveRequest, run_timestamp: str) -> tuple[Path, Path, str]:
+def _resolve_run_layout(req: StartAlgoEvolveRequest, run_timestamp: str) -> tuple[Path, Path, str]:
     exp_name = (_extract_cli_override(req.args, "exp_name") or "").strip()
     if not exp_name and not req.resume:
-        raise HTTPException(status_code=400, detail="missing exp_name in MLEvolve args")
+        raise HTTPException(status_code=400, detail="missing exp_name in AlgoEvolve args")
 
     log_root = Path(req.log_dir).expanduser().resolve()
     workspace_root = Path(req.workspace_dir).expanduser().resolve()
@@ -466,10 +484,16 @@ def _is_search_budget_exhausted(log_dir: Path) -> bool:
     reason = str(status.get("termination_reason") or "").strip().lower()
     if reason in {"time_limit_exhausted", "step_limit_exhausted", "steps_completed"}:
         return True
-    brief_log_name = str(_saved_config_value(log_dir, "logging.brief_log_filename", "MLEvolve.log"))
+    brief_log_name = _resolved_log_filename(
+        log_dir,
+        "logging.brief_log_filename",
+        "AlgoEvolve.log",
+        "MLEvolve.log",
+    )
     log_tail = _safe_read_text(log_dir / brief_log_name, limit=120000)
     return (
         "Search budget is exhausted" in log_tail
+        or "AlgoEvolve search budget exhausted" in log_tail
         or "MLEvolve search budget exhausted" in log_tail
         or "Time limit reached (configured=" in log_tail
     )
@@ -482,7 +506,7 @@ def _mark_service_budget_completed(log_dir: Path, time_limit_secs: int) -> None:
     payload = _safe_read_json_dict(status_path)
     payload.update(
         {
-            "schema_version": payload.get("schema_version") or "mlevolve.run_status.v1",
+            "schema_version": payload.get("schema_version") or "algoevolve.run_status.v1",
             "status": "completed",
             "termination_reason": "time_limit_exhausted",
             "time_limit_secs": int(time_limit_secs),
@@ -719,13 +743,13 @@ def _parse_log_events(log_path: Path, limit: int = 400) -> list[dict[str, Any]]:
             rows.append(
                 {
                     "ts": match.group("ts"),
-                    "component": "mlevolve.log",
+                    "component": "algoevolve.log",
                     "event": match.group("level"),
                     "message": match.group("msg"),
                 }
             )
         else:
-            rows.append({"ts": "", "component": "mlevolve.log", "event": "INFO", "message": text})
+            rows.append({"ts": "", "component": "algoevolve.log", "event": "INFO", "message": text})
     return rows
 
 
@@ -751,7 +775,7 @@ def _pick_dirs(req: SnapshotRequest) -> tuple[Path | None, Path | None]:
 def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
     log_dir, workspace_dir = _pick_dirs(req)
     if log_dir is None:
-        return {"engine": "mlevolve", "nodes": [], "events": []}
+        return {"engine": "algoevolve", "nodes": [], "events": []}
 
     if workspace_dir is None and log_dir.parent.name == "logs":
         sibling = log_dir.parent.parent / "workspace"
@@ -773,9 +797,17 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
         1000,
         int(_saved_config_value(log_dir, "runtime.snapshot_text_tail_chars", 200000)),
     )
-    brief_log_name = str(_saved_config_value(log_dir, "logging.brief_log_filename", "MLEvolve.log"))
-    verbose_log_name = str(
-        _saved_config_value(log_dir, "logging.verbose_log_filename", "MLEvolve.verbose.log")
+    brief_log_name = _resolved_log_filename(
+        log_dir,
+        "logging.brief_log_filename",
+        "AlgoEvolve.log",
+        "MLEvolve.log",
+    )
+    verbose_log_name = _resolved_log_filename(
+        log_dir,
+        "logging.verbose_log_filename",
+        "AlgoEvolve.verbose.log",
+        "MLEvolve.verbose.log",
     )
     try:
         if journal_path.exists() and journal_path.stat().st_size <= journal_max_bytes:
@@ -876,7 +908,7 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
             )
 
     return {
-        "engine": "mlevolve",
+        "engine": "algoevolve",
         "log_dir": str(log_dir),
         "workspace_dir": str(workspace_dir) if workspace_dir else "",
         "events": _parse_log_events(log_dir / brief_log_name, limit=snapshot_event_limit),
@@ -930,7 +962,7 @@ def _monitor_task_resources(
                     "memory_limit_child_guard: stopped memory-heavy execution child "
                     f"pid={action.child_pid} after task memory reached {format_bytes(action.observed_bytes)}; "
                     f"controller guard={format_bytes(action.limit_bytes)}, "
-                    f"configured limit={format_bytes(memory_limit_bytes)}. MLEvolve controller continues."
+                    f"configured limit={format_bytes(memory_limit_bytes)}. AlgoEvolve controller continues."
                 )
             elif action.action == "controller_over_limit":
                 warning = (
@@ -945,7 +977,7 @@ def _monitor_task_resources(
         stop_event.wait(interval)
 
 
-def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actual_workspace_dir: Path, run_timestamp: str) -> None:
+def _run_job(job_id: str, req: StartAlgoEvolveRequest, actual_log_dir: Path, actual_workspace_dir: Path, run_timestamp: str) -> None:
     limits = req.resources or _resolve_resource_limits(req)
     run_args = list(req.args)
     # OmegaConf interprets 20260722_015005 as an integer with a numeric
@@ -991,7 +1023,10 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
             capabilities=cpu_enforcement,
         )
     )
-    env["MLEVOLVE_ASSIGNED_CPU_IDS"] = json.dumps(job_runtime.assigned_cpu_ids)
+    assigned_cpu_ids_json = json.dumps(job_runtime.assigned_cpu_ids)
+    env["ALGOEVOLVE_ASSIGNED_CPU_IDS"] = assigned_cpu_ids_json
+    env["MLEVOLVE_ASSIGNED_CPU_IDS"] = assigned_cpu_ids_json
+    env["ALGOEVOLVE_MEMORY_LIMIT_GB"] = str(limits.memory_limit_gb)
     env["MLEVOLVE_MEMORY_LIMIT_GB"] = str(limits.memory_limit_gb)
     config_path: Path | None = None
     if req.config_path.strip():
@@ -999,11 +1034,17 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
         if not config_path.is_absolute():
             config_path = Path(workdir) / config_path
     if config_path is not None:
-        env["MLEVOLVE_CONFIG_PATH"] = str(config_path.resolve())
+        resolved_config_path = str(config_path.resolve())
+        env["ALGOEVOLVE_CONFIG_PATH"] = resolved_config_path
+        env["MLEVOLVE_CONFIG_PATH"] = resolved_config_path
     else:
+        env.pop("ALGOEVOLVE_CONFIG_PATH", None)
         env.pop("MLEVOLVE_CONFIG_PATH", None)
+    env["ALGOEVOLVE_RUN_TIMESTAMP"] = run_timestamp
     env["MLEVOLVE_RUN_TIMESTAMP"] = run_timestamp
-    env["MLEVOLVE_RESUME_RUN"] = "1" if req.resume else "0"
+    resume_flag = "1" if req.resume else "0"
+    env["ALGOEVOLVE_RESUME_RUN"] = resume_flag
+    env["MLEVOLVE_RESUME_RUN"] = resume_flag
     env.setdefault("PYTHONFAULTHANDLER", "1")
 
     memory_limit_bytes = int(float(limits.memory_limit_gb) * (1024**3))
@@ -1046,8 +1087,11 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
         memory_enforcement=memory_enforcement,
         resource_warning=memory_setup_warning,
     )
+    memory_mode = str(memory_enforcement.get("backend") or "disabled")
+    env["ALGOEVOLVE_MEMORY_LIMIT_BYTES"] = str(memory_limit_bytes)
     env["MLEVOLVE_MEMORY_LIMIT_BYTES"] = str(memory_limit_bytes)
-    env["MLEVOLVE_MEMORY_ENFORCEMENT_MODE"] = str(memory_enforcement.get("backend") or "disabled")
+    env["ALGOEVOLVE_MEMORY_ENFORCEMENT_MODE"] = memory_mode
+    env["MLEVOLVE_MEMORY_ENFORCEMENT_MODE"] = memory_mode
 
     try:
         popen_kwargs: dict[str, Any] = {}
@@ -1219,7 +1263,7 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
         last_error = resource_violation
     elif timed_out:
         completion_note = (
-            "MLEvolve search budget was exhausted; the service finalized the saved "
+            "AlgoEvolve search budget was exhausted; the service finalized the saved "
             "search tree and current Top-K artifacts normally. "
             f"search_limit={time_limit_secs}s, startup_buffer={int(startup_buffer)}s, "
             f"grace={int(shutdown_buffer)}s."
@@ -1227,21 +1271,21 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
         out = "\n".join(part for part in ((out or "").rstrip(), completion_note) if part)
     elif status == "interrupted_resumable":
         last_error = (
-            "MLEvolve was interrupted after committing the durable search tree, "
+            "AlgoEvolve was interrupted after committing the durable search tree, "
             "generated-code resume actions, and the existing Top-K artifact index. "
             "It can be resumed or reported now."
         )
     elif status == "interrupted_incomplete":
         actor = "user stop" if stop_requested else f"signal exit code {exit_code}"
         last_error = (
-            f"MLEvolve was terminated after {actor}, but the resumable checkpoint "
+            f"AlgoEvolve was terminated after {actor}, but the resumable checkpoint "
             f"could not be verified: {checkpoint_error or 'unknown checkpoint error'}"
         )
     elif native_exit_reason:
         tail = (err or out or "").strip()
         secondary = tail.splitlines()[-1][:service_last_error_chars] if tail else ""
         last_error = (
-            f"MLEvolve native crash: {native_exit_reason}. "
+            f"AlgoEvolve native crash: {native_exit_reason}. "
             f"Peak task memory={format_bytes(current_job.peak_memory_bytes)}, "
             f"configured limit={format_bytes(memory_limit_bytes)}."
         )
@@ -1249,7 +1293,7 @@ def _run_job(job_id: str, req: StartMLEvolveRequest, actual_log_dir: Path, actua
             last_error += f" Last stderr/output: {secondary}"
     elif exit_code != 0:
         tail = (err or out or "").strip()
-        last_error = tail.splitlines()[-1][:service_last_error_chars] if tail else f"MLEvolve exited with code {exit_code}"
+        last_error = tail.splitlines()[-1][:service_last_error_chars] if tail else f"AlgoEvolve exited with code {exit_code}"
 
     if checkpoint_ready:
         actual_log_dir = checkpoint_log_dir
@@ -1320,7 +1364,7 @@ def resource_inventory(python_executable: str = "") -> dict[str, Any]:
 
 
 @app.post("/jobs/start")
-def start_job(req: StartMLEvolveRequest) -> dict[str, Any]:
+def start_job(req: StartAlgoEvolveRequest) -> dict[str, Any]:
     run_timestamp = time.strftime("%Y%m%d_%H%M%S")
     actual_log_dir, actual_workspace_dir, final_run_name = _resolve_run_layout(req, run_timestamp)
     actual_log_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1358,7 +1402,7 @@ def start_job(req: StartMLEvolveRequest) -> dict[str, Any]:
     return {
         "job_id": job.job_id,
         "status": "started",
-        "engine": "mlevolve",
+        "engine": "algoevolve",
         "run_name": final_run_name,
         "log_dir": str(actual_log_dir),
         "workspace_dir": str(actual_workspace_dir),

@@ -24,14 +24,14 @@ from .usage import (
     usage_to_dict,
 )
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 NETWORK_RETRY_MAX_ATTEMPTS = 5
 NETWORK_RETRY_BASE_SLEEP_SECONDS = 5.0
 NETWORK_RETRY_MAX_SLEEP_SECONDS = 30.0
 MAX_CONTINUATION_ROUNDS = 2
 CONTINUATION_OVERLAP_SCAN_CHARS = 4096
 CACHE_FRIENDLY_SYSTEM = (
-    "You are MLEvolve, an automated ML/RL coding agent. Follow the task/data "
+    "You are AlgoEvolve, an automated ML/RL coding agent. Follow the task/data "
     "context and the agent-specific instructions in the user messages. "
     "When a JSON/tool schema is supplied, return data that satisfies it exactly."
 )

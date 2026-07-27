@@ -2,7 +2,7 @@ import logging
 
 from engine.search_node import SearchNode
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def get_patience_counter(agent, parent_node: SearchNode) -> tuple:

@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 _USAGE_PATH = Path(__file__).resolve().parents[1] / "llm" / "usage.py"
-_SPEC = importlib.util.spec_from_file_location("mlevolve_llm_usage_for_test", _USAGE_PATH)
+_SPEC = importlib.util.spec_from_file_location("algoevolve_llm_usage_for_test", _USAGE_PATH)
 assert _SPEC and _SPEC.loader
 _USAGE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_USAGE)
@@ -67,7 +67,7 @@ def test_log_llm_usage_writes_jsonl_summary_and_prompt_parts(tmp_path):
     assert summary["by_prompt"]["draft_agent"]["by_part"]["task_context"]["estimated_tokens"] > 0
     assert summary["by_prompt_part_ranked"][0]["estimated_tokens"] >= summary["by_prompt_part_ranked"][-1]["estimated_tokens"]
     brief = json.loads((tmp_path / "llm_usage_brief.json").read_text(encoding="utf-8"))
-    assert brief["schema_version"] == "mlevolve.llm_usage_brief.v2"
+    assert brief["schema_version"] == "algoevolve.llm_usage_brief.v2"
     assert brief["deepseek_pricing_usd_per_1m"]["cache_miss_input"] == 0.14
     assert brief["deepseek_cost_breakdown_usd"]["output_tokens"] == 12
     assert brief["reasoning_tokens"] == 7

@@ -1,4 +1,4 @@
-schema_version: mlevolve.optimization_experiences.v1
+schema_version: algoevolve.optimization_experiences.v1
 
 cards:
   - experience_id: bounded_aggregate_state_milp_lns

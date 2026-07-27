@@ -1,0 +1,26 @@
+AlgoEvolve
+Copyright 2026 AlgoEvolve contributors
+
+This product contains modified portions of MLEvolve:
+
+  MLEvolve
+  Copyright 2026 MLEvolve Team, Shanghai Artificial Intelligence Laboratory
+  https://github.com/InternScience/MLEvolve
+  Licensed under the Apache License, Version 2.0.
+
+AlgoEvolve is an independently maintained derivative and is not an official
+release of MLEvolve. InternScience, Shanghai Artificial Intelligence Laboratory,
+and the original MLEvolve team do not sponsor, endorse, or maintain this fork.
+
+Material modifications include parallel MCTS scheduling and virtual visits;
+durable search and in-flight runtime state; Prediction/Decision/RL solution
+protocols; generation, preflight, result-review, evolution, and fusion changes;
+provider-aware prompt and context management; DeepSeek API integration;
+AutoRealize context integration; FastAPI service and resource controls; logging,
+usage accounting, dependency isolation, and expanded tests and documentation.
+
+The names MLEvolve, InternScience, Shanghai Artificial Intelligence Laboratory,
+and their logos may be trade names, trademarks, service marks, or product names
+of their respective owners. The Apache License, Version 2.0 does not grant a
+trademark license. Their use here is solely to identify the origin of the
+modified work; no endorsement is implied.

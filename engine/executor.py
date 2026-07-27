@@ -34,9 +34,20 @@ def memory_limited_subprocess_command(
 ) -> list[str]:
     current_platform = platform_name or sys.platform
     env = environment if environment is not None else os.environ
-    mode = str(env.get("MLEVOLVE_MEMORY_ENFORCEMENT_MODE") or "").strip()
+    mode = str(
+        env.get("ALGOEVOLVE_MEMORY_ENFORCEMENT_MODE")
+        or env.get("MLEVOLVE_MEMORY_ENFORCEMENT_MODE")
+        or ""
+    ).strip()
     try:
-        limit_bytes = max(0, int(env.get("MLEVOLVE_MEMORY_LIMIT_BYTES") or 0))
+        limit_bytes = max(
+            0,
+            int(
+                env.get("ALGOEVOLVE_MEMORY_LIMIT_BYTES")
+                or env.get("MLEVOLVE_MEMORY_LIMIT_BYTES")
+                or 0
+            ),
+        )
     except (TypeError, ValueError):
         limit_bytes = 0
     if not (current_platform.startswith("linux") or current_platform == "darwin"):
@@ -53,7 +64,7 @@ def memory_limited_subprocess_command(
         *command,
     ]
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 @dataclass
 class ExecutionResult(DataClassJsonMixin):
@@ -96,7 +107,11 @@ class Interpreter:
         configured_parallel_run = (
             cfg.agent.search.parallel_search_num if (cfg and getattr(cfg.agent.search, "parallel_search_num", None)) else max_parallel_run
         )
-        worker_cap_raw = str(os.environ.get("MLEVOLVE_CPU_WORKER_CAP") or "").strip()
+        worker_cap_raw = str(
+            os.environ.get("ALGOEVOLVE_CPU_WORKER_CAP")
+            or os.environ.get("MLEVOLVE_CPU_WORKER_CAP")
+            or ""
+        ).strip()
         try:
             worker_cap = max(1, int(worker_cap_raw)) if worker_cap_raw else configured_parallel_run
         except ValueError:
@@ -295,7 +310,7 @@ class Interpreter:
             return ExecutionResult(
                 term_out=[
                     "Generated solution code was not executed: "
-                    f"{unsafe_install}. Use only `# MLEVOLVE_PIP_INSTALL: pip install <distribution>`; "
+                    f"{unsafe_install}. Use only `# ALGOEVOLVE_PIP_INSTALL: pip install <distribution>`; "
                     "the runtime controls dependency installation.\n"
                 ],
                 exec_time=0.0,

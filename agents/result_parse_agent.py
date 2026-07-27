@@ -23,7 +23,7 @@ from agents.prompt_policy import (
 )
 from engine.model_artifacts import find_model_artifacts
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 FINAL_SCORE_RE = re.compile(

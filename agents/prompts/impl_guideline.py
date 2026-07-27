@@ -195,7 +195,7 @@ def get_impl_guideline(
         "**Execution Guidelines**:",
         *(
             [
-                "- If your chosen method needs a package that may be absent, determine its PyPI distribution name and bind it to the import root: `# MLEVOLVE_PIP_INSTALL[<import_root>]: pip install <distribution>`. For example: `# MLEVOLVE_PIP_INSTALL[sklearn]: pip install scikit-learn`, `# MLEVOLVE_PIP_INSTALL[PIL]: pip install Pillow`, or `# MLEVOLVE_PIP_INSTALL[cv2]: pip install opencv-python`. The older unscoped form remains valid only when the script declares one unambiguous package.",
+                "- If your chosen method needs a package that may be absent, determine its PyPI distribution name and bind it to the import root: `# ALGOEVOLVE_PIP_INSTALL[<import_root>]: pip install <distribution>`. For example: `# ALGOEVOLVE_PIP_INSTALL[sklearn]: pip install scikit-learn`, `# ALGOEVOLVE_PIP_INSTALL[PIL]: pip install Pillow`, or `# ALGOEVOLVE_PIP_INSTALL[cv2]: pip install opencv-python`. The older unscoped form remains valid only when the script declares one unambiguous package.",
                 "- The declaration is not executed by the generated script. After an exact `ModuleNotFoundError`, the runtime validates your single PyPI distribution declaration, applies a configured trusted version bound when available, installs it into this task's isolated package directory, and reruns this same script once. A configured import map is only a fallback when no declaration is present; strict deployments may enable an allowlist policy.",
                 "- Never call `pip`, `conda`, `subprocess`, `os.system`, shell commands, or notebook `!pip` from generated solution code. Do not request upgrades or reinstall an already present package.",
             ]

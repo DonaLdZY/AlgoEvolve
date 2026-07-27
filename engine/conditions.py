@@ -4,7 +4,7 @@ import logging
 import time
 from agents.prompt_policy import infer_task_family, method_family_for_node
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def should_trigger_branch_fusion(agent) -> bool:

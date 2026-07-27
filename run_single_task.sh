@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run MLEvolve on a single competition task.
+# Run AlgoEvolve on a single competition task.
 # Usage:
 #   Grading server disabled by default:
 #     bash run_single_task.sh <EXP_ID> [TASK_ROOT]

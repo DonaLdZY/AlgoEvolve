@@ -26,7 +26,7 @@ from .base_planner import (
 )
 from agents.prompt_cache import dataset_reference_sentence, task_section
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 # ============ Stage 1: Generate initial text plan ============

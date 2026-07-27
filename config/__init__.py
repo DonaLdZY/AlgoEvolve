@@ -24,7 +24,16 @@ def _get_journal_classes():
 from utils import copytree, preproc_data, serialize
 
 shutup.mute_warnings()
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
+
+
+def _environment_value(name: str, legacy_name: str = "") -> str:
+    """Read the AlgoEvolve name first while keeping old MLEvolve runs usable."""
+
+    value = os.environ.get(name, "").strip()
+    if value or not legacy_name:
+        return value
+    return os.environ.get(legacy_name, "").strip()
 
 
 """These dataclasses provide typing for the default config/config.yaml."""
@@ -251,8 +260,8 @@ class LoggingConfig:
     write_brief_log: bool = True
     write_verbose_log: bool = True
     write_console_log: bool = True
-    brief_log_filename: str = "MLEvolve.log"
-    verbose_log_filename: str = "MLEvolve.verbose.log"
+    brief_log_filename: str = "AlgoEvolve.log"
+    verbose_log_filename: str = "AlgoEvolve.verbose.log"
     brief_log_max_bytes: int = 67108864
     verbose_log_max_bytes: int = 268435456
     log_backup_count: int = 2
@@ -339,7 +348,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 def _resolve_config_path(path: Path | str | None = None) -> Path:
     if path is not None:
         return Path(path).expanduser().resolve()
-    env_path = os.environ.get("MLEVOLVE_CONFIG_PATH", "").strip()
+    env_path = _environment_value("ALGOEVOLVE_CONFIG_PATH", "MLEVOLVE_CONFIG_PATH")
     if env_path:
         return Path(env_path).expanduser().resolve()
     return DEFAULT_CONFIG_PATH.resolve()
@@ -390,7 +399,7 @@ def prep_cfg(cfg: Config):
     top_log_dir = Path(cfg.log_dir).resolve()
     top_workspace_dir = Path(cfg.workspace_dir).resolve()
     runtime_cfg = getattr(cfg, "runtime", RuntimeConfig())
-    env_resume = os.environ.get("MLEVOLVE_RESUME_RUN", "").strip().lower()
+    env_resume = _environment_value("ALGOEVOLVE_RESUME_RUN", "MLEVOLVE_RESUME_RUN").lower()
     resume_run = bool(getattr(runtime_cfg, "resume_run", False))
     if env_resume:
         resume_run = env_resume in {"1", "true", "yes", "on"}
@@ -402,7 +411,7 @@ def prep_cfg(cfg: Config):
     else:
         timestamp = (
             str(getattr(runtime_cfg, "run_timestamp", "") or "").strip()
-            or os.environ.get("MLEVOLVE_RUN_TIMESTAMP", "").strip()
+            or _environment_value("ALGOEVOLVE_RUN_TIMESTAMP", "MLEVOLVE_RUN_TIMESTAMP")
             or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         cfg.exp_name = f"{timestamp}_{cfg.exp_name or coolname.generate_slug(3)}"
@@ -458,17 +467,17 @@ def prep_cfg(cfg: Config):
     )
     cfg.agent.code.api_key = (
         str(cfg.agent.code.api_key or "").strip()
-        or os.environ.get("MLEVOLVE_CODE_API_KEY", "").strip()
+        or _environment_value("ALGOEVOLVE_CODE_API_KEY", "MLEVOLVE_CODE_API_KEY")
         or os.environ.get("DEEPSEEK_API_KEY", "").strip()
     )
     cfg.agent.feedback.api_key = (
         str(cfg.agent.feedback.api_key or "").strip()
-        or os.environ.get("MLEVOLVE_FEEDBACK_API_KEY", "").strip()
+        or _environment_value("ALGOEVOLVE_FEEDBACK_API_KEY", "MLEVOLVE_FEEDBACK_API_KEY")
         or os.environ.get("DEEPSEEK_API_KEY", "").strip()
     )
     cfg.agent.memory_embedding_api_key = (
         str(cfg.agent.memory_embedding_api_key or "").strip()
-        or os.environ.get("MLEVOLVE_EMBEDDING_API_KEY", "").strip()
+        or _environment_value("ALGOEVOLVE_EMBEDDING_API_KEY", "MLEVOLVE_EMBEDDING_API_KEY")
         or os.environ.get("EMBEDDING_API_KEY", "").strip()
     )
 
@@ -520,7 +529,7 @@ def load_task_desc(cfg: Config):
 
 def prep_agent_workspace(cfg: Config):
     """Setup the agent's workspace and preprocess data if necessary."""
-    env_resume = os.environ.get("MLEVOLVE_RESUME_RUN", "").strip().lower()
+    env_resume = _environment_value("ALGOEVOLVE_RESUME_RUN", "MLEVOLVE_RESUME_RUN").lower()
     resume_run = bool(getattr(getattr(cfg, "runtime", None), "resume_run", False))
     if env_resume:
         resume_run = env_resume in {"1", "true", "yes", "on"}

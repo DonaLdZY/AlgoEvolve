@@ -7,7 +7,7 @@ import threading
 
 from engine.search_node import SearchNode
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def _update_virtual_visits(node: SearchNode | None, delta: int) -> None:

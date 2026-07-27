@@ -1,4 +1,4 @@
-# MLEvolve orchestration runtime. This file intentionally lists direct
+# AlgoEvolve orchestration runtime. This file intentionally lists direct
 # dependencies instead of a machine-wide `pip freeze` snapshot.
 
 # Configuration and structured data

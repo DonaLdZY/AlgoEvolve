@@ -120,7 +120,7 @@ def test_task_config_path_and_key_override_environment(tmp_path: Path, monkeypat
     config_path = tmp_path / "task.yaml"
     OmegaConf.save(task_cfg, config_path)
 
-    monkeypatch.setenv("MLEVOLVE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("ALGOEVOLVE_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-key")
     loaded = prep_cfg(_load_cfg(use_cli_args=False))
 

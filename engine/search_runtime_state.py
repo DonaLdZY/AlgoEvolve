@@ -1,4 +1,4 @@
-"""Durable runtime state for resuming in-flight MLEvolve search actions."""
+"""Durable runtime state for resuming in-flight AlgoEvolve search actions."""
 
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ from engine.journal_snapshot import NodeSnapshot
 from engine.expansion_profile import ExpansionProfile
 
 
-SEARCH_STATE_SCHEMA_VERSION = "mlevolve.search_state.v1"
+SEARCH_STATE_SCHEMA_VERSION = "algoevolve.search_state.v1"
+LEGACY_SEARCH_STATE_SCHEMA_VERSIONS = frozenset({"mlevolve.search_state.v1"})
 ACTIVE_ACTION_STATUSES = {"scheduled", "generating", "generated", "executing"}
 
 
@@ -107,7 +108,11 @@ class SearchRuntimeState:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "SearchRuntimeState":
-        if str(payload.get("schema_version") or "") != SEARCH_STATE_SCHEMA_VERSION:
+        schema_version = str(payload.get("schema_version") or "")
+        if schema_version not in {
+            SEARCH_STATE_SCHEMA_VERSION,
+            *LEGACY_SEARCH_STATE_SCHEMA_VERSIONS,
+        }:
             return cls()
         try:
             elapsed = max(0.0, float(payload.get("cumulative_search_elapsed_seconds") or 0.0))
@@ -291,7 +296,7 @@ class SearchRuntimeStateStore:
 
         self._checkpoint_thread = threading.Thread(
             target=_checkpoint_loop,
-            name="mlevolve-search-state-checkpoint",
+            name="algoevolve-search-state-checkpoint",
             daemon=True,
         )
         self._checkpoint_thread.start()

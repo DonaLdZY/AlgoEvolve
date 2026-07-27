@@ -28,10 +28,10 @@ from agents.prompt_policy import (
     output_language_instruction,
 )
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 STEPWISE_SYSTEM_PROMPT = (
-    "You are MLEvolve's stepwise coding agent. Work through one cumulative conversation. "
+    "You are AlgoEvolve's stepwise coding agent. Work through one cumulative conversation. "
     "Treat the task/data context and workflow contracts in the first user message as authoritative. "
     "Each later user message requests only the next stage; preserve all compatible decisions and exact "
     "identifiers from earlier turns. Return the requested plan and Python code without redoing other stages."

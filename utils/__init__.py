@@ -3,7 +3,7 @@ import shutil
 import zipfile
 from pathlib import Path
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def copytree(src: Path, dst: Path, use_symlinks=True):

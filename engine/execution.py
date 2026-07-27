@@ -8,7 +8,7 @@ from engine.model_artifacts import find_model_artifacts
 from engine.search_node import SearchNode
 from agents.prompts import infer_task_mode
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 _ZERO_METRIC_ANALYSIS = (
     "Performance is 0.0 (complete failure). This indicates fundamental issues that need debugging:\n"

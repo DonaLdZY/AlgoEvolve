@@ -18,7 +18,7 @@ import time
 import numpy as np
 from typing import List, Literal, Optional
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 NETWORK_RETRY_MAX_ATTEMPTS = 5
 NETWORK_RETRY_MAX_SLEEP_SECONDS = 30.0
 

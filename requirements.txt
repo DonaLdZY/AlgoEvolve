@@ -1,4 +1,4 @@
-# Supported default MLEvolve installation: orchestration plus the general
+# Supported default AlgoEvolve installation: orchestration plus the general
 # data-science, deep-learning, optimization, and reinforcement-learning stack.
 -r requirements_base.txt
 -r requirements_ml.txt

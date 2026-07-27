@@ -13,7 +13,7 @@ from rank_bm25 import BM25Okapi
 if TYPE_CHECKING:
     from .embedding_models import EmbeddingModel
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 class HybridRetriever:

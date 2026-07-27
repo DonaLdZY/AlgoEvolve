@@ -228,7 +228,7 @@ def generate(base_path, include_file_details=True, simple=False, submission_requ
     return result
 
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 
 def clean_task_desc(task_desc: str, cfg) -> str:

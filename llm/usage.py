@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 _LOCK = threading.Lock()
 _SUMMARIES: dict[str, dict[str, Any]] = {}
@@ -602,7 +602,7 @@ def _build_usage_brief(summary: dict[str, Any], *, model_name: str) -> dict[str,
         reverse=True,
     )
     return {
-        "schema_version": "mlevolve.llm_usage_brief.v2",
+        "schema_version": "algoevolve.llm_usage_brief.v2",
         "model": model_name,
         "models": summary.get("models", {}),
         "calls": int(summary.get("calls", 0) or 0),

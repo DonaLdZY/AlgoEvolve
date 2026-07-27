@@ -26,10 +26,10 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 INSTALL_DECLARATION_RE = re.compile(
-    r"^\s*#\s*MLEVOLVE_PIP_INSTALL"
+    r"^\s*#\s*(?:ALGOEVOLVE|MLEVOLVE)_PIP_INSTALL"
     r"(?:\[(?P<module>[A-Za-z_][A-Za-z0-9_.]*)\])?"
     r"\s*:\s*(?P<command>.+?)\s*$",
     re.MULTILINE,
@@ -307,7 +307,7 @@ class DependencyInstaller:
         interpreter_hash = hashlib.sha256(lock_identity.encode("utf-8")).hexdigest()[:20]
         self._interpreter_lock_path = (
             Path(tempfile.gettempdir())
-            / "mlevolve-dependency-locks"
+            / "algoevolve-dependency-locks"
             / f"{interpreter_hash}.lock"
         )
         self._status_by_distribution: dict[str, dict[str, Any]] = {}
@@ -325,6 +325,7 @@ class DependencyInstaller:
         environment["PYTHONPATH"] = (
             target if not existing else os.pathsep.join((target, existing))
         )
+        environment["ALGOEVOLVE_TASK_PACKAGE_DIR"] = target
         environment["MLEVOLVE_TASK_PACKAGE_DIR"] = target
         return environment
 
@@ -499,7 +500,7 @@ class DependencyInstaller:
         reason: str,
     ) -> dict[str, Any]:
         record = {
-            "schema_version": "mlevolve.dependency_installation.v1",
+            "schema_version": "algoevolve.dependency_installation.v1",
             "timestamp": _utc_now(),
             "run_log_dir": str(self.run_log_dir),
             "node_id": node_id,
@@ -674,7 +675,7 @@ class DependencyInstaller:
             else ""
         )
         record = {
-            "schema_version": "mlevolve.dependency_installation.v1",
+            "schema_version": "algoevolve.dependency_installation.v1",
             "timestamp": _utc_now(),
             "run_log_dir": str(self.run_log_dir),
             "node_id": str(metadata["node_id"]),
@@ -733,7 +734,7 @@ class DependencyInstaller:
             }
         self._append_record(
             {
-                "schema_version": "mlevolve.dependency_installation.v1",
+                "schema_version": "algoevolve.dependency_installation.v1",
                 "timestamp": _utc_now(),
                 "run_log_dir": str(self.run_log_dir),
                 "node_id": str(node_id),
@@ -787,7 +788,7 @@ class DependencyInstaller:
         installed = [record for record in attempted if record.get("success")]
         failed = [record for record in attempted if not record.get("success")]
         return {
-            "schema_version": "mlevolve.dependency_installation_summary.v1",
+            "schema_version": "algoevolve.dependency_installation_summary.v1",
             "updated_at": _utc_now(),
             "python_executable": sys.executable,
             "install_target": str(self.install_target_path),

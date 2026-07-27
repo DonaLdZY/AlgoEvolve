@@ -8,7 +8,7 @@ from engine.search_node import SearchNode
 from utils.response import wrap_code
 from agents.prompt_cache import task_section
 
-logger = logging.getLogger("MLEvolve")
+logger = logging.getLogger("AlgoEvolve")
 
 DATA_LEAKAGE_CHECK_SPEC = FunctionSpec(
     name="check_data_leakage",
