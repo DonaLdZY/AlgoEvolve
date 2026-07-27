@@ -10,6 +10,7 @@ Used by improve_agent when global memory is available.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Dict, Any
 

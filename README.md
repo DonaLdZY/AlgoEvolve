@@ -4,12 +4,12 @@
 [![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
 [![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 
-**核心定位：不只搜索机器学习预测模型，也把部分决策优化与强化学习问题纳入同一套自动搜索、执行、评审和交付流程。**
+**不只搜索机器学习预测模型，也把部分决策优化与强化学习问题纳入同一套自动搜索、执行、评审和交付流程。**
 
 AlgoEvolve 是一个面向预测与决策任务的自动机器学习方案搜索引擎。机器学习预测是当前最完整的核心能力；在此基础上，项目还部分支持数学优化、组合决策、启发式搜索、强化学习及其混合方案。它读取任务说明、数据和可选的 AutoRealize 结构化上下文，让多个闭环 Worker 在同一棵搜索树上生成、执行、评审并改进 Python 方案，最终导出最佳方案、Top-K 候选、可复用模型、策略或求解器产物，以及完整的可恢复搜索状态。
 
 > [!IMPORTANT]
-> AlgoEvolve 是 [InternScience/MLEvolve](https://github.com/InternScience/MLEvolve) 的大幅修改版，由 Bydecision 独立维护。它拥有独立名称，不是 MLEvolve 官方发行版，也不代表 InternScience、上海人工智能实验室或原 MLEvolve 团队对本项目的认可。上游版权、修改说明和许可证信息见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
+> AlgoEvolve 是 [InternScience/MLEvolve](https://github.com/InternScience/MLEvolve) 的大幅修改版，由 Bydecision 独立维护。不是 MLEvolve 官方发行版，也不代表 InternScience、上海人工智能实验室或原 MLEvolve 团队对本项目的认可。上游版权、修改说明和许可证信息见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
 
 ## 能做什么
 
@@ -21,7 +21,9 @@ AlgoEvolve 的重点不是只让 LLM 写一份训练代码，而是让预测模�
 | **决策与优化**   | 部分支持             | 数学规划、组合优化、调度、分配、路径规划、启发式、局部搜索、元启发式及混合方法            |
 | **强化学习**     | 部分支持、实验性更强 | 环境定义、策略训练、rollout、artifact 保存，以及和启发式或优化方法在统一 evaluator 下比较 |
 
-“部分支持”表示这些任务已经进入正式工作流，而不是仅在提示词里提到：它们可以生成专用方案、执行代码、接受 Result Review、参与搜索树评分，并通过 Decision/RL 接口导出。但是，决策与 RL 的可靠性更依赖任务是否提供明确的约束、状态转移、可行性校验器和统一评分函数；本项目并不宣称能够解决任意形式的决策或 RL 问题。
+“部分支持”表示这些任务已经进入正式工作流：它们可以生成专用方案、执行代码、接受 Result Review、参与搜索树评分，并通过 Decision/RL 接口导出。但是，决策与 RL 的可靠性更依赖任务是否提供明确的约束、状态转移、可行性校验器和统一评分函数；本项目并不宣称能够解决任意形式的决策或 RL 问题。
+
+暂时只支持字面描述的决策问题或者使用环境内的gym，还不支持自由形式的环境或验证器参与搜索。
 
 主要能力包括：
 
@@ -80,7 +82,6 @@ flowchart TD
 
 指标必须在所有节点间保持同一语义、同一方向和同一计算公式。确定性规则会检查有限数值和指标方向，Result Review 则结合任务合同、代码与运行输出判断分数是否可信。若指标含糊不清，会导致LLM幻觉，进而导致搜不出合法方案。
 
-
 ### 3. 并行选择待扩展节点
 
 每个空闲 Worker 从当前已提交的搜索树原子选择一个父节点。父节点同一时刻只能被一个 Worker 扩展；如果最高优先级节点已被占用，就尝试下一个可调度节点。
@@ -101,8 +102,6 @@ UCT = total_reward / effective_visits
 - 探索常数 `C` 随搜索进度分段衰减。
 - 搜索中后段会按时间进度把 UCT 探索与 Top-K 利用做软切换；Top-K 对单一根分支设配额，避免候选全部来自一条分支。
 
-初始强制生成 `agent.initial_drafts` 个根草稿。之后，新根 Draft 以 `agent.search.root_new_draft_probability` 与更深层扩展竞争，不会机械地先填满所有根草稿。兄弟节点使用渐进的复杂度提示：第 1–2 个为 `simple`，第 3–4 个为 `normal`，第 5 个起为 `complex`。复杂度表示运行成本和策略风险，不指定算法角色；模型仍需根据问题结构选择最合适的方法。
-
 ### 4. 生成候选方案
 
 系统可产生以下节点：
@@ -119,7 +118,6 @@ UCT = total_reward / effective_visits
 | ---------- | ------------------- | ---------------- | ------------------------ | ------------------ |
 | Prediction | Data & Validation   | Model & Training | Inference & Artifact     | MetaAgent 忠实合并 |
 | Decision   | Problem & Evaluator | Decision Method  | Solve/Rollout & Artifact | MetaAgent 忠实合并 |
-
 
 ## 环境要求
 
@@ -496,7 +494,7 @@ def rollout(model_path, data): ...
 
 只有执行出现精确 `ModuleNotFoundError` 后，系统才会将包安装到当前任务隔离目录并立即重跑同一节点。生成代码直接执行 pip、conda 或 shell 安装仍会被拒绝。严格部署可以把 `exec.dependency_install_policy` 改为 `allowlist`。
 
-## 与原版 MLEvolve 的关系
+## 上游项目申明
 
 本仓库基于原版 [MLEvolve](https://github.com/InternScience/MLEvolve) 修改。上游项目页与论文：
 
@@ -516,8 +514,6 @@ AlgoEvolve 相对上游的主要修改包括：
 - provider-friendly 累积上下文、headroom 压缩、精确快照取回和统一输出语言；
 - DeepSeek `/beta`、prefix completion、thinking/reasoning 与用量统计；
 - AutoRealize 上下文接入、FastAPI 服务、任务级资源限制和扩展测试。
-
-这是一项实质性派生工作，不是简单改名。请勿删除 [NOTICE](NOTICE) 中的上游归属信息。
 
 ## 许可证与商标
 
