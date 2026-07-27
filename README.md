@@ -133,8 +133,8 @@ UCT = total_reward / effective_visits
 git clone https://github.com/DonaLdZY/AlgoEvolve.git
 cd AlgoEvolve
 
-conda create -n algoevolve python=3.12 pip -y
-conda activate algoevolve
+conda create -n autodecision python=3.12 pip -y
+conda activate autodecision
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
