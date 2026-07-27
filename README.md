@@ -9,7 +9,7 @@
 AlgoEvolve 是一个面向预测与决策任务的自动机器学习方案搜索引擎。机器学习预测是当前最完整的核心能力；在此基础上，项目还部分支持数学优化、组合决策、启发式搜索、强化学习及其混合方案。它读取任务说明、数据和可选的 AutoRealize 结构化上下文，让多个闭环 Worker 在同一棵搜索树上生成、执行、评审并改进 Python 方案，最终导出最佳方案、Top-K 候选、可复用模型、策略或求解器产物，以及完整的可恢复搜索状态。
 
 > [!IMPORTANT]
-> AlgoEvolve 是 [InternScience/MLEvolve](https://github.com/InternScience/MLEvolve) 的大幅修改版，由 AlgoEvolve 贡献者独立维护。它拥有独立名称，不是 MLEvolve 官方发行版，也不代表 InternScience、上海人工智能实验室或原 MLEvolve 团队对本项目的认可。上游版权、修改说明和许可证信息见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
+> AlgoEvolve 是 [InternScience/MLEvolve](https://github.com/InternScience/MLEvolve) 的大幅修改版，由 Bydecision 独立维护。它拥有独立名称，不是 MLEvolve 官方发行版，也不代表 InternScience、上海人工智能实验室或原 MLEvolve 团队对本项目的认可。上游版权、修改说明和许可证信息见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
 
 ## 能做什么
 
@@ -521,7 +521,7 @@ AlgoEvolve 相对上游的主要修改包括：
 
 ## 许可证与商标
 
-代码按 [Apache License 2.0](LICENSE) 发布。`LICENSE` 同时保留原 MLEvolve 的版权声明，并加入 AlgoEvolve 贡献者的修改版权。分发源码或衍生版本时，应继续：
+代码按 [Apache License 2.0](LICENSE) 发布。`LICENSE` 同时保留原 MLEvolve 的版权声明，并加入 Bydecision 的修改版权。分发源码或衍生版本时，应继续：
 
 1. 附带完整 Apache-2.0 许可证；
 2. 保留适用的版权、专利、商标和归属声明；
