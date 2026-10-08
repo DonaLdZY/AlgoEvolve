@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 import zipfile
 from pathlib import Path
@@ -9,7 +10,9 @@ logger = logging.getLogger("AlgoEvolve")
 def copytree(src: Path, dst: Path, use_symlinks=True):
     """
     Copy contents of `src` to `dst`. Unlike shutil.copytree, the dst dir can exist and will be merged.
-    If src is a file, only that file will be copied. Optionally uses symlinks instead of copying.
+    If src is a file, only that file will be copied. The legacy use_symlinks
+    flag now uses hard links for files and real directories so recursive discovery
+    and resolved input-relative paths work with nested datasets.
 
     Args:
         src (Path): source directory
@@ -21,7 +24,7 @@ def copytree(src: Path, dst: Path, use_symlinks=True):
         dest_f = dst / src.name
         assert not dest_f.exists(), dest_f
         if use_symlinks:
-            (dest_f).symlink_to(src)
+            _link_dataset_file(src, dest_f)
         else:
             shutil.copyfile(src, dest_f)
         return
@@ -29,12 +32,25 @@ def copytree(src: Path, dst: Path, use_symlinks=True):
     for f in src.iterdir():
         dest_f = dst / f.name
         assert not dest_f.exists(), dest_f
-        if use_symlinks:
-            (dest_f).symlink_to(f)
-        elif f.is_dir():
-            shutil.copytree(f, dest_f)
+        resolved = f.resolve()
+        if resolved.is_dir():
+            if use_symlinks:
+                shutil.copytree(resolved, dest_f, copy_function=_link_dataset_file)
+            else:
+                shutil.copytree(resolved, dest_f)
+        elif use_symlinks:
+            _link_dataset_file(f, dest_f)
         else:
             shutil.copyfile(f, dest_f)
+
+
+def _link_dataset_file(src, dst):
+    try:
+        os.link(Path(src).resolve(), dst)
+    except OSError:
+        # Cross-volume filesystems may not support hard links.
+        shutil.copy2(src, dst)
+    return str(dst)
 
 
 def clean_up_dataset(path: Path):

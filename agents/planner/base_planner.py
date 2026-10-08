@@ -14,6 +14,7 @@ import re
 import json
 import logging
 from typing import Dict, Any, Union
+from itertools import combinations
 
 from llm import generate, compile_prompt_to_md
 from llm.model_profiles import thinking_json_incompatible
@@ -120,6 +121,22 @@ def build_planning_json_schema(allowed_modules: list[str] | None = None) -> dict
 
 
 PLANNING_JSON_SCHEMA = build_planning_json_schema(PLANNING_ALLOWED_MODULES)
+
+
+def build_closed_planning_json_schema(allowed_modules: list[str] | None = None) -> dict:
+    """Express selected module maps without provider-incompatible open objects."""
+    allowed = list(dict.fromkeys(allowed_modules or PLANNING_ALLOWED_MODULES))
+    schema = build_planning_json_schema(allowed)
+    plan = schema["properties"]["plan"]
+    value_schema = plan.pop("additionalProperties")
+    plan.pop("required", None)
+    plan.pop("type", None)
+    plan["anyOf"] = [
+        {"type": "object", "properties": {name: value_schema for name in selected},
+         "required": list(selected), "additionalProperties": False}
+        for size in range(1, min(3, len(allowed)) + 1) for selected in combinations(allowed, size)
+    ]
+    return schema
 
 
 # ============ Component descriptions ============
@@ -400,7 +417,7 @@ def run_planner(
     for attempt in range(max_retries):
         logger.info(f"Calling {stage_name} Agent to analyze which modules to modify... (attempt {attempt + 1}/{max_retries})")
 
-        json_schema = build_planning_json_schema(allowed_modules)
+        json_schema = build_closed_planning_json_schema(allowed_modules)
 
         planning_response = generate(
             prompt=planning_prompt_complete,

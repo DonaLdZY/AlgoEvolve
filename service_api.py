@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import signal
@@ -182,6 +183,11 @@ class JobStore:
                 raise HTTPException(status_code=400, detail="task already running in AlgoEvolve service")
             job_id = uuid.uuid4().hex
             ts = now_ts()
+            if assigned_cpu_ids is None and resource_limits and resource_limits.get("cpu_cores"):
+                occupied = [cpu for job in self._jobs.values()
+                            if job.status in {"pending", "running", "stopping"}
+                            for cpu in job.assigned_cpu_ids]
+                assigned_cpu_ids = choose_cpu_ids(int(resource_limits["cpu_cores"]), occupied_ids=occupied)
             runtime = JobRuntime(
                 job_id=job_id,
                 task_id=task_id,
@@ -328,6 +334,21 @@ def _base_config_value(dotted_key: str, default: Any) -> Any:
         return current
     except Exception:
         return default
+
+
+def _finalization_timeout_secs(req: StartAlgoEvolveRequest) -> float:
+    value = _base_config_value("exec.timeout", 900)
+    if req.config_path.strip():
+        path = Path(req.config_path).expanduser()
+        if not path.is_absolute():
+            path = Path(req.working_dir.strip() or DEFAULT_WORKDIR) / path
+        configuration = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        value = configuration.get("exec", {}).get("timeout", value)
+    override = _extract_cli_override(req.args, "exec.timeout")
+    seconds = float(override if override is not None else value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Final evaluation requires a finite positive exec.timeout")
+    return seconds + 60
 
 
 def _resolve_resource_limits(req: StartAlgoEvolveRequest) -> TaskResourceLimits:
@@ -482,7 +503,7 @@ def _is_search_budget_exhausted(log_dir: Path) -> bool:
     status_name = str(_saved_config_value(log_dir, "runtime.run_status_filename", "run_status.json"))
     status = _safe_read_json_dict(log_dir / status_name)
     reason = str(status.get("termination_reason") or "").strip().lower()
-    if reason in {"time_limit_exhausted", "step_limit_exhausted", "steps_completed"}:
+    if reason in {"time_limit_exhausted", "step_limit_exhausted", "steps_completed", "action_budget_exhausted"}:
         return True
     brief_log_name = _resolved_log_filename(
         log_dir,
@@ -839,6 +860,7 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
                 {
                     "id": node_id,
                     "parent_id": node2parent.get(node_id),
+                    "fusion_sources": node.get("fusion_sources") or [],
                     "stage": node.get("stage"),
                     "plan": node.get("plan"),
                     "code": node.get("code"),
@@ -847,6 +869,7 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
                     "llm_insight": node.get("llm_insight"),
                     "parser_analysis": node.get("parser_analysis") or node.get("analysis"),
                     "decision_signals": node.get("decision_signals"),
+                    "evaluation_protocol": node.get("evaluation_protocol") or {},
                     "metric": metric,
                     "maximize": maximize,
                     "is_buggy": node.get("is_buggy"),
@@ -1190,7 +1213,8 @@ def _run_job(job_id: str, req: StartAlgoEvolveRequest, actual_log_dir: Path, act
                 )
             except Exception:
                 startup_buffer = max(0, int(runtime_value("service_startup_buffer_seconds", 1800)))
-            total_timeout = time_limit_secs + startup_buffer + max(0, shutdown_buffer)
+            finalization_budget = _finalization_timeout_secs(req)
+            total_timeout = time_limit_secs + startup_buffer + max(0, shutdown_buffer, finalization_budget)
             try:
                 out, err = proc.communicate(timeout=total_timeout)
             except subprocess.TimeoutExpired:
@@ -1391,8 +1415,8 @@ def start_job(req: StartAlgoEvolveRequest) -> dict[str, Any]:
         log_dir=str(actual_log_dir),
         workspace_dir=str(actual_workspace_dir),
         resource_limits=resources.model_dump(),
-        assigned_cpu_ids=cpu_ids,
     )
+    cpu_ids = job.assigned_cpu_ids
     thread = threading.Thread(
         target=_run_job,
         args=(job.job_id, req, actual_log_dir, actual_workspace_dir, run_timestamp),

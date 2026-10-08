@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from omegaconf import OmegaConf
+import pytest
 import service_api
 
 from service_api import (
@@ -30,6 +31,18 @@ def test_service_reads_runtime_defaults_from_default_yaml() -> None:
     assert _base_config_value("runtime.interruption_checkpoint_wait_seconds", None) == 30
     assert _base_config_value("runtime.exit_immediately_after_interrupt_checkpoint", None) is True
     assert _base_config_value("runtime.service_startup_buffer_seconds", None) == 1800
+
+
+def test_finalization_watchdog_uses_effective_execution_budget(tmp_path):
+    config = tmp_path / "run.yaml"
+    config.write_text("exec:\n  timeout: 1800\n", encoding="utf-8")
+    req = StartAlgoEvolveRequest(task_id="final", log_dir="logs", workspace_dir="workspace", config_path=str(config))
+    assert service_api._finalization_timeout_secs(req) == 1860
+    req.args = ["exec.timeout=2400.5"]
+    assert service_api._finalization_timeout_secs(req) == 2460.5
+    req.args = ["exec.timeout=nan"]
+    with pytest.raises(ValueError, match="finite positive"):
+        service_api._finalization_timeout_secs(req)
 
 
 def test_job_status_tail_and_request_default_are_config_driven() -> None:

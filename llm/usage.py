@@ -486,10 +486,16 @@ def _write_summary(path: Path, summary: dict[str, Any]) -> None:
     completion_tokens = int(out.get("completion_tokens", 0) or 0)
     known_prompt_tokens = int(out.get("provider_cache_known_prompt_tokens", 0) or 0)
     estimated_prompt_tokens = int(out.get("estimated_prompt_tokens", 0) or 0)
-    out["provider_cache_hit_ratio"] = round(cached / prompt_tokens, 6) if prompt_tokens else 0.0
-    out["provider_cache_miss_ratio"] = round(missed / prompt_tokens, 6) if prompt_tokens else 0.0
-    out["known_provider_cache_hit_ratio"] = round(cached / known_prompt_tokens, 6) if known_prompt_tokens else 0.0
-    out["known_provider_cache_miss_ratio"] = round(missed / known_prompt_tokens, 6) if known_prompt_tokens else 0.0
+    complete_cache_usage = (
+        prompt_tokens > 0 and known_prompt_tokens == prompt_tokens
+        and not out.get("provider_usage_missing_calls", 0)
+    )
+    out["provider_cache_hit_ratio"] = round(cached / prompt_tokens, 6) if complete_cache_usage else None
+    out["provider_cache_miss_ratio"] = round(missed / prompt_tokens, 6) if complete_cache_usage else None
+    out["provider_cache_observed_hit_ratio_lower_bound"] = round(cached / prompt_tokens, 6) if prompt_tokens else None
+    out["provider_cache_telemetry_coverage"] = round(known_prompt_tokens / prompt_tokens, 6) if prompt_tokens else None
+    out["known_provider_cache_hit_ratio"] = round(cached / known_prompt_tokens, 6) if known_prompt_tokens else None
+    out["known_provider_cache_miss_ratio"] = round(missed / known_prompt_tokens, 6) if known_prompt_tokens else None
     _apply_deepseek_costs_by_model(out)
     models = out.get("models", {}) if isinstance(out.get("models"), dict) else {}
     model_name = next(iter(models)) if len(models) == 1 else "mixed" if models else ""
@@ -661,6 +667,11 @@ def log_llm_usage(
     cached_tokens, miss_tokens = usage_cache_tokens(raw_usage)
     cache_known = cached_tokens is not None or miss_tokens is not None
     part_rows, estimated_prompt_tokens = prompt_part_stats(prompt_parts, provider_prompt_tokens=prompt_tokens)
+    prompt_usage_available = usage_available and (prompt_tokens > 0 or not estimated_prompt_tokens)
+    if not prompt_usage_available:
+        usage_available = False
+        cache_known = False
+        cached_tokens = miss_tokens = None
     estimated_completion_tokens = estimate_text_tokens(estimated_completion_text or "")
     row = {
         "ts": time.time(),
@@ -686,6 +697,7 @@ def log_llm_usage(
         "prompt_cache_miss_tokens": miss_tokens or 0,
         "provider_cache_tokens_known": cache_known,
         "usage_available": usage_available,
+        "prompt_usage_available": prompt_usage_available,
         "estimated_prompt_tokens": estimated_prompt_tokens,
         "estimated_completion_tokens": estimated_completion_tokens,
         "prompt_parts": part_rows,

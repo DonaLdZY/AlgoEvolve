@@ -3,6 +3,7 @@ from typing import Any, List, Tuple
 
 from llm import compile_prompt_to_md, generate
 from engine.search_node import SearchNode
+from engine.execution_evidence import failure_context
 from agents.coder import plan_and_code_query
 from utils.response import extract_plan_from_diff_response, wrap_code
 from agents.prompts import (
@@ -120,7 +121,7 @@ def run(
         "Introduction": introduction,
         "Task description": agent.task_desc,
         "Previous (buggy) implementation": wrap_code(parent_node.code),
-        "Execution output": wrap_code(parent_node.term_out, lang=""),
+        "Execution output": wrap_code(failure_context(agent.cfg.workspace_dir, parent_node.id, parent_node.term_out), lang=""),
         "Instructions": {},
     }
     prompt["Instructions"] |= {

@@ -16,6 +16,33 @@ from engine.search_node import SearchNode
 from utils.metric import MetricValue
 
 
+@pytest.mark.parametrize("scope,context,artifact,phase,accepted", [
+    ("development_validation_only", True, True, "search", True),
+    ("provided_prediction_population", True, True, "search", False),
+    ("unknown", True, True, "search", False),
+    ("development_validation_only", False, True, "search", False),
+    ("development_validation_only", True, False, "search", False),
+    ("development_validation_only", True, True, "final", False),
+])
+def test_development_score_does_not_claim_missing_new_output_delivery(monkeypatch, tmp_path, scope, context, artifact, phase, accepted):
+    from engine.execution import update_node_certification
+
+    monkeypatch.setattr(result_parse_agent, "find_model_artifacts", lambda *args: [tmp_path / "model.pkl"] if artifact else [])
+    agent = SimpleNamespace(cfg=SimpleNamespace(workspace_dir=tmp_path),
+                            acfg=SimpleNamespace(generate_submission=True, use_global_memory=False, output_language="english"),
+                            metric_maximize=True, has_autorealize_context=context, global_memory=None,
+                            task_desc="Classify equipment state", data_preview="", coldstart_description="")
+    node = SearchNode(code="def predict(model_path, data): return data", stage="draft", _term_out=[],
+                      evaluation_protocol={"evaluation_phase": phase, "scoring_split": "development", "final_evaluation_accessed": False})
+    response = {"verdict": "accept", "is_bug": False, "metric": 0.7, "lower_is_better": False,
+                "summary": "Development probabilities were evaluated.", "reason_codes": ["accepted"],
+                "output_scope": scope, "confidence": 0.9}
+    result_parse_agent._apply_review_response(agent, node, response)
+    update_node_certification(agent, node)
+    assert node.search_eligible is accepted
+    assert node.delivery_ready is False
+
+
 def test_result_review_supplies_ui_insight_without_a_second_llm_call(
     monkeypatch,
     tmp_path,
@@ -81,6 +108,19 @@ def test_metric_direction_uses_autorealize_contract_without_llm(monkeypatch) -> 
 
     assert agent.metric_maximize is False
     assert "AutoRealize evaluation contract" in agent.metric_maximize_reasoning
+
+
+@pytest.mark.parametrize("response", [{"lower_is_better": "false"}, {}])
+def test_metric_direction_never_defaults_to_maximize_on_invalid_response(monkeypatch, response):
+    monkeypatch.setattr(result_parse_agent, "query", lambda **kwargs: response)
+    agent = SimpleNamespace(
+        task_desc="Use the stated task metric", autorealize_context="", cfg=SimpleNamespace(),
+        acfg=SimpleNamespace(retries=SimpleNamespace(metric_direction_max_attempts=1),
+                             feedback=SimpleNamespace(model="test", temp=0)),
+    )
+    with pytest.raises(RuntimeError, match="Metric direction is unresolved"):
+        result_parse_agent.determine_metric_direction(agent)
+    assert not hasattr(agent, "metric_maximize")
 
 
 def _parse_agent(tmp_path, contract: str) -> SimpleNamespace:
@@ -270,4 +310,21 @@ def test_execution_exception_still_routes_through_llm_reviewer(monkeypatch, tmp_
     assert len(calls) == 1
     assert '"exception_type": "KeyError"' in calls[0]["user_message"]
     assert node.is_buggy is True
+    assert node.metric.value is None
+
+
+def test_prediction_result_review_receives_complete_contract_and_final_score_boundary(monkeypatch, tmp_path):
+    contract = "## AutoRealize Structured Context\nReserved evaluation uses the last 7008 rows. Only development_search may rank candidates.\n" + "Complete rule. " * 1000 + "\nLate exception: legal observed history crosses partitions."
+    agent = _parse_agent(tmp_path, contract)
+    agent.task_desc = "Forecast the next electricity usage observation."
+    calls = []
+    def fake_query(**kwargs):
+        calls.append(kwargs)
+        return {"is_bug": True, "summary": "Holdout score is invalid for search", "metric": None, "lower_is_better": True}
+    monkeypatch.setattr(result_parse_agent, "query", fake_query)
+    node = SearchNode(code="print('Final Validation Score: 3.9')", stage="draft", _term_out=[])
+    result_parse_agent.run(agent, node, ExecutionResult(term_out=["Final Validation Score: 3.9\n"], exec_time=1, exc_type=None))
+    assert len(calls) == 1
+    assert contract in calls[0]["user_message"]
+    assert "Trace the printed scalar to its prediction population" in calls[0]["user_message"]
     assert node.metric.value is None

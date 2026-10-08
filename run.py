@@ -11,6 +11,10 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Optional
 
+from utils.runtime_threads import configure_controller_threads
+
+configure_controller_threads()
+
 
 def _print_cli_help() -> None:
     print(
@@ -28,7 +32,7 @@ Common overrides:
   exp_name=NAME                  Human-readable run name
   log_dir=PATH                   Log output root
   workspace_dir=PATH             Execution workspace root
-  agent.steps=50                 Maximum search nodes/steps
+  agent.steps=50                 Maximum nodes/action submissions (failed attempts consume budget)
   agent.time_limit=10800         Search wall-clock limit in seconds
   agent.initial_drafts=3         Number of initial drafts
   agent.search.parallel_search_num=4
@@ -52,7 +56,6 @@ if __name__ == "__main__" and any(arg in {"-h", "--help"} for arg in sys.argv[1:
     raise SystemExit(0)
 
 
-import torch
 from omegaconf import OmegaConf
 from rich.status import Status
 
@@ -64,7 +67,7 @@ from engine.executor import Interpreter
 from engine.expansion_profile import ExpansionProfile
 from engine.node_selection import refresh_persisted_uct_values
 from engine.search_node import Journal
-from engine.search_budget import resolve_search_budget
+from engine.search_budget import resolve_search_budget, search_termination_reason
 from engine.search_runtime_state import (
     SearchRuntimeState,
     SearchRuntimeStateStore,
@@ -79,6 +82,8 @@ from engine.search_runtime_state import (
 from engine.solution_manager import persist_resumable_checkpoint
 from agents.prompt_policy import infer_task_family
 from utils.seed import set_global_seed
+from agents.coder.recovery import GenerationRecoveryError
+from engine.final_evaluation import finalize_selected_candidate, require_unexposed_search
 from utils.logging_config import setup_logging
 from utils.visualization import journal_to_string_tree
 from utils.serialize import load_json
@@ -136,6 +141,8 @@ def _pending_node_row(node, status: str) -> dict:
         "llm_insight": _node_attr(node, "llm_insight", None),
         "parser_analysis": _node_attr(node, "parser_analysis", None) or _node_attr(node, "analysis", None),
         "decision_signals": _node_attr(node, "decision_signals", None),
+        "fusion_sources": _node_attr(node, "fusion_sources", []) or [],
+        "evaluation_protocol": _node_attr(node, "evaluation_protocol", {}) or {},
         "metric": metric_value,
         "maximize": metric_maximize if isinstance(metric_maximize, bool) else None,
         "is_buggy": _node_attr(node, "is_buggy", None),
@@ -200,6 +207,8 @@ def _write_run_status(
     completed_steps: int,
     total_steps: int,
     time_limit_secs: int,
+    submitted_actions: int | None = None,
+    action_submission_budget: int | None = None,
 ) -> None:
     payload = {
         "schema_version": "algoevolve.run_status.v1",
@@ -210,6 +219,9 @@ def _write_run_status(
         "time_limit_secs": time_limit_secs,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if submitted_actions is not None:
+        payload["submitted_actions"] = submitted_actions
+        payload["action_submission_budget"] = action_submission_budget
     runtime_cfg = getattr(cfg, "runtime", None)
     filename = str(getattr(runtime_cfg, "run_status_filename", RUN_STATUS_FILE) or RUN_STATUS_FILE)
     path = cfg.log_dir / filename
@@ -284,10 +296,12 @@ def run():
     if env_resume:
         resume_run = env_resume in {"1", "true", "yes", "on"}
     if cfg.torch_hub_dir:
+        import torch
         torch.hub.set_dir(cfg.torch_hub_dir)
     set_global_seed(cfg.agent.seed)
     logger = setup_logging(cfg)
     logger.info(f'Starting run "{cfg.exp_name}"')
+    require_unexposed_search(cfg.workspace_dir)
 
     task_desc = load_task_desc(cfg)
 
@@ -557,6 +571,8 @@ def run():
     status = Status("[green]Generating code...")
 
     def exec_callback(*args, **kwargs):
+        if not agent.accept_search_results or interruption_requested.is_set():
+            raise RuntimeError("Search has closed; no further candidate execution is admitted")
         status.update("[magenta]Executing code...")
         res = interpreter.run(*args, **kwargs)
         status.update("[green]Generating code...")
@@ -764,6 +780,8 @@ def run():
     logger.info(
         "Search pipeline: parallel closed-loop workers with virtual-visit UCT reservations"
     )
+    submitted_actions = 0
+    action_submission_budget = max(0, total_steps - completed)
     if pending_draft_nodes or completed < total_steps:
         drafts_to_execute = [
             node for node in pending_draft_nodes
@@ -793,8 +811,6 @@ def run():
         try:
             futures = set()
             future_metadata: dict = {}
-            submitted_actions = 0
-            action_submission_budget = max(0, total_steps - completed)
             for node in drafts_to_execute:
                 if submitted_actions >= action_submission_budget:
                     break
@@ -822,11 +838,15 @@ def run():
                 logger.info(f"Resumed generated node in a closed-loop worker: {node.id}")
 
             def fill_worker_slots() -> int:
+                nonlocal submitted_actions
                 added = 0
                 while (
                     len(futures) < max_workers
                     and completed + len(futures) < total_steps
+                    and submitted_actions < action_submission_budget
                     and not timed_out
+                    and not getattr(agent, "search_integrity_failure", None)
+                    and getattr(agent, "accept_search_results", True)
                 ):
                     scheduled = schedule_new_step(executor)
                     if scheduled is None:
@@ -838,6 +858,7 @@ def run():
                         "pending_node_id": placeholder_id,
                         "reservation": reservation,
                     }
+                    submitted_actions += 1
                     added += 1
                     logger.info(
                         "Assigned worker to parent %s after virtual-visit UCT update",
@@ -848,6 +869,9 @@ def run():
             fill_worker_slots()
 
             while futures:
+                if getattr(agent, "search_integrity_failure", None):
+                    logger.error("Search integrity failure; stopping all expansion and evaluation")
+                    break
                 if is_timed_out():
                     timed_out = True
                     logger.warning("Time limit reached in Phase 2 main loop.")
@@ -878,6 +902,9 @@ def run():
                             )
                         else:
                             logger.warning("Task returned None (execution failed)")
+                    except GenerationRecoveryError:
+                        commit_interrupted_checkpoint()
+                        raise
                     except Exception as e:
                         logger.exception(f"Exception during task execution: {e}")
                         cur_node = None
@@ -913,6 +940,26 @@ def run():
                         fill_worker_slots()
                     logger.info(f"Progress: {completed}/{total_steps} steps completed, {len(futures)} tasks running")
 
+            if getattr(agent, "search_integrity_failure", None):
+                agent.accept_search_results = False
+                agent.runtime_checkpoint_callback = None
+                interpreter.terminate_all_subprocesses()
+                fast_shutdown = True
+                for metadata in future_metadata.values():
+                    reservation = metadata.get("reservation")
+                    if isinstance(reservation, ExpansionReservation):
+                        reservation.cancel()
+                search_state.close(clear_actions=True)
+                with agent.journal_lock:
+                    repair_journal_for_resume(journal, [])
+                    save_run(cfg, journal)
+                _write_run_status(cfg, status="failed", termination_reason=agent.search_integrity_failure,
+                                  completed_steps=max(0, len(journal) - 1), total_steps=total_steps,
+                                  time_limit_secs=time_limit_secs)
+                normal_exit["done"] = True
+                logger.error("Search exposure audit saved; this failed trial will not run final evaluation")
+                _exit_process_immediately(2)
+                return
             if timed_out:
                 logger.warning(
                     f"Time limit reached (configured={time_limit_secs}s). "
@@ -994,7 +1041,19 @@ def run():
             refresh_persisted_uct_values(agent)
             save_run(cfg, journal)
 
-    termination_reason = "time_limit_exhausted" if timed_out else "steps_completed"
+    termination_reason = search_termination_reason(
+        timed_out=timed_out,
+        completed_steps=max(0, len(journal) - 1),
+        total_steps=total_steps,
+        submitted_actions=submitted_actions,
+        action_budget=action_submission_budget,
+    )
+    if termination_reason == "action_budget_exhausted":
+        logger.warning(
+            "Search action budget exhausted after %s submissions; completed nodes=%s/%s. "
+            "Failed generation actions were not counted as completed nodes.",
+            submitted_actions, max(0, len(journal) - 1), total_steps,
+        )
     _write_run_status(
         cfg,
         status="completed",
@@ -1002,6 +1061,8 @@ def run():
         completed_steps=max(0, len(journal) - 1),
         total_steps=total_steps,
         time_limit_secs=time_limit_secs,
+        submitted_actions=submitted_actions,
+        action_submission_budget=action_submission_budget,
     )
     # Clear cancelled/completed runtime actions before the completion manifest
     # is written. The manifest is the final durable marker and must never point
@@ -1020,7 +1081,16 @@ def run():
             )
         ),
     )
+    # Search completion is durable even if the separate final evaluation fails or is interrupted.
     normal_exit["done"] = True
+    agent.accept_search_results = False
+    agent.runtime_checkpoint_callback = None
+    final_interpreter = Interpreter(cfg.workspace_dir, **OmegaConf.to_container(cfg.exec), cfg=cfg)
+    try:
+        final_evaluation = finalize_selected_candidate(cfg, journal.get_best_node(), final_interpreter)
+        logger.info("Post-search final evaluation status: %s", final_evaluation["status"])
+    finally:
+        final_interpreter.terminate_all_subprocesses()
     interpreter.cleanup_session(-1)
     if timed_out and bool(getattr(runtime_cfg, "force_process_exit_on_timeout", True)):
         # ThreadPoolExecutor cannot cancel already-running LLM calls. Once the

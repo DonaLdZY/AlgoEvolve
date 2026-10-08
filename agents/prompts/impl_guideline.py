@@ -5,9 +5,10 @@ import time
 import humanize
 
 from .shared import (
+    SEARCH_EVALUATION_GUIDANCE,
     get_decision_solution_protocol,
     get_optimization_rl_strategy,
-    is_optimization_or_rl_task,
+    infer_task_mode,
 )
 
 
@@ -15,10 +16,12 @@ def get_impl_guideline_from_agent(agent):
     """Build implementation guideline from agent config."""
     tot_time_remaining = agent.acfg.time_limit - (time.time() - agent.start_time)
     exec_timeout = int(min(agent.cfg.exec.timeout, tot_time_remaining))
-    optimization_rl = is_optimization_or_rl_task(
+    task_mode = infer_task_mode(
         task_desc=getattr(agent, "task_desc", ""),
         coldstart_description=getattr(agent, "coldstart_description", ""),
+        autorealize_context=getattr(agent, "data_preview", ""),
     )
+    optimization_rl = task_mode in {"optimization", "decision", "rl"}
     guideline = get_impl_guideline(
         tot_time_remaining=tot_time_remaining,
         steps_remaining=agent.acfg.steps - agent.current_step,
@@ -36,14 +39,18 @@ def get_impl_guideline_from_agent(agent):
             )
         ),
     )
+    runtime_budget = guideline.pop("Current execution budget")
     guideline |= get_decision_solution_protocol(
         task_desc=getattr(agent, "task_desc", ""),
         coldstart_description=getattr(agent, "coldstart_description", ""),
+        enabled=optimization_rl,
     )
     guideline |= get_optimization_rl_strategy(
         task_desc=getattr(agent, "task_desc", ""),
         coldstart_description=getattr(agent, "coldstart_description", ""),
+        enabled=optimization_rl,
     )
+    guideline["Current execution budget"] = runtime_budget
     return guideline
 
 
@@ -81,6 +88,7 @@ def get_impl_guideline(
             "- Define the evaluation population before scoring. Missing date/time/feature values must not be silently dropped. If the AutoRealize/task contract defines a valid/evaluable subset or exclusion rule, apply it explicitly and report excluded counts/examples; otherwise use fallback fields, explicit defaults, or validation notes.",
             "- `validate_solution` must check task-defined feasibility and completeness before any score is trusted.",
             "- `score_solution` must implement the single scalar score from the task description / AutoRealize evaluation contract. Do not report reward-only values, training loss, proxy costs, or extra metrics as `Final Validation Score`.",
+            "- Return one finite numeric score, not layered comparisons, tuples or vectors. Freeze the contract's weights/scales/aggregation across all candidates; assumptions recorded in the contract are part of its formula. Record raw objective components and test boundary/priority/precision cases. Do not replace business scores with self-test pass rates; software-check scoring requires explicit task authorization and a frozen common check population.",
             "- FORBIDDEN: empty/no-op/constant/placeholder/random solutions being treated as competitive unless the official invalid-output rule explicitly scores them and the validation summary says so.",
             "- Output/submission columns describe the generated result table, not raw input dataframe columns. Never select `output_columns` from a source dataframe, and never assume names like solution name, delivery day, trip id, validity, or failure reason exist in the input unless the Exact Source Schema Contract lists them exactly.",
             "- When writing a generated decision/result table, declare `OUTPUT_COLUMNS` and use `pd.DataFrame(rows, columns=OUTPUT_COLUMNS)`. This preserves schema for empty/no-feasible solutions and prevents `KeyError` from slicing a zero-column dataframe.",
@@ -156,14 +164,27 @@ def get_impl_guideline(
         if generate_submission
         else ["- Did I avoid forcing submission.csv because final submission generation is disabled?"]
     )
+    interface_guideline = (
+        [
+            "- Non-RL decision methods MUST define `solve(model_path, data)`; stateless solvers may use `model_path=None` and do not need artificial training or prediction wrappers.",
+            "- RL/hybrid methods MUST define `train_policy(data, artifact_dir)` and `rollout(model_path, data)`; rollout loads the saved policy without retraining.",
+            "- Validation and final decision output must use the same solve/rollout path and evaluator.",
+        ]
+        if optimization_rl
+        else [
+            "- MUST define `def train(data, artifact_dir): ...` to fit and save the prediction artifact.",
+            "- MUST define `def predict(model_path, data): ...` in the final script.",
+            "- `predict(model_path, data)` loads the saved artifact, applies the same fitted preprocessing as validation/test, and returns predictions without retraining.",
+            "- Validation, test, and submission inference must use this function or the same internal inference routine.",
+        ]
+    )
     impl_guideline = [
-        f"**Resource Budget**: Time left <= {_format_time(tot_time_remaining)} | Steps left = {steps_remaining} | Max execution time per run = {humanize.naturaldelta(exec_timeout)}",
-        "",
         "**Note:** Code execution must complete within the configured hard limit; a solution exceeding it is invalid. Within this constraint, prioritize performance and optimization.",
         "**CRITICAL REQUIREMENTS** (Non-Negotiable):",
         "",
         "**0. AutoRealize Contract Priority**",
         "- If `./input/autorealize_context.md` exists, read and obey it before using generic assumptions.",
+        "- If an Execution Contract is present, preserve its contract_id and evaluation_id in run diagnostics and saved metadata. Treat blocking issues as unresolved constraints; do not silently invent facts or claim a blocked task is ready for delivery.",
         "- Its data reading examples, output contract, evaluation contract, constraints, leakage guards, and single-scalar score definition override generic Kaggle templates and lightweight file previews.",
         "- Prefer AutoRealize Executable Data Read Recipes when present, then verify observed shape and columns after loading. If runtime evidence conflicts, adapt explicitly and report the mismatch instead of silently continuing with a malformed table.",
         "- Do not invent submission columns, target fields, row-count rules, random seeds, distance matrices, or cost formulas when AutoRealize did not provide authority for them.",
@@ -172,16 +193,30 @@ def get_impl_guideline(
         *inference_guideline,
         *submission_guideline,
         "**3. Save Reusable Model Artifact**",
-        "- MUST save the trained best model and all required preprocessing state under `./working/`, `./models/`, `./artifacts/`, or `./checkpoints/`.",
+        (
+            "- Save any learned policy, fitted cost model, preprocessing and required solver configuration under `./working/`, `./models/`, `./artifacts/`, or `./checkpoints/`. A truly stateless solver may use `solve(None, data)` without inventing a trained model file."
+            if optimization_rl
+            else "- MUST save the trained best model and all required preprocessing state under `./working/`, `./models/`, `./artifacts/`, or `./checkpoints/`."
+        ),
         "- Use a standard artifact filename such as `./working/model_artifact.pkl`, `./working/best_model.pt`, or `./working/best_model.joblib`; the executor may rewrite generic filenames per node to avoid conflicts.",
         "- The artifact must support later inference without retraining: include fitted preprocessing, feature metadata, model weights, solver state, policy checkpoint, heuristic parameters, or solver configuration.",
         "- For PyTorch, save `state_dict` plus required preprocessing/config metadata. For sklearn and boosting libraries, save the model pipeline or model plus preprocessing state.",
+        "- Save metadata for feature order/types, preprocessing, target mapping, package versions, seeds, evaluation protocol, and relative artifact paths. An ensemble artifact must include every member and its combiner.",
+        "- Reusable training must bind the actually selected hyperparameters and preprocessing recipe. Calling train(data, a_new_artifact_dir) or train_policy(data, a_new_artifact_dir) must reproduce that recipe, not silently fall back to unrelated defaults. Embed the selected configuration in exported code or load it from an exported training dependency located relative to the solution, never from an assumed pre-existing output directory. List any configuration dependencies in the artifact manifest and fail explicitly if required configuration is missing.",
+        "- Keep executable training under `if __name__ == '__main__':`; importing the solution for inference must not start training, evaluation, or file writes. Reload the artifact and verify inference on a small valid batch before reporting success.",
         "",
         "**4. Expose Reusable Inference API**",
-        "- MUST define `def train(data, artifact_dir): ...` to fit and save the prediction artifact.",
-        "- MUST define `def predict(model_path, data): ...` in the final script.",
-        "- `predict(model_path, data)` must load the saved artifact, apply the same preprocessing as validation/test, and return predictions, decisions, or the required solution without retraining.",
-        "- Validation, test, and submission inference must use this function or the same internal inference routine. Do not retrain inside `predict`.",
+        *interface_guideline,
+        "",
+        "**Comparable Evaluation Across Search Nodes**",
+        SEARCH_EVALUATION_GUIDANCE,
+        "- Freeze the official metric formula/direction, evaluation population, split membership, cutoff/horizon, scenario seeds, feasibility rules, and output schema from the task contract. Improvements and fusion must reuse them; never improve a score by changing the evaluator or dropping difficult evaluation units.",
+        "- For forecasts, use chronological holdouts or rolling origins matching the requested future horizon; respect per-entity grouping, label delay and feature availability at prediction time. Never use a random split that exposes future observations.",
+        "- For repeated entities, batches, sites or documents, honor contract grouping so related records cannot cross splits. Fit imputation, scaling, encoders, text/vector transforms and feature selection on training data only.",
+        "- Documents may supply constraints and domain facts, but future reports, target summaries, IDs and post-outcome fields are not inference-time features unless the contract explicitly permits them.",
+        "- Print an `Evaluation Protocol Summary:` JSON diagnostic with available contract_id, evaluation_id, metric_name, maximize, split_fingerprint, evaluation_count, cutoff and horizon. The fingerprint must derive from actual validation unit IDs/folds plus evaluator settings, not the node ID or a claimed score. Report unavailable fields honestly.",
+        "- Estimate fitting, preprocessing, prediction and artifact size costs when the task specifies limits. A score obtained beyond a hard resource, latency or feasibility limit cannot be called the best compliant result.",
+        "- Search-validation scores guide selection and are not an unbiased estimate after many trials. Keep any untouched test set out of tuning and blending; only claim final-test performance when that evaluation actually ran.",
         "",
         *metric_guideline,
         directories_guideline,
@@ -210,15 +245,15 @@ def get_impl_guideline(
         "",
         "**Self-Check Before Finalizing**:",
         *[f"- {item}" for item in predict_self_check],
-        "- Did I save the best model/preprocessing artifact under ./working, ./models, ./artifacts, or ./checkpoints?",
-        "- Did I define `train(data, artifact_dir)` plus `predict(model_path, data)` and use the same inference path for validation/test/submission?",
+        "- Did I save every required model/preprocessing/configuration artifact, or document a truly stateless solve(None, data) interface?",
+        "- Did I expose the task-appropriate reusable interface above and verify artifact reload without retraining?",
         *submission_self_check,
         "- Did I print the validation metric as the last line?",
         "- Did I use the complete training dataset rather than a tiny subset?",
     ]
     if expose_prediction:
         impl_guideline.append(
-            "Because prediction exposure is enabled, document the expected `data` input type for `predict(model_path, data)` and keep the function usable from another Python process."
+            "Because inference exposure is enabled, document the expected `data` input type for the task-appropriate predict/solve/rollout entrypoint and keep it usable from another Python process."
         )
 
     if k_fold_validation > 1:
@@ -226,4 +261,9 @@ def get_impl_guideline(
             f"The evaluation should be based on {k_fold_validation}-fold cross-validation but only if that's an appropriate evaluation for the task at hand."
         )
 
-    return {"Implementation guideline": impl_guideline}
+    return {
+        "Implementation guideline": impl_guideline,
+        "Current execution budget": [
+            f"**Resource Budget**: Time left <= {_format_time(max(0, tot_time_remaining))} | Steps left = {max(0, steps_remaining)} | Max execution time per run = {humanize.naturaldelta(max(0, exec_timeout))}",
+        ],
+    }

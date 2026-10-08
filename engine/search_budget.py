@@ -5,6 +5,16 @@ from __future__ import annotations
 import math
 
 
+def search_termination_reason(*, timed_out: bool, completed_steps: int, total_steps: int, submitted_actions: int, action_budget: int) -> str:
+    if timed_out:
+        return "time_limit_exhausted"
+    if completed_steps >= total_steps:
+        return "steps_completed"
+    if submitted_actions >= action_budget:
+        return "action_budget_exhausted"
+    return "search_exhausted"
+
+
 def resolve_search_budget(
     *,
     requested_steps: int,

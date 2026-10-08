@@ -1,12 +1,18 @@
 """Post-execution validation: validate_executed_node (csv existence, metric=0.0, register success)."""
 
 import logging
+import json
 import math
+import os
 import re
+from contextlib import nullcontext
+from pathlib import Path
+import time
 
 from engine.model_artifacts import find_model_artifacts
 from engine.search_node import SearchNode
 from agents.prompts import infer_task_mode
+from agents.prompt_policy import method_family_for_node
 
 logger = logging.getLogger("AlgoEvolve")
 
@@ -76,10 +82,24 @@ def update_node_certification(agent, node: SearchNode) -> None:
     """Record evidence without adding a third delivery-eligibility review layer."""
 
     metric = getattr(node, "metric", None)
+    protocol = getattr(node, "evaluation_protocol", {}) or {}
+    if getattr(agent, "has_autorealize_context", False) and node.exc_type is None:
+        phase_ok = (
+            protocol.get("evaluation_phase") == "search"
+            and isinstance(protocol.get("scoring_split"), str)
+            and bool(protocol["scoring_split"].strip())
+            and protocol.get("final_evaluation_accessed") is False
+        )
+        if not phase_ok:
+            node.is_valid = False
+            _append_nonfatal_decision_warning(node, "Search scoring provenance is missing or reports final-evaluation access; this candidate cannot be ranked. Required: evaluation_phase=search, actual scoring_split, final_evaluation_accessed=false.")
     metric_value = getattr(metric, "value", None) if metric is not None else None
     finite_metric = isinstance(metric_value, (int, float)) and math.isfinite(float(metric_value))
     artifacts = find_model_artifacts(agent.cfg.workspace_dir, str(node.id))
     node.method_mode = _method_mode(agent, node)
+    node.method_family = method_family_for_node(
+        node, task_family="prediction" if node.method_mode == "prediction" else "decision"
+    )
     node.runtime_ok = node.exc_type is None and node.is_buggy is False
     node.contract_valid = node.is_valid is not False
     node.search_eligible = bool(node.runtime_ok and finite_metric and node.contract_valid)
@@ -92,8 +112,9 @@ def update_node_certification(agent, node: SearchNode) -> None:
 
     # Deprecated compatibility fields mirror acceptance/certification; they no
     # longer form an independent gate for best-node or Top-K selection.
-    node.delivery_ready = node.search_eligible
-    node.delivery_certified = bool(node.search_eligible and node.score_recomputed)
+    output_deferred = getattr(node, "output_scope", "unknown") == "development_validation_only"
+    node.delivery_ready = node.search_eligible and not output_deferred
+    node.delivery_certified = bool(node.delivery_ready and node.score_recomputed)
     node.certification_source = (
         "independent_evaluator"
         if node.delivery_certified
@@ -102,6 +123,8 @@ def update_node_certification(agent, node: SearchNode) -> None:
         else "runtime_or_validation_failure"
     )
     notes: list[str] = []
+    if output_deferred:
+        notes.append("Development predictions were reviewed; real NEW output was not available. Independent inference delivery remains pending.")
     if node.search_eligible and not node.score_recomputed:
         notes.append("Final score was reported by candidate code and has not been independently recomputed.")
     if stateful_interface and not artifacts:
@@ -150,6 +173,31 @@ def record_independent_score(
 def validate_executed_node(agent, node: SearchNode):
     """Finalize deterministic hard facts after the Result Review verdict."""
     update_node_certification(agent, node)
+    protocol = getattr(node, "evaluation_protocol", {}) or {}
+    if protocol.get("final_evaluation_accessed") is True:
+        # Preserve evidence outside feedback memory and stop admitting work before
+        # the rejected node can become a debug parent or expose its metrics again.
+        agent.accept_search_results = False
+        node.search_eligible = False
+        node.delivery_ready = False
+        node.delivery_certified = False
+        from engine.journal_snapshot import NodeSnapshot
+        marker = Path(agent.cfg.workspace_dir) / "search_evaluation_exposure.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with getattr(agent, "journal_lock", nullcontext()):
+            try:
+                with marker.open("x", encoding="utf-8") as stream:
+                    json.dump({"reason": "search_evaluation_exposure", "recorded_at": time.time(),
+                               "node": NodeSnapshot.from_node(node).to_payload(),
+                               "resume_allowed": False, "final_evaluation_allowed": False},
+                              stream, ensure_ascii=False, indent=2)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                pass
+            finally:
+                agent.search_integrity_failure = "search_evaluation_exposure"
+        return
 
     if node.search_eligible and hasattr(node, 'branch_id') and node.branch_id:
         if node.branch_id not in agent.branch_successful_nodes:

@@ -11,6 +11,45 @@ PLAN_AND_CODE_RESPONSE_FORMAT = (
 )
 
 
+SEARCH_EVALUATION_GUIDANCE = (
+    "This invocation is ONE candidate inside an ongoing MCTS search. Internal parameter selection in a candidate is not the end of the global search. "
+    "The ENGINE owns the complete task's cumulative search duration, MCTS admission, search Workers, process-tree memory/CPU limits, interruptions and checkpoint audit. "
+    "A task requirement to search for three hours (10800 seconds) applies to that outer engine, NEVER to each generated train(), main(), model, or candidate review. "
+    "One node must finish within its per-node execution timeout. Do not create a nested three-hour scheduler, wait to fill the budget, reject a candidate for finishing quickly, or require candidate-local budget_satisfied=true. "
+    "Candidate-reported search_audit/worker counts are local diagnostics and cannot establish or disprove the engine's global run duration or resource enforcement. "
+    "Final Validation Score must be computed on the task's search/development population, with its frozen metric and direction. "
+    "When the task reserves a separate final holdout/test population, do not evaluate it, print its metrics, fit on it, or use it for weights or selection during candidate execution. "
+    "Keep any required final holdout evaluation and subsequent full-history refit in a separate def final_evaluate(data, artifact_dir) entrypoint, never called by the default search execution. "
+    "That entrypoint receives the complete input directory and an output artifact directory, evaluates only the already-selected recipe once, saves actual final metrics and refits only after evaluation as the task permits. "
+    "Resolve the required files beneath that input directory before passing them to file-only readers such as read_csv or open; never pass the directory itself to a file-only loader. Verify the directory-to-file adapter using metadata or development-only fixtures, without invoking final evaluation on held-out labels. "
+    "It returns a JSON-serializable dictionary with status='completed', metrics, model_path relative to artifact_dir, and inference_checks; it must not search or select a different candidate. "
+    "Make module imports side-effect-free: default training/search execution belongs under if __name__ == '__main__'. Persist the selected recipe during search; final_evaluate loads that exact recipe and fixed ensemble weights from the same working directory, without repeating config selection. "
+    "Each candidate has its own working directory with shared ./input and uniquely named ./submission outputs; keep all models, recipes and auxiliary metadata beneath ./working. The final output artifact_dir is initially populated with an exact copy of the selected node's ./working contents, including its saved recipe. Never read another candidate's mutable working files. "
+    "Exports retain candidate sidecars under runtime/working beside solution.py; after final evaluation its sidecars also live under final_evaluation/artifacts. Resolve selected recipe dependencies from the packaged solution directory, with ./working only for the original candidate workspace. "
+    "The runner invokes it only after global selection is frozen. Formal AutoRealize tasks must define this two-parameter lifecycle entrypoint even without a final holdout: in that case return status='not_applicable' and the actual reason, without inventing observations or business metrics. "
+    "Do not bind final_evaluate to a candidate CLI callback, call it from any search helper, or inline its holdout scoring/refitting logic into main/train. A locally selected recipe is still inside global search. "
+    "Print Evaluation Protocol Summary with evaluation_phase='search', scoring_split naming the actual search population, and final_evaluation_accessed=false, in addition to metric and split fingerprints. "
+    "These fields must describe actual execution; a claimed search phase does not excuse a score traced to final-test predictions. "
+    "Persist source rules by copying or referencing the unchanged source documents; do not reproduce long static contracts inside Python string literals when the original files can be packaged intact. "
+    "Keep generated metadata specific to the implemented recipe and measured run."
+    " For reusable training, package the selected recipe with the code and make default train(data, artifact_dir) work in a fresh output directory. Do not require a recipe pre-existing inside that new output directory. "
+    "Do not enumerate candidates or reselect hyperparameters inside this reusable train call. Put optional configuration search in a separately named entrypoint; train fits the already selected exported recipe on the supplied labeled data. "
+    "Keep predict(model_path, data) as the importable inference API. If the task also requires input-path/output-directory operation, add a separate inference-only CLI or function that reads NEW data, calls predict and writes the declared output. It must not call training/search. "
+    "If no separate NEW/unlabeled prediction population was supplied, do not invent one or fail the development evaluation for that missing input. Exercise frozen inference using feature-only development rows, write nonempty source-aligned development validation predictions with an explicit development_validation_only scope, and state that real NEW predictions remain unavailable. "
+    "Never treat header-only files as successful model predictions or silently label development fixtures as new operational data. When a real prediction population is supplied, its exact required output remains mandatory."
+)
+
+
+FUSION_EVALUATION_GUIDANCE = [
+    "Choose between technique transfer and a real ensemble based on complementary errors, task constraints and available runtime. Name the contributing source nodes and the operation in the plan; a fusion stage label alone does not prove that an ensemble ran.",
+    "For prediction blending or stacking, align every member's held-out/OOF predictions by validation IDs, fold assignments, target/probability column order, and the same evaluation_id/split_fingerprint. Reject incompatible predictions instead of averaging unmatched rows or scores.",
+    "Fit learned blend weights, calibration, thresholds and meta-models inside training folds or nested validation. Never train a stacker on in-sample member predictions or tune weights on an untouched final test set.",
+    "Evaluate the combined model on the same official population, metric and hard constraints as each member, including combined inference latency and artifact size. The combined score must be measured; do not infer it from member scores.",
+    "For routes, schedules, assignments or RL actions, transfer a solver component or generate and validate a new feasible solution. Numeric averaging of decisions is not a valid ensemble unless the task explicitly defines it. Recheck all original hard constraints after combination.",
+    "Package all component models, preprocessing state and the combiner in a portable artifact with relative paths and one task-appropriate inference entrypoint. Inference must work after export without access to other search-node working directories.",
+]
+
+
 def plan_and_code_response_format(scope: str = "the requested implementation") -> str:
     """One canonical response contract for all full-code generation prompts."""
 
@@ -134,9 +173,9 @@ def infer_task_mode(
     return "prediction"
 
 
-def get_optimization_rl_strategy(task_desc: str = "", coldstart_description: str = "") -> dict:
+def get_optimization_rl_strategy(task_desc: str = "", coldstart_description: str = "", *, enabled: bool | None = None) -> dict:
     """Conditional guidance for optimization and reinforcement-learning tasks."""
-    if not is_optimization_or_rl_task(task_desc, coldstart_description):
+    if enabled is False or (enabled is None and not is_optimization_or_rl_task(task_desc, coldstart_description)):
         return {}
 
     return {
@@ -186,9 +225,9 @@ def get_optimization_rl_strategy(task_desc: str = "", coldstart_description: str
     }
 
 
-def get_decision_solution_protocol(task_desc: str = "", coldstart_description: str = "") -> dict:
+def get_decision_solution_protocol(task_desc: str = "", coldstart_description: str = "", *, enabled: bool | None = None) -> dict:
     """Strict protocol for optimization, RL, and decision-output tasks."""
-    if not is_optimization_or_rl_task(task_desc, coldstart_description):
+    if enabled is False or (enabled is None and not is_optimization_or_rl_task(task_desc, coldstart_description)):
         return {}
 
     return {
@@ -204,7 +243,9 @@ def get_decision_solution_protocol(task_desc: str = "", coldstart_description: s
             "- Define the evaluation population before scoring. Do not silently drop orders/items/jobs/resources because a time, target, capacity, or feature field is missing. If the task/AutoRealize contract defines eligibility or exclusion rules for records lacking mandatory evaluation fields, apply those rules explicitly and report excluded/missing counts and examples in validation details; otherwise use a documented fallback field, an `UNKNOWN`/default bucket, or a conservative assumption.",
             "- `validate_solution` must check the task-defined feasibility, completeness, uniqueness, schema, unknown IDs/entities, capacity/time/budget/inventory rules, and any leakage guard stated in the task or AutoRealize context.",
             "- `score_solution` must compute the single scalar objective from the task description or AutoRealize evaluation contract. Do not invent a second metric, reward-only metric, training loss, or proxy objective as the reported final score.",
-            "- If the official objective is incomplete, implement the most conservative scalar explicitly supported by the task text and state missing assumptions in the validation summary; do not silently optimize an unrelated score.",
+            "- Return exactly one finite numeric scalar, never a tuple, vector, Pareto set or separate business tie-break. All nodes and fusion candidates use the frozen contract formula, direction, weights, scales and aggregation, including disclosed evaluation assumptions; do not choose candidate-specific parameters. Persist raw objective components and parameters for audit, and test priority, boundary and numeric-precision cases against the contract.",
+            "- For decision/assignment tasks, do not replace business performance with fixture, schema or validator pass rates. Software checks may be the score only when explicitly authorized by the task's ranking_scope; candidate-generated tests are diagnostics, not a new ranking objective. Missing business inputs must remain missing and unmeasured.",
+            "- If the final scalar contract is incomplete, report the exact missing formula/parameter for contract repair; do not invent a local scoring formula or silently optimize an unrelated score.",
             "",
             "**2. A solution is an artifact, not just a model output.**",
             "- Non-RL decision methods expose `solve(model_path, data)`; a stateless heuristic/rule/exact solver may accept `model_path=None`.",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from engine.node_workspace import node_workspace
 
 
 MODEL_ARTIFACT_EXTENSIONS = {
@@ -61,7 +62,9 @@ def find_model_artifacts(workspace_dir: Path, node_id: str, limit: int = 64) -> 
 
     found: list[Path] = []
     seen: set[str] = set()
-    for root in _candidate_roots(workspace):
+    isolated = node_workspace(workspace, node_text)
+    roots = [isolated] if isolated.is_dir() else _candidate_roots(workspace)
+    for root in roots:
         if not root.exists():
             continue
         for path in root.rglob("*"):

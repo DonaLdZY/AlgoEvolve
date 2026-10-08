@@ -1,6 +1,7 @@
 """Code Review Agent: LLM-based code review and fix for node code."""
 
 import logging
+import ast
 import json
 import time
 from typing import cast
@@ -11,6 +12,7 @@ from agents.planner import build_chat_prompt_for_model
 from engine.search_node import SearchNode
 from agents.prompts.validation_template_prompts import get_code_review_prompt
 from agents.prompts import get_internet_clarification
+from agents.prompts.shared import SEARCH_EVALUATION_GUIDANCE
 from agents.prompt_cache import task_section
 from agents.prompt_policy import (
     configured_output_language,
@@ -27,6 +29,24 @@ from engine.solution_protocol import (
 from agents.coder.diff_coder import SearchReplacePatcher
 
 logger = logging.getLogger("AlgoEvolve")
+
+
+class CodeReviewFailed(RuntimeError):
+    """A candidate must not execute when critical review could not finish."""
+
+
+def validate_review_edit_scope(original: str, revised: str, allowed_definitions) -> str:
+    if not allowed_definitions:
+        return revised
+    allowed = set(allowed_definitions)
+    def protected(code):
+        tree = ast.parse(code)
+        tree.body = [item for item in tree.body if not (
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in allowed)]
+        return ast.dump(tree, include_attributes=False)
+    if protected(original) != protected(revised):
+        raise CodeReviewFailed("Focused interface repair changed protected code outside allowed function definitions")
+    return revised
 
 CODE_REVIEW_SPEC = FunctionSpec(
     name="submit_code_review",
@@ -89,7 +109,7 @@ def run(agent, node: SearchNode) -> str:
         task_family=task_family,
         method_family=str(getattr(node, "method_family", "unknown") or "unknown"),
     )
-    preflight = preflight_code(node.code, interface)
+    preflight = preflight_code(node.code, interface, require_final_evaluation=bool(getattr(agent, "has_autorealize_context", False)))
     prompt = get_code_review_prompt(
         task_desc=review_task_desc,
         code=node.code,
@@ -98,6 +118,7 @@ def run(agent, node: SearchNode) -> str:
     internet_clarification = get_internet_clarification(getattr(agent.cfg, "pretrain_model_dir", ""))
     if "Instructions" not in prompt:
         prompt["Instructions"] = {}
+    prompt["Instructions"]["Search score and final evaluation lifecycle"] = SEARCH_EVALUATION_GUIDANCE
     if "Implementation guideline" in prompt["Instructions"]:
         prompt["Instructions"]["Implementation guideline"].extend(internet_clarification)
     else:
@@ -124,6 +145,8 @@ def run(agent, node: SearchNode) -> str:
     if bool(getattr(retry_cfg, "code_review_escalate_to_code", True)) and primary_role != "code":
         roles.append("code")
     roles = roles[:max_retries]
+    retry_evidence = None
+    allowed_definitions = getattr(node, "review_allowed_definitions", None)
 
     for attempt, role in enumerate(roles):
         try:
@@ -155,6 +178,15 @@ def run(agent, node: SearchNode) -> str:
                                 "task_family": task_family,
                                 "required_interface": interface.__dict__,
                                 "preflight": preflight.__dict__,
+                                "actual_call_contract": {
+                                    "default_search": "Only task training/development data may be fitted/predicted; never final holdout",
+                                    "final_evaluate": "final_evaluate(Path(full_input_directory), Path(final_artifact_directory)); first argument is NOT a DataFrame or CSV filename. Resolve and parse the exact source files before dataframe validation. The output directory already contains the selected node working files.",
+                                    "reusable_training": "train(task_training_data, Path(fresh_output_directory)); bind exported selected recipe relative to solution, fit supplied rows, do not enumerate or select candidates again",
+                                    "independent_probe_evidence": getattr(node, "interface_probe_evidence", None),
+                                    "allowed_function_edits": allowed_definitions,
+                                    "focused_repair_rule": "When allowed_function_edits is present, change/add only those named functions. Preserve all other imports, constants, feature transformations, model grids, split logic and scoring exactly. No invented fallback recipe; missing actual selected configuration is an error.",
+                                },
+                                "previous_review_failure": retry_evidence,
                             },
                             ensure_ascii=False,
                             sort_keys=True,
@@ -171,7 +203,9 @@ def run(agent, node: SearchNode) -> str:
                 ),
             )
 
-            needs_revision = review_response.get("needs_revision", False)
+            if not isinstance(review_response, dict) or type(review_response.get("needs_revision")) is not bool:
+                raise ValueError("Code review must return an explicit boolean needs_revision")
+            needs_revision = review_response["needs_revision"]
             reasoning = review_response.get("reasoning", "")
             revised_code = review_response.get("revised_code")
             logger.info(
@@ -191,13 +225,14 @@ def run(agent, node: SearchNode) -> str:
                             logger.info("Code review returned diff format, applying patch")
                             patcher = SearchReplacePatcher()
                             patched_code, count = patcher.apply_patch(
-                                revised_code, node.code, strict=False
+                                revised_code, node.code, strict=True
                             )
                             if count > 0 and patched_code and patched_code != node.code:
                                 logger.info(f"Successfully applied {count} review patch(es)")
-                                return patched_code.strip()
+                                return validate_review_edit_scope(node.code, patched_code.strip(), allowed_definitions)
                             raise ValueError(f"review diff did not apply (count={count})")
                         except Exception as e:
+                            retry_evidence = str(e)
                             logger.warning(
                                 "Failed to apply %s review patch: %s",
                                 role,
@@ -205,30 +240,32 @@ def run(agent, node: SearchNode) -> str:
                             )
                             if attempt < len(roles) - 1:
                                 continue
-                            return node.code
+                            raise CodeReviewFailed("Required review patch could not be applied") from e
                     else:
                         # Full code revision (original behavior)
                         if use_diff_for_review:
+                            retry_evidence = "Full code returned but exact SEARCH/REPLACE blocks are required"
                             logger.warning(
                                 "%s reviewer returned full code while diff mode is enabled.",
                                 role,
                             )
                             if attempt < len(roles) - 1:
                                 continue
-                            return node.code
+                            raise CodeReviewFailed("Review returned full code where a targeted patch is required")
                         else:
                             logger.info("Using revised code from reviewer")
-                            return revised_code.strip()
+                            return validate_review_edit_scope(node.code, revised_code.strip(), allowed_definitions)
 
                 if attempt < len(roles) - 1:
+                    retry_evidence = "Required revision has no applicable patch: " + str(reasoning)
                     logger.warning(
                         "Code review requested a revision without an applicable patch; escalating."
                     )
                     logger.info(f"Reasoning detail: {reasoning}", extra={"verbose": True})
                     continue
-                logger.error("Code review requested a revision without an applicable patch; returning original code")
+                logger.error("Code review requested a revision without an applicable patch; blocking execution")
                 logger.info(f"Reasoning detail: {reasoning}", extra={"verbose": True})
-                return node.code
+                raise CodeReviewFailed("Critical review findings have no applicable repair")
 
             if revised_code is not None and revised_code.strip():
                 logger.warning(
@@ -239,15 +276,15 @@ def run(agent, node: SearchNode) -> str:
             return node.code
 
         except Exception as e:
+            retry_evidence = str(e)
             error_msg = f"Code review failed with exception: {e}"
             if attempt < len(roles) - 1:
                 logger.warning("%s - escalating to the next review role", error_msg)
                 continue
-            logger.error(f"{error_msg} - returning original code")
-            return node.code
+            logger.error(f"{error_msg} - blocking execution")
+            raise CodeReviewFailed(error_msg) from e
 
-    logger.error("Code review: Unexpected exit from retry loop, returning original code")
-    return node.code
+    raise CodeReviewFailed("Code review finished without approval or an applicable repair")
 
 
 def regenerate_after_preflight_failure(

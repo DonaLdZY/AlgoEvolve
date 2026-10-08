@@ -66,7 +66,7 @@ class DraftConfig:
     """Initial draft generation and visibility controls."""
 
     fast_first_draft: bool = True
-    fast_first_draft_skip_pre_review: bool = True
+    fast_first_draft_skip_pre_review: bool = False
     # Deprecated: first-result sequencing replaces synchronous repair blocking.
     fast_first_draft_max_repairs: int = 2
     # Deprecated: full AutoRealize context is always used.
@@ -91,6 +91,7 @@ class DraftConfig:
 class RetryConfig:
     """Agent-level structured-output and review retry policy."""
 
+    review_gate_policy: str = "strict"
     code_review_max_attempts: int = 2
     preflight_regeneration_max_attempts: int = 2
     code_review_delay_seconds: float = 5.0
@@ -184,6 +185,7 @@ class AgentConfig:
 class ExecConfig:
     timeout: int
     agent_file_name: str
+    isolate_node_workspaces: bool = True
     auto_install_missing_dependencies: bool = True
     dependency_install_policy: str = "ai_declared"
     dependency_install_target_path: str = ""

@@ -40,19 +40,20 @@ def interface_for(*, task_family: str, method_family: str) -> SolutionInterface:
     return SolutionInterface("prediction", True, "predict", "train", True)
 
 
-def _function_names(tree: ast.AST) -> set[str]:
+def _function_names(tree: ast.Module) -> set[str]:
     return {
         node.name
-        for node in ast.walk(tree)
+        for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
 
-def _function_parameters(tree: ast.AST) -> dict[str, tuple[str, ...]]:
+def _function_parameters(tree: ast.Module) -> dict[str, tuple[str, ...]]:
     parameters: dict[str, tuple[str, ...]] = {}
-    for node in ast.walk(tree):
+    # Exported entry points live in module scope; estimator methods may share names.
+    for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            parameters[node.name] = tuple(arg.arg for arg in node.args.args)
+            parameters[node.name] = tuple(arg.arg for arg in (*node.args.posonlyargs, *node.args.args))
     return parameters
 
 
@@ -94,7 +95,7 @@ def _dangerous_findings(tree: ast.AST) -> list[str]:
     return sorted(set(findings))
 
 
-def preflight_code(code: str, interface: SolutionInterface) -> PreflightReport:
+def preflight_code(code: str, interface: SolutionInterface, *, require_final_evaluation: bool = False) -> PreflightReport:
     try:
         tree = ast.parse(code or "")
     except SyntaxError as exc:
@@ -113,17 +114,40 @@ def preflight_code(code: str, interface: SolutionInterface) -> PreflightReport:
     required = [interface.entrypoint]
     if interface.train_entrypoint:
         required.insert(0, interface.train_entrypoint)
+    signatures = expected_signatures(interface)
+    if require_final_evaluation or "final_evaluate" in discovered:
+        required.append("final_evaluate")
+        signatures["final_evaluate"] = ("data", "artifact_dir")
     missing = sorted(set(required) - discovered)
     invalid_signatures = sorted(
         f"{name}{parameters.get(name, ())} must start with {expected}"
-        for name, expected in expected_signatures(interface).items()
+        for name, expected in signatures.items()
         if name in parameters and parameters[name][: len(expected)] != expected
     )
+    for function in tree.body:
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) or function.name not in signatures:
+            continue
+        supplied = len(signatures[function.name])
+        args = function.args
+        required_positionals = len(args.posonlyargs) + len(args.args) - len(args.defaults)
+        required_keywords = [arg.arg for arg, default in zip(args.kwonlyargs, args.kw_defaults) if default is None]
+        if required_positionals > supplied or required_keywords:
+            invalid_signatures.append(f"{function.name} cannot be called with only {supplied} positional arguments; extra required parameters exist")
+        if isinstance(function, ast.AsyncFunctionDef):
+            invalid_signatures.append(f"{function.name} must be synchronous for the generated-solution runner")
     dangerous = _dangerous_findings(tree)
+    # The outer engine imports and invokes this entrypoint only after selection.
+    # Disallow candidate-side references, including aliases and CLI callbacks.
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == "final_evaluate":
+            continue
+        for item in ast.walk(statement):
+            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load) and item.id == "final_evaluate":
+                dangerous.append(f"final_evaluate is engine-only; candidate reference at line {item.lineno}")
     return PreflightReport(
         ok=not missing and not invalid_signatures and not dangerous,
         required_functions=tuple(required),
-        expected_signatures=tuple(interface_contract_text(interface).splitlines()),
+        expected_signatures=tuple(f"def {name}({', '.join(args)}): ..." for name, args in signatures.items()),
         discovered_functions=tuple(sorted(discovered)),
         missing_functions=tuple(missing),
         invalid_signatures=tuple(invalid_signatures),

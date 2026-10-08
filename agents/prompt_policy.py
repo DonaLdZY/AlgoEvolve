@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from typing import Any, Iterable
@@ -79,13 +80,39 @@ def apply_expansion_profile(
     node.expansion_complexity = profile.complexity
     node.expansion_operator = operator
     node.method_family = infer_method_family(
-        f"{getattr(node, 'plan', '')}\n{getattr(node, 'code', '')}",
+        getattr(node, "plan", ""), code=getattr(node, "code", ""),
         task_family=profile.task_family or infer_task_family(agent),
     )
 
 
-def infer_method_family(text: Any, *, task_family: str = "prediction") -> str:
+def _method_symbols(code: str) -> str | None:
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, TypeError):
+        return None
+    symbols: list[str] = []
+    for item in ast.walk(tree):
+        if isinstance(item, (ast.Import, ast.ImportFrom)):
+            if isinstance(item, ast.ImportFrom) and item.module:
+                # sklearn.ensemble is also the module for individual tree estimators.
+                symbols.append(item.module.replace("sklearn.ensemble", "sklearn"))
+            symbols.extend(alias.name.replace("sklearn.ensemble", "sklearn") for alias in item.names)
+        elif isinstance(item, ast.Call):
+            symbols.append(ast.unparse(item.func))
+        elif isinstance(item, ast.ClassDef):
+            symbols.append(item.name)
+    source = " ".join(symbols)
+    source = re.sub(r"\b(?:ColumnTransformer|FunctionTransformer|PowerTransformer|QuantileTransformer|TransformedTargetRegressor)\b", "preprocessing", source)
+    source = re.sub(r"([a-z])([A-Z])", r"\1 \2", source).replace("_", " ")
+    return source.lower()
+
+
+def infer_method_family(text: Any, *, task_family: str = "prediction", code: str = "") -> str:
     source = str(text or "").lower()
+    if code:
+        symbols = _method_symbols(code)
+        if symbols is not None:
+            source = symbols
     has_rl = bool(re.search(r"\b(ppo|dqn|sac|td3|actor.?critic|reinforcement learning|q.?learning|policy gradient)\b", source))
     has_opt = bool(re.search(r"\b(milp|mip|linear program|cp.?sat|ortools|dynamic programming|branch.?and.?bound)\b", source))
     has_search = bool(re.search(r"\b(genetic|evolutionary|simulated annealing|tabu|large neighborhood|beam search|mcts)\b", source))
@@ -109,7 +136,7 @@ def infer_method_family(text: Any, *, task_family: str = "prediction") -> str:
         return "ensemble"
     if re.search(r"\b(transformer|cnn|rnn|lstm|neural|pytorch|tensorflow|keras)\b", source):
         return "deep_learning"
-    if re.search(r"\b(xgboost|lightgbm|catboost|random forest|gradient boost)\b", source):
+    if re.search(r"\b(xgboost|lightgbm|catboost|random forest|gradient boost(?:ing)?)\b", source):
         return "tree_boosting"
     if re.search(r"\b(linear regression|logistic regression|ridge|lasso|svm)\b", source):
         return "linear_or_kernel"
@@ -117,12 +144,17 @@ def infer_method_family(text: Any, *, task_family: str = "prediction") -> str:
 
 
 def method_family_for_node(node: Any, *, task_family: str) -> str:
+    code = str(getattr(node, "code", "") or "")
+    if code:
+        detected = infer_method_family("", task_family=task_family, code=code)
+        if detected not in {"prediction_other", "decision_other"}:
+            return detected
     explicit = str(getattr(node, "method_family", "") or "").strip()
     if explicit and explicit != "unknown":
         return explicit
     return infer_method_family(
         f"{getattr(node, 'plan', '')}\n{getattr(node, 'code_summary', '')}\n{getattr(node, 'code', '')}",
-        task_family=task_family,
+        task_family=task_family, code=code,
     )
 
 

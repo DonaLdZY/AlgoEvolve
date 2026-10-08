@@ -4,6 +4,8 @@ from typing import Any, List, Optional
 from llm import compile_prompt_to_md
 from engine.search_node import SearchNode
 from agents.prompts import prompt_resp_fmt, get_impl_guideline_from_agent
+from agents.prompts.shared import FUSION_EVALUATION_GUIDANCE
+from engine.solution_manager import get_branch_top_nodes
 from agents.planner import build_chat_prompt_for_model
 from agents.coder import plan_and_code_query
 from agents.prompt_cache import dataset_reference_sentence, routed_data_context, task_section
@@ -28,19 +30,10 @@ def _collect_branch_representatives(agent) -> List[SearchNode]:
             logger.debug(f"Branch {branch_id} has no successful nodes, skipping")
             continue
 
-        maximize = agent.metric_maximize if agent.metric_maximize is not None else True
-        branch_best = max(
-            successful_nodes,
-            key=lambda n: n.metric.value if n.metric and n.metric.value is not None else (
-                float("-inf") if maximize else float("inf")
-            ),
-        )
-
-        if not branch_best.metric or branch_best.metric.value is None:
-            logger.debug(f"Branch {branch_id} best node has no valid metric, skipping")
+        top_nodes = get_branch_top_nodes(agent, branch_id, top_k=1)
+        if not top_nodes:
             continue
-
-        representatives.append(branch_best)
+        representatives.append(top_nodes[0])
 
     maximize = agent.metric_maximize if agent.metric_maximize is not None else True
     representatives.sort(
@@ -142,6 +135,7 @@ def run(
     }
 
     prompt["Instructions"] |= prompt_resp_fmt()
+    prompt["Instructions"]["Comparable and reusable fusion"] = FUSION_EVALUATION_GUIDANCE
 
     if mode == "node":
         prompt["Instructions"] |= {
@@ -201,6 +195,7 @@ def run(
         parent=agent.virtual_root,
         stage="fusion_draft",
         local_best_node=agent.virtual_root,
+        fusion_sources=[str(node.id) for node in branch_representatives],
     )
     register_node(agent, aggregation_node, prompt_complete, new_branch=True)
     agent.fusion_draft_count += 1

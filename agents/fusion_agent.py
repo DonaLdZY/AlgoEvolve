@@ -7,6 +7,7 @@ from llm import compile_prompt_to_md
 from engine.search_node import SearchNode
 from utils.response import wrap_code
 from agents.prompts import prompt_resp_fmt, get_impl_guideline_from_agent
+from agents.prompts.shared import FUSION_EVALUATION_GUIDANCE
 from agents.improve_agent import run as run_improve
 from agents.planner import run_planner, build_planner_task, build_chat_prompt_for_model
 from agents.coder import plan_and_code_query
@@ -92,6 +93,7 @@ def fuse_two_nodes(
         "Instructions": {},
     }
     prompt["Instructions"]["Method selection autonomy"] = autonomous_method_selection_guidance()
+    prompt["Instructions"]["Comparable and reusable fusion"] = FUSION_EVALUATION_GUIDANCE
 
     prompt["Instructions"] |= {
         "🔬 Critical: Scientific Approach to Fusion": [
@@ -156,6 +158,7 @@ def fuse_two_nodes(
         local_best_node=source_node.local_best_node,
         from_topk=from_topk
     )
+    fused_node.fusion_sources = [str(source_node.id), str(target_node.id)]
     register_node(agent, fused_node, prompt_complete, parent_node=source_node)
 
     if hasattr(source_node, '_topk_triggered'):
@@ -208,6 +211,7 @@ def _fuse_with_multiple_references(
         "Instructions": {},
     }
     prompt["Instructions"]["Method selection autonomy"] = autonomous_method_selection_guidance()
+    prompt["Instructions"]["Comparable and reusable fusion"] = FUSION_EVALUATION_GUIDANCE
 
     prompt["Instructions"] |= {
         "🔬 Critical: Scientific Approach to Multi-Reference Fusion": [
@@ -272,6 +276,9 @@ def _fuse_with_multiple_references(
         local_best_node=parent_node.local_best_node,
         from_topk=from_topk
     )
+    fused_node.fusion_sources = list(dict.fromkeys(
+        [str(parent_node.id), *[str(node.id) for node in reference_nodes]]
+    ))
     register_node(agent, fused_node, prompt_complete, parent_node=parent_node)
 
     if hasattr(parent_node, '_topk_triggered'):

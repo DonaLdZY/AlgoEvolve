@@ -439,6 +439,22 @@ def test_interpreter_reruns_same_script_after_environment_recovery(tmp_path: Pat
     assert not (working / "demo_missing.py").exists()
 
 
+def test_once_only_evaluation_disables_environment_recovery_and_script_retry(tmp_path, monkeypatch):
+    interpreter = Interpreter(tmp_path, timeout=10, max_parallel_run=1)
+    def forbidden_recovery(**kwargs):
+        raise AssertionError("Final evaluation must never retry after reading its population")
+    monkeypatch.setattr(interpreter.dependency_installer, "maybe_recover", forbidden_recovery)
+    result = interpreter.run(
+        "from pathlib import Path\n"
+        "with Path('evaluations.txt').open('a') as stream: stream.write('once\\n')\n"
+        "import missing_final_evaluation_fixture_package\n",
+        "final-once", allow_dependency_retry=False,
+    )
+    assert result.exc_type is not None
+    assert "ModuleNotFoundError" in "".join(result.term_out)
+    assert (tmp_path / "evaluations.txt").read_text() == "once\n"
+
+
 def test_real_pip_installs_unlisted_ai_package_into_task_directory(
     tmp_path: Path,
     monkeypatch,

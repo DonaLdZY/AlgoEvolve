@@ -2,8 +2,26 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from llm import gemini as gemini_backend
 from llm import openai as openai_backend
+
+
+def test_request_context_allots_output_after_complete_input(monkeypatch):
+    received = []
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kwargs: received.append(kwargs) or "ok")))
+    stage = SimpleNamespace(context_window_tokens=278528)
+    params = {"messages": [{"role": "user", "content": "original constraint"}], "max_tokens": 278528}
+    monkeypatch.setattr(openai_backend, "estimate_text_tokens", lambda _: 60000)
+    assert openai_backend._create_with_retry(client, params, label="test", stage=stage) == "ok"
+    assert received[0]["max_tokens"] == 278528 - 60000 - int(278528 * .18)
+    assert received[0]["messages"] == params["messages"]
+    monkeypatch.setattr(openai_backend, "estimate_text_tokens", lambda _: 278000)
+    with pytest.raises(ValueError, match="context budget"):
+        openai_backend._create_with_retry(client, params, label="test", stage=stage)
+    assert len(received) == 1
 
 
 def test_normal_requests_enforce_32768_output_floor_for_both_backends() -> None:
@@ -86,6 +104,21 @@ def test_deepseek_non_beta_does_not_send_prefix_extension() -> None:
         {"user": "Implement the task.", "assistant": "Start here:"},
         model="deepseek-v4-pro",
         base_url="https://api.deepseek.com",
+    )
+
+    assert "prefix" not in messages[-1]
+
+
+def test_deepseek_beta_structured_output_does_not_send_prefix_extension() -> None:
+    messages = openai_backend._prompt_to_messages(
+        {
+            "system": "Return valid JSON.",
+            "user": "Return the structured result.",
+            "assistant": "{",
+        },
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com/beta",
+        structured_output=True,
     )
 
     assert "prefix" not in messages[-1]
@@ -177,3 +210,96 @@ def test_gemini_client_uses_stage_endpoint_and_timeout(monkeypatch) -> None:
     assert captured["api_key"] == "test-key"
     assert captured["http_options"]["base_url"] == "https://example.invalid"
     assert captured["http_options"]["timeout"] == 12500
+
+
+@pytest.mark.parametrize("marker", ["> \u274c \u7f51\u7edc\u51fa\u73b0\u5f02\u5e38", "> Network error occurred\r\n"])
+def test_gateway_false_stop_preserves_partial_whitespace(marker):
+    partial = "```python\r\ndef predict():\r\n"
+    assert openai_backend._normalize_stream_completion(partial + marker, "stop") == (partial, "provider_interrupted")
+
+
+@pytest.mark.parametrize("text", [
+    "The provider may report Network error occurred.",
+    "Example:\n> Network error occurred\nThen retry.",
+    '```python\nmessage = """\n> Network error occurred\n"""\n```',
+])
+def test_gateway_marker_does_not_strip_embedded_prose(text):
+    assert openai_backend._normalize_stream_completion(text, "stop") == (text, "stop")
+
+
+def _mock_interrupted_generation(monkeypatch, tmp_path, responses, rounds=2):
+    stage = SimpleNamespace(model="gpt-5.6-luna", api_key="test-only", base_url="https://example.invalid/v1",
+                            max_tokens=32768, minimum_output_tokens=32768, reasoning_effort="xhigh",
+                            continuation_max_rounds=rounds, generation_max_retries=1)
+    cfg = SimpleNamespace(agent=SimpleNamespace(code=stage), log_dir=tmp_path)
+    requests, rows = [], []
+    iterator = iter(responses)
+
+    def collect(client, params, **kwargs):
+        requests.append(params)
+        return next(iterator), "stop", {"prompt_tokens": 0, "completion_tokens": 10}, 1.0
+
+    monkeypatch.setattr(openai_backend, "OpenAI", lambda **kwargs: object())
+    monkeypatch.setattr(openai_backend, "_collect_stream_response", collect)
+    monkeypatch.setattr(openai_backend, "log_llm_usage", lambda **kwargs: rows.append(kwargs))
+    return cfg, requests, rows
+
+
+def test_query_keeps_requested_model_separate_from_provider_alias(monkeypatch, tmp_path):
+    cfg, _, rows = _mock_interrupted_generation(monkeypatch, tmp_path, [])
+    response = SimpleNamespace(model="gpt-5.6-terra", usage=SimpleNamespace(prompt_tokens=200, completion_tokens=4),
+        choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="ok", tool_calls=[]))])
+    captured = []
+
+    def complete(client, params, **kwargs):
+        captured.append(params)
+        return response
+
+    monkeypatch.setattr(openai_backend, "_create_with_retry", complete)
+    output = openai_backend.query("Review constraints", "Candidate", cfg=cfg, model="gpt-5.6-luna")
+    assert output[0] == "ok"
+    assert captured[0]["model"] == rows[0]["model"] == "gpt-5.6-luna"
+    assert rows[0]["response"].model == "gpt-5.6-terra"
+
+
+def test_false_stop_continues_exact_original_task_and_partial(monkeypatch, tmp_path):
+    partial = "```python\ndef predict():\n"
+    cfg, requests, rows = _mock_interrupted_generation(
+        monkeypatch, tmp_path, [partial + "> Network error occurred", "    return 42\n```"])
+    prompt = [{"role": "system", "content": "Preserve every constraint."},
+              {"role": "user", "content": "Use only past observations; keep all output keys."}]
+    result = openai_backend.generate(prompt, cfg)
+    assert result == partial + "    return 42\n```"
+    assert requests[1]["messages"][:2] == requests[0]["messages"] == prompt
+    assert requests[1]["messages"][-2] == {"role": "assistant", "content": partial}
+    assert "provider connection" in requests[1]["messages"][-1]["content"]
+    assert all(request["max_tokens"] == 32768 and request["reasoning_effort"] == "xhigh" for request in requests)
+    assert rows[0]["parsed_ok"] is False
+    assert rows[0]["finish_reason"] == "provider_interrupted"
+    assert rows[0]["extra"]["provider_finish_reason"] == "stop"
+    assert rows[1]["parsed_ok"] is True
+
+
+def test_provider_interruption_exhaustion_is_bounded_and_not_success(monkeypatch, tmp_path):
+    cfg, requests, rows = _mock_interrupted_generation(
+        monkeypatch, tmp_path, ["partial\n> Network error occurred"] * 3)
+    with pytest.raises(RuntimeError, match="bounded continuation"):
+        openai_backend.generate("Implement the complete task", cfg)
+    assert len(requests) == 3
+    assert all(row["parsed_ok"] is False for row in rows)
+
+
+def test_structured_interruption_is_never_returned_as_json(monkeypatch, tmp_path):
+    cfg, requests, rows = _mock_interrupted_generation(monkeypatch, tmp_path, ['{"score":\n> Network error occurred'])
+    with pytest.raises(RuntimeError, match="interrupted structured output"):
+        openai_backend.generate("Return the score", cfg, json_schema={"type": "object"})
+    assert len(requests) == 1
+    assert rows[0]["parsed_ok"] is False
+
+
+def test_continuation_thinking_does_not_erase_preceding_code(monkeypatch, tmp_path):
+    partial = '```python\ndef predict():\n    marker = "</think>"\n'
+    cfg, requests, _ = _mock_interrupted_generation(monkeypatch, tmp_path,
+        [partial + "> Network error occurred", "<think>Continue the function.</think>    return marker\n```"])
+    assert openai_backend.generate("Implement predict", cfg) == partial + "    return marker\n```"
+    assert requests[1]["messages"][-2]["content"] == partial

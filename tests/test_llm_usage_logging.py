@@ -134,3 +134,25 @@ def test_mixed_deepseek_models_are_priced_per_call_model(tmp_path):
     assert brief["model"] == "mixed"
     assert brief["models"] == summary["models"]
     assert brief["top_prompts_by_estimated_cost"][0]["models"] == summary["models"]
+
+
+def test_zero_reported_input_is_unknown_and_does_not_pollute_cache_ratio(tmp_path):
+    cfg = SimpleNamespace(log_dir=tmp_path)
+    for tokens, cached in [(100, 80), (0, 10)]:
+        row = log_llm_usage(
+            cfg=cfg, prompt_name="generation", mode="generate_stream", provider="openai_compatible",
+            model="gpt-5.6-luna", usage={"prompt_tokens": tokens, "completion_tokens": 12,
+                                       "prompt_tokens_details": {"cached_tokens": cached}},
+            prompt_parts=[{"name": "task", "role": "user", "content": "A real nonempty task context"}],
+        )
+    assert row["prompt_tokens"] == 0
+    assert row["estimated_prompt_tokens"] > 0
+    assert row["prompt_usage_available"] is False
+    assert row["provider_cache_tokens_known"] is False
+    assert row["raw_usage"]["prompt_tokens_details"]["cached_tokens"] == 10
+    summary = json.loads((tmp_path / "llm_usage_summary.json").read_text(encoding="utf-8"))
+    assert summary["provider_usage_missing_calls"] == 1
+    assert summary["completion_tokens"] == 24
+    assert summary["prompt_cache_hit_tokens"] == 80
+    assert summary["provider_cache_hit_ratio"] is None
+    assert summary["known_provider_cache_hit_ratio"] == .8

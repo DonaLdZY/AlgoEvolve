@@ -14,6 +14,7 @@ from dataclasses_json import DataClassJsonMixin
 from engine.executor import ExecutionResult
 from config import SearchConfig
 from utils.metric import MetricValue
+from utils.evaluation_protocol import extract_evaluation_protocol
 from utils.response import trim_long_string
 
 logger = logging.getLogger("AlgoEvolve")
@@ -33,6 +34,7 @@ class SearchNode(DataClassJsonMixin):
     id: str = field(default_factory=lambda: uuid.uuid4().hex, kw_only=True)
     ctime: float = field(default_factory=lambda: time.time(), kw_only=True)
     parent: Optional["SearchNode"] = field(default=None, kw_only=True)
+    fusion_sources: list[str] = field(default_factory=list, kw_only=True)
     children: set["SearchNode"] = field(default_factory=set, kw_only=True)
 
     # ---- execution info ----
@@ -46,6 +48,7 @@ class SearchNode(DataClassJsonMixin):
     analysis: str = field(default=None, kw_only=True)  # type: ignore
     parser_analysis: str | None = field(default=None, kw_only=True)
     decision_signals: dict | None = field(default=None, kw_only=True)
+    evaluation_protocol: dict = field(default_factory=dict, kw_only=True)
     llm_insight: str | None = field(default=None, kw_only=True)
     metric: MetricValue = field(default=None, kw_only=True)  # type: ignore
     is_buggy: bool = field(default=None, kw_only=True)  # type: ignore
@@ -66,7 +69,9 @@ class SearchNode(DataClassJsonMixin):
     expansion_operator: str = field(default="unknown", kw_only=True)
     solution_interface: str = field(default="", kw_only=True)
     preflight_report: dict | None = field(default=None, kw_only=True)
+    preexecution_review_warnings: list[str] = field(default_factory=list, kw_only=True)
     review_verdict: str = field(default="", kw_only=True)
+    output_scope: str = field(default="unknown", kw_only=True)
     review_reason_codes: list[str] = field(default_factory=list, kw_only=True)
     review_confidence: float | None = field(default=None, kw_only=True)
 
@@ -124,6 +129,10 @@ class SearchNode(DataClassJsonMixin):
     def absorb_exec_result(self, exec_result: ExecutionResult):
         """Absorb the result of executing the code from this node."""
         self._term_out = exec_result.term_out
+        self.evaluation_protocol = {
+            **{key: value for key, value in self.evaluation_protocol.items() if key.startswith("expected_")},
+            **extract_evaluation_protocol(exec_result.term_out),
+        }
         self.exec_time = exec_result.exec_time
         self.exc_type = exec_result.exc_type
         self.exc_info = exec_result.exc_info
@@ -154,6 +163,8 @@ class SearchNode(DataClassJsonMixin):
                 "Result evidence (candidate-reported fields are untrusted): "
                 f"{trim_long_string(signals, threshold=1200, k=600)}"
             )
+        if self.evaluation_protocol:
+            parts.append("Evaluation protocol metadata: " + json.dumps(self.evaluation_protocol, ensure_ascii=False, sort_keys=True))
         if self.llm_insight:
             parts.append(f"LLM insight: {trim_long_string(str(self.llm_insight), threshold=900, k=450)}")
         return "\n".join(parts) if parts else "N/A"

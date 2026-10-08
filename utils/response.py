@@ -45,23 +45,29 @@ def trim_long_string(string, threshold=5100, k=2500):
 
 
 def extract_code(text):
+    """Extract complete scripts, including Markdown fences inside Python strings."""
+    if is_valid_python_script(text):
+        return format_code(text)
+    if "```" not in text:
+        return ""
+
+    opening = re.compile(r"(?<!`)(`{3,})(?:python3?|py)?[ \t]*\r?\n", re.IGNORECASE)
     parsed_codes = []
-
-    matches = re.findall(r"```(python)?\n*(.*?)\n*```", text, re.DOTALL)
-    for match in matches:
-        code_block = match[1]
-        parsed_codes.append(code_block)
-
-    if len(parsed_codes) == 0:
-        matches = re.findall(r"^(```(python)?)?\n?(.*?)\n?(```)?$", text, re.DOTALL)
-        if matches:
-            code_block = matches[0][2]
-            parsed_codes.append(code_block)
-
-    valid_code_blocks = [
-        format_code(c) for c in parsed_codes if is_valid_python_script(c)
-    ]
-    return format_code("\n\n".join(valid_code_blocks))
+    position = 0
+    while match := opening.search(text, position):
+        closing = re.compile(r"^[ \t]*`{" + str(len(match[1])) + r",}[ \t]*\r?$", re.MULTILINE)
+        # An apparent fence may belong to a README inside a triple-quoted
+        # string. Accept a boundary only when the complete prefix compiles.
+        for end in closing.finditer(text, match.end()):
+            candidate = text[match.end():end.start()].strip()
+            if candidate and is_valid_python_script(candidate):
+                parsed_codes.append(candidate)
+                position = end.end()
+                break
+        else:
+            return ""
+    code = "\n\n".join(parsed_codes)
+    return format_code(code) if code and is_valid_python_script(code) else ""
 
 
 def extract_text_up_to_code(s):

@@ -24,7 +24,7 @@ def test_commented_default_yaml_matches_runtime_schema() -> None:
     assert merged.agent.search.num_drafts == 8
     assert merged.agent.search.num_improves == 5
     assert merged.agent.draft.fast_first_draft is True
-    assert merged.agent.draft.fast_first_draft_skip_pre_review is True
+    assert merged.agent.draft.fast_first_draft_skip_pre_review is False
     assert merged.agent.draft.fast_first_draft_max_repairs == 2
     assert merged.agent.draft.fast_first_draft_compact_context is False
     assert merged.exec.auto_install_missing_dependencies is True

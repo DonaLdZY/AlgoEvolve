@@ -195,7 +195,8 @@ def refine_plan_to_json(
         assistant_suffix=assistant_suffix,
     )
 
-    json_schema = build_planning_json_schema(allowed_modules)
+    from .base_planner import build_closed_planning_json_schema
+    json_schema = build_closed_planning_json_schema(allowed_modules)
     retry_cfg = getattr(agent_instance.acfg, "retries", None)
     max_retries = max(1, int(getattr(retry_cfg, "refine_plan_max_attempts", 3)))
     planning_result = None

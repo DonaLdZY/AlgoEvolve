@@ -27,13 +27,7 @@ def looks_same_context(task_desc: Any, data_preview: Any) -> bool:
     preview = _norm(data_preview)
     if not task or not preview:
         return False
-    if task == preview:
-        return True
-    # AutoRealize context may be regenerated with tiny trailing differences; use
-    # a conservative prefix/length check so we only suppress obvious duplicates.
-    if abs(len(task) - len(preview)) <= 128 and task[:4096] == preview[:4096]:
-        return True
-    return False
+    return task == preview
 
 
 def stable_data_context(task_desc: Any, data_preview: Any) -> str:

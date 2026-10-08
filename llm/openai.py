@@ -1,7 +1,9 @@
 """OpenAI-compatible API backend (query + generate). Supports Qwen API and any OpenAI-compatible endpoint."""
 
+import hashlib
 import json
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -18,6 +20,7 @@ from .model_profiles import (
     thinking_json_incompatible,
 )
 from .usage import (
+    estimate_text_tokens,
     infer_prompt_name,
     log_llm_usage,
     prompt_parts_from_messages,
@@ -40,14 +43,30 @@ TASK_CONTEXT_END_MARKER = "# End stable task/data context"
 
 
 def _strip_visible_thinking(text: str) -> str:
-    """Keep the old visible-output behavior while allowing internal raw continuations."""
-    if "</think>" in text:
-        return text[text.find("</think>") + 8:]
+    """Remove a leading provider thinking block without touching literals in code."""
+    thinking = re.match(r"\s*<think>.*?</think>", text, re.S)
+    if thinking:
+        return text[thinking.end():]
     return text
 
 
 def _finish_reason_is_length(finish_reason: str | None) -> bool:
     return str(finish_reason or "").strip().lower() in {"length", "max_tokens", "max_output_tokens"}
+
+
+def _normalize_stream_completion(text: str, finish_reason: str) -> tuple[str, str]:
+    # Some gateways append an error as answer text and incorrectly report stop.
+    marker = re.search(
+        r"(?m)^>[ \t]*(?:\u274c[ \t]*)?(?:\u7f51\u7edc\u51fa\u73b0\u5f02\u5e38|Network error occurred)[ \t\r\n]*\Z",
+        text,
+    )
+    if marker:
+        return text[:marker.start()], "provider_interrupted"
+    return text, finish_reason
+
+
+def _needs_continuation(finish_reason: str) -> bool:
+    return _finish_reason_is_length(finish_reason) or finish_reason == "provider_interrupted"
 
 
 def _finish_reason_is_resource_limited(finish_reason: str | None) -> bool:
@@ -69,11 +88,13 @@ def _append_with_overlap(
     return base + addition
 
 
-def _build_continuation_instruction(max_tokens: int | None, round_index: int) -> str:
+def _build_continuation_instruction(max_tokens: int | None, round_index: int, reason: str = "length") -> str:
     token_text = f"{max_tokens}" if max_tokens else "the provider/API default"
     return (
-        "Your previous assistant response was cut off because it reached the output token limit. "
-        "Continue exactly from the point where the previous assistant message stopped.\n"
+        ("Your previous assistant response was interrupted by the provider connection. "
+         if reason == "provider_interrupted" else
+         "Your previous assistant response was cut off because it reached the output token limit. ")
+        + "Continue exactly from the point where the previous assistant message stopped.\n"
         "- Do not repeat any previous text.\n"
         "- Do not restart the answer.\n"
         "- Start with the next character or token that should follow the previous assistant message.\n"
@@ -88,6 +109,7 @@ def _build_continuation_messages(
     *,
     max_tokens: int | None,
     round_index: int,
+    reason: str = "length",
 ) -> list[dict[str, Any]]:
     """Replay the original prompt plus the partial assistant output, then ask for only the tail."""
     messages = [dict(m) for m in original_messages]
@@ -100,7 +122,7 @@ def _build_continuation_messages(
     messages.append(
         {
             "role": "user",
-            "content": _build_continuation_instruction(max_tokens=max_tokens, round_index=round_index),
+            "content": _build_continuation_instruction(max_tokens=max_tokens, round_index=round_index, reason=reason),
         }
     )
     return messages
@@ -191,6 +213,16 @@ def _looks_like_task_prefixed_user(user_message: str | None) -> bool:
     return bool(str(user_message or "").lstrip().startswith("# Task description"))
 
 
+def _stable_task_section_end(user: str) -> int:
+    marker_index = user.find(TASK_CONTEXT_END_MARKER)
+    if marker_index >= 0:
+        return marker_index + len(TASK_CONTEXT_END_MARKER)
+    stripped_offset = len(user) - len(user.lstrip())
+    search_start = stripped_offset + len("# Task description")
+    match = re.search(r"\n# (?!#)", user[search_start:])
+    return search_start + match.start() if match else len(user)
+
+
 def _insert_after_task_section(user_message: str, section: str) -> str:
     """Put changing stage instructions after the stable task section.
 
@@ -204,20 +236,12 @@ def _insert_after_task_section(user_message: str, section: str) -> str:
     if not inserted.strip():
         return user
 
-    marker_index = user.find(TASK_CONTEXT_END_MARKER)
-    if marker_index >= 0:
-        split_at = marker_index + len(TASK_CONTEXT_END_MARKER)
-        return f"{user[:split_at].rstrip()}\n\n{inserted}\n\n{user[split_at:].lstrip()}"
-
-    stripped_offset = len(user) - len(user.lstrip())
-    search_start = stripped_offset + len("# Task description")
     # The AutoRealize context uses mostly "##" headings. The next top-level
     # section ("# Instructions", "# Implementation", etc.) is the safe point
     # where the stage-specific instructions can diverge.
-    match = re.search(r"\n# (?!#)", user[search_start:])
-    if not match:
+    split_at = _stable_task_section_end(user)
+    if split_at == len(user):
         return f"{user.rstrip()}\n\n{inserted}"
-    split_at = search_start + match.start()
     return f"{user[:split_at].rstrip()}\n\n{inserted}\n\n{user[split_at:].lstrip()}"
 
 
@@ -357,8 +381,20 @@ def _apply_deepseek_request_options(
     model: str,
     use_thinking: bool | None,
 ) -> None:
-    """Apply the current DeepSeek OpenAI-format thinking contract."""
+    """Apply configured effort and compatible provider routing options."""
+    cache_mode = os.environ.get("ALGOEVOLVE_PROMPT_CACHE_KEY_MODE", "auto").strip().lower()
+    official = (urlparse(str(getattr(stage, "base_url", "") or "")).hostname or "").lower() == "api.openai.com"
+    messages = params.get("messages", [])
+    if (cache_mode == "enabled" or (cache_mode == "auto" and official)) and _is_cache_friendly_message_layout(messages):
+        user = str(messages[1]["content"])
+        prefix = user[:_stable_task_section_end(user)].rstrip()
+        params["prompt_cache_key"] = "algoevolve:" + hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:32]
     if not is_deepseek_model(model):
+        effort = str(getattr(stage, "reasoning_effort", None) or "").strip().lower()
+        if effort and effort not in {"default", "none", "null"}:
+            params["reasoning_effort"] = effort
+            if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
+                params.pop("temperature", None)
         return
     thinking_active = use_thinking is not False
     if thinking_active:
@@ -427,6 +463,17 @@ def _create_with_retry(
     label: str,
     stage=None,
 ):
+    window = int(getattr(stage, "context_window_tokens", 0) or 0)
+    if window:
+        input_tokens = estimate_text_tokens(json.dumps(
+            {key: params[key] for key in ("messages", "tools", "response_format") if key in params},
+            ensure_ascii=False, default=str,
+        ))
+        remaining = window - input_tokens - int(window * 0.18)
+        requested = int(params.get("max_tokens") or 32768)
+        if remaining < min(requested, 32768):
+            raise ValueError(f"Complete request exceeds context budget: input={input_tokens}, window={window}")
+        params["max_tokens"] = min(requested, remaining)
     max_attempts = max(
         1,
         int(getattr(stage, "network_retry_max_attempts", NETWORK_RETRY_MAX_ATTEMPTS)),
@@ -442,7 +489,17 @@ def _create_with_retry(
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            completion = client.chat.completions.create(**params)
+            try:
+                completion = client.chat.completions.create(**params)
+            except Exception as exc:
+                message = str(exc).lower()
+                if "prompt_cache_key" not in params or "prompt_cache_key" not in message or not any(
+                    word in message for word in ("unsupported", "unknown", "unexpected", "unrecognized", "not permitted")
+                ):
+                    raise
+                params = {key: value for key, value in params.items() if key != "prompt_cache_key"}
+                logger.warning("%s provider rejected cache routing key; retrying without it", label)
+                completion = client.chat.completions.create(**params)
             choices = getattr(completion, "choices", None) or []
             finish_reason = str(getattr(choices[0], "finish_reason", "") or "") if choices else ""
             if is_deepseek_model(str(params.get("model", ""))) and _finish_reason_is_resource_limited(
@@ -530,13 +587,19 @@ def _collect_stream_response(
     full_text = ""
     final_usage: Any = None
     final_finish_reason = ""
+    chunks = 0
+    last_progress = time.monotonic()
     for chunk in stream:
+        chunks += 1
         if chunk.choices and chunk.choices[0].delta.content:
             full_text += chunk.choices[0].delta.content
         if getattr(chunk, "usage", None) is not None:
             final_usage = getattr(chunk, "usage", None)
         if chunk.choices and getattr(chunk.choices[0], "finish_reason", None):
             final_finish_reason = str(chunk.choices[0].finish_reason or "")
+        if time.monotonic() - last_progress >= 30:
+            logger.info("%s stream progress: chunks=%s output_chars=%s elapsed=%.1fs", label, chunks, len(full_text), time.time() - t0)
+            last_progress = time.monotonic()
     if is_deepseek_model(str(params.get("model", ""))) and _finish_reason_is_resource_limited(
         final_finish_reason
     ):
@@ -599,6 +662,7 @@ def query(
     client = OpenAI(
         api_key=stage.api_key,
         base_url=stage.base_url or None,
+        max_retries=0,
         timeout=max(1.0, float(getattr(stage, "request_timeout_seconds", 1200.0))),
     )
     messages = _build_messages(system_message, user_message)
@@ -677,7 +741,7 @@ def query(
             prompt_name=prompt_name,
             mode="query_text",
             provider="openai_compatible",
-            model=getattr(completion, "model", model),
+            model=model,
             response=completion,
             seconds=req_time,
             finish_reason=finish_reason,
@@ -702,7 +766,7 @@ def query(
                 prompt_name=prompt_name,
                 mode="query_function",
                 provider="openai_compatible",
-                model=getattr(completion, "model", model),
+                model=model,
                 response=completion,
                 seconds=req_time,
                 finish_reason=finish_reason,
@@ -720,7 +784,7 @@ def query(
                 prompt_name=f"{prompt_name}:tool_call_failed_content",
                 mode="query_function_unparsed",
                 provider="openai_compatible",
-                model=getattr(completion, "model", model),
+                model=model,
                 response=completion,
                 seconds=req_time,
                 finish_reason=finish_reason,
@@ -764,7 +828,7 @@ def query(
                 prompt_name=f"{prompt_name}:json_fallback",
                 mode="query_json_fallback",
                 provider="openai_compatible",
-                model=getattr(completion, "model", model),
+                model=model,
                 response=completion,
                 seconds=fallback_seconds,
                 finish_reason=str(getattr(fallback_choice, "finish_reason", "") or ""),
@@ -805,6 +869,8 @@ def _prompt_to_messages(
     prompt: str | dict | list,
     model: str = "",
     base_url: str = "",
+    *,
+    structured_output: bool = False,
 ) -> list[dict[str, Any]]:
     """Convert prompt to chat messages. Supports Qwen/OpenAI chat format: {system, user, assistant}.
 
@@ -827,7 +893,8 @@ def _prompt_to_messages(
         if not messages:
             raise ValueError("Chat message list must contain at least one non-empty message")
         if (
-            is_deepseek_model(model)
+            not structured_output
+            and is_deepseek_model(model)
             and _is_deepseek_beta_base_url(base_url)
             and messages[-1].get("role") == "assistant"
         ):
@@ -857,7 +924,7 @@ def _prompt_to_messages(
             messages.append({"role": "user", "content": user_content})
         if assistant_content and not is_gpt:
             assistant_message: dict[str, Any] = {"role": "assistant", "content": assistant_content}
-            if use_deepseek_prefix:
+            if use_deepseek_prefix and not structured_output:
                 assistant_message["prefix"] = True
             messages.append(assistant_message)
 
@@ -881,10 +948,16 @@ def generate(
     """Streaming text generation via OpenAI-compatible Chat API. Supports chat format {system, user, assistant} for Qwen."""
     stage = cfg.agent.code
     model = stage.model
-    messages = _prompt_to_messages(prompt, model=model, base_url=stage.base_url)
+    messages = _prompt_to_messages(
+        prompt,
+        model=model,
+        base_url=stage.base_url,
+        structured_output=json_schema is not None,
+    )
     client = OpenAI(
         api_key=stage.api_key,
         base_url=stage.base_url or None,
+        max_retries=0,
         timeout=max(1.0, float(getattr(stage, "request_timeout_seconds", 1200.0))),
     )
     max_retries = max(
@@ -990,8 +1063,10 @@ def generate(
                 label="generate_stream",
                 stage=stage,
             )
+            logger.info(f"generate response: {_strip_visible_thinking(raw_full_text)}", extra={"verbose": True})
+            provider_finish_reason = final_finish_reason
+            raw_full_text, final_finish_reason = _normalize_stream_completion(raw_full_text, final_finish_reason)
             full_text = _strip_visible_thinking(raw_full_text)
-            logger.info(f"generate response: {full_text}", extra={"verbose": True})
             prompt_name = infer_prompt_name("generate")
             log_llm_usage(
                 cfg=cfg,
@@ -1003,7 +1078,7 @@ def generate(
                 seconds=elapsed,
                 finish_reason=final_finish_reason,
                 max_tokens=params.get("max_tokens"),
-                parsed_ok=True,
+                parsed_ok=not _needs_continuation(final_finish_reason),
                 prompt_parts=prompt_parts_from_messages(messages)
                 + (
                     [
@@ -1017,7 +1092,8 @@ def generate(
                     else []
                 ),
                 estimated_completion_text=full_text,
-                extra={"usage_estimated_when_missing": not bool(usage_to_dict(final_usage))},
+                extra={"usage_estimated_when_missing": not bool(usage_to_dict(final_usage)),
+                       "provider_finish_reason": provider_finish_reason},
             )
             if _finish_reason_is_length(final_finish_reason) and json_schema is not None:
                 logger.warning(
@@ -1025,16 +1101,18 @@ def generate(
                 )
 
             allow_continuation = json_schema is None
+            if not allow_continuation and final_finish_reason == "provider_interrupted":
+                raise RuntimeError("Provider network error interrupted structured output")
             continuation_round = 0
             while (
                 allow_continuation
-                and _finish_reason_is_length(final_finish_reason)
+                and _needs_continuation(final_finish_reason)
                 and continuation_round < max_continuation_rounds
             ):
                 continuation_round += 1
                 logger.warning(
-                    "generate response truncated by max_tokens (%s); requesting continuation round %s/%s",
-                    params.get("max_tokens"),
+                    "generate response incomplete (%s); requesting continuation round %s/%s",
+                    final_finish_reason,
                     continuation_round,
                     max_continuation_rounds,
                 )
@@ -1043,6 +1121,7 @@ def generate(
                     raw_full_text,
                     max_tokens=params.get("max_tokens"),
                     round_index=continuation_round,
+                    reason=final_finish_reason,
                 )
                 continuation_params = dict(params)
                 continuation_params["messages"] = continuation_messages
@@ -1052,6 +1131,9 @@ def generate(
                     label=f"generate_stream_continuation_{continuation_round}",
                     stage=stage,
                 )
+                provider_finish_reason = final_finish_reason
+                continuation_text, final_finish_reason = _normalize_stream_completion(continuation_text, final_finish_reason)
+                continuation_text = _strip_visible_thinking(continuation_text)
                 raw_full_text = _append_with_overlap(
                     raw_full_text,
                     continuation_text,
@@ -1068,15 +1150,18 @@ def generate(
                     seconds=continuation_elapsed,
                     finish_reason=final_finish_reason,
                     max_tokens=params.get("max_tokens"),
-                    parsed_ok=True,
+                    parsed_ok=not _needs_continuation(final_finish_reason),
                     prompt_parts=prompt_parts_from_messages(continuation_messages),
                     estimated_completion_text=_strip_visible_thinking(continuation_text),
                     extra={
                         "usage_estimated_when_missing": not bool(usage_to_dict(continuation_usage)),
                         "continuation_round": continuation_round,
+                        "provider_finish_reason": provider_finish_reason,
                     },
                 )
-            if allow_continuation and _finish_reason_is_length(final_finish_reason):
+            if allow_continuation and _needs_continuation(final_finish_reason):
+                if final_finish_reason == "provider_interrupted":
+                    raise RuntimeError("Provider interruption persisted after the bounded continuation attempts")
                 logger.warning(
                     "generate response still truncated after %s continuation round(s); returning partial output",
                     continuation_round,

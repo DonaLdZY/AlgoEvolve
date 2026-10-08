@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from config import save_run
 from engine.journal_snapshot import JournalSnapshot
+from engine.journal_snapshot import NodeSnapshot
 from engine.search_node import Journal, SearchNode, filter_on_path
 from utils.metric import MetricValue
 from utils.serialize import dumps_json, loads_json
@@ -66,6 +67,18 @@ def test_snapshot_ignores_runtime_only_dynamic_attributes() -> None:
     assert "runtime_lock" not in serialized
     assert "runtime_callback" not in serialized
     assert "runtime_context" not in serialized
+
+
+def test_output_scope_round_trip_and_legacy_default() -> None:
+    node = SearchNode(code="", stage="draft", output_scope="development_validation_only",
+                      search_eligible=True, delivery_ready=False)
+    payload = NodeSnapshot.from_node(node).to_payload()
+    restored = NodeSnapshot.from_payload(payload).to_node()
+    assert restored.output_scope == "development_validation_only"
+    assert restored.search_eligible is True
+    assert restored.delivery_ready is False
+    payload.pop("output_scope")
+    assert NodeSnapshot.from_payload(payload).to_node().output_scope == "unknown"
 
 
 def test_snapshot_round_trip_rebuilds_graph_metrics_and_locks() -> None:

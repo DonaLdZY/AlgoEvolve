@@ -7,6 +7,7 @@ from typing import Any, Optional
 from llm import compile_prompt_to_md
 from engine.search_node import SearchNode
 from agents.coder import plan_and_code_query, stepwise_plan_and_code_query
+from agents.coder.recovery import recover_first_draft
 from agents.triggers import register_node
 from agents.prompts import (
     ROBUSTNESS_GENERALIZATION_STRATEGY,
@@ -283,7 +284,10 @@ def run(
     )
     agent.virtual_root.add_expected_child_count()
 
-    if use_stepwise_generation and expansion_profile.complexity != "simple":
+    recovered = recover_first_draft(agent, prompt_complete)
+    if recovered is not None:
+        plan, code = recovered
+    elif use_stepwise_generation and expansion_profile.complexity != "simple":
         plan, code = stepwise_plan_and_code_query(
             agent_instance=agent,
             prompt_base=prompt,

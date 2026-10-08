@@ -2,6 +2,7 @@
 
 import shutil
 import logging
+import math
 import json
 import os
 import re
@@ -12,9 +13,10 @@ from pathlib import Path
 from typing import List
 
 from engine.model_artifacts import find_model_artifacts
+from engine.node_workspace import node_workspace, copy_node_outputs
 from engine.search_node import SearchNode
 from engine.solution_protocol import interface_for, solution_manifest
-from agents.prompt_policy import infer_task_family
+from agents.prompt_policy import infer_task_family, method_family_for_node
 
 logger = logging.getLogger("AlgoEvolve")
 
@@ -75,6 +77,12 @@ def write_metric_file(filepath, node, metric_maximize: bool) -> None:
 def copy_model_artifacts(agent, node: SearchNode, target_dir) -> None:
     """Copy node-specific model artifacts into a solution directory."""
     artifacts = find_model_artifacts(agent.cfg.workspace_dir, str(node.id))
+    isolated = node_workspace(agent.cfg.workspace_dir, node.id)
+    if isolated.is_dir():
+        runtime_dir = target_dir / "runtime"
+        if runtime_dir.exists():
+            shutil.rmtree(runtime_dir)
+        copy_node_outputs(isolated, runtime_dir)
     artifacts_dir = target_dir / "model_artifacts"
     if artifacts_dir.exists():
         shutil.rmtree(artifacts_dir)
@@ -86,9 +94,11 @@ def copy_model_artifacts(agent, node: SearchNode, target_dir) -> None:
     manifest_lines = []
     for src in artifacts:
         try:
-            dst = artifacts_dir / src.name
+            relative = src.relative_to(isolated) if isolated.is_dir() else src.relative_to(agent.cfg.workspace_dir)
+            dst = artifacts_dir / relative
+            dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-            manifest_lines.append(f"- {src.name} <- {src}")
+            manifest_lines.append(f"- {relative.as_posix()} <- {src}")
         except Exception as e:
             logger.error(f"Failed to copy model artifact for node {node.id}: {src} -> {e}")
     if manifest_lines:
@@ -96,17 +106,19 @@ def copy_model_artifacts(agent, node: SearchNode, target_dir) -> None:
             "# Model Artifacts\n\n" + "\n".join(manifest_lines) + "\n",
             encoding="utf-8",
         )
-        primary = artifacts_dir / artifacts[0].name
-        (target_dir / "model_path.txt").write_text(str(primary), encoding="utf-8")
+        binary = [path for path in artifacts if path.suffix.lower() not in {".json", ".yaml", ".yml", ".txt"}]
+        primary_source = (binary or artifacts)[0]
+        base = isolated if isolated.is_dir() else agent.cfg.workspace_dir
+        primary = artifacts_dir / primary_source.relative_to(base)
+        (target_dir / "model_path.txt").write_text(primary.relative_to(target_dir).as_posix(), encoding="utf-8")
 
 
 def write_solution_manifest(agent, node: SearchNode, target_dir: Path) -> dict:
     """Write the finite cross-system interface contract next to exported code."""
 
-    interface = interface_for(
-        task_family=infer_task_family(agent),
-        method_family=str(getattr(node, "method_family", "unknown") or "unknown"),
-    )
+    task_family = infer_task_family(agent)
+    method_family = method_family_for_node(node, task_family=task_family)
+    interface = interface_for(task_family=task_family, method_family=method_family)
     model_path_file = target_dir / "model_path.txt"
     artifact_path = (
         model_path_file.read_text(encoding="utf-8").strip()
@@ -117,8 +129,10 @@ def write_solution_manifest(agent, node: SearchNode, target_dir: Path) -> dict:
         interface,
         artifact_path=artifact_path or None,
         node_id=str(node.id),
-        method_family=str(getattr(node, "method_family", "unknown") or "unknown"),
+        method_family=method_family,
     )
+    payload["evaluation_protocol"] = dict(getattr(node, "evaluation_protocol", {}) or {})
+    payload["fusion_sources"] = list(getattr(node, "fusion_sources", []) or [])
     (target_dir / "solution_manifest.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -477,7 +491,17 @@ def get_branch_top_nodes(agent, branch_id: int, top_k: int = 3) -> List[SearchNo
         logger.info(f"Branch {branch_id} has no successful nodes")
         return []
 
-    successful_nodes = agent.branch_successful_nodes[branch_id]
+    maximize = agent.metric_maximize
+    successful_nodes = [
+        node for node in agent.branch_successful_nodes[branch_id]
+        if getattr(node, "search_eligible", False)
+        and getattr(node, "is_buggy", None) is False
+        and getattr(node, "is_valid", None) is not False
+        and node.metric is not None
+        and node.metric.value is not None
+        and math.isfinite(float(node.metric.value))
+        and (maximize is None or node.metric.maximize in {None, maximize})
+    ]
 
     if not successful_nodes:
         logger.info(f"Branch {branch_id} has no successful nodes")
@@ -492,7 +516,7 @@ def get_branch_top_nodes(agent, branch_id: int, top_k: int = 3) -> List[SearchNo
         reverse=maximize
     )
 
-    result = sorted_nodes[:top_k]
+    result = sorted_nodes[:max(0, top_k)]
 
     logger.info(f"Branch {branch_id}: found {len(successful_nodes)} successful nodes, returning top {len(result)}")
     for i, node in enumerate(result):

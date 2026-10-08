@@ -54,6 +54,8 @@ pretrain_model_dir: ""
 
 # Generated-code execution / 生成代码执行
 exec:
+  # Isolate every candidate's working files, not only model filenames.
+  isolate_node_workspaces: true
   # Per-node code execution timeout seconds / 单节点代码执行超时秒数
   timeout: 1800
   # Base generated-script filename / 生成脚本基础文件名
@@ -166,7 +168,8 @@ exec:
 agent:
   # Language for model-authored plans, reviews, debug hints, summaries, and UI insight: english|chinese
   output_language: "english"
-  # Maximum search nodes/steps / 最大搜索节点或步数
+  # Maximum nodes and remaining action submissions per launch; failed generation consumes an action.
+  # 最大搜索节点/动作预算；生成失败也消耗动作次数，继续搜索可追加预算。
   steps: 50
   # Whole-search wall-clock limit seconds / 整体搜索时限秒数
   time_limit: 10800
@@ -263,7 +266,7 @@ agent:
     # First draft uses one LLM code call / 第一个草稿是否使用单次快速生成
     fast_first_draft: true
     # Run first, then review only when runtime evidence requires it / 首稿先运行，只有运行证据需要时才评审
-    fast_first_draft_skip_pre_review: true
+    fast_first_draft_skip_pre_review: false
     # Deprecated compatibility field; used only by the legacy coupled scheduler / 兼容旧配置；仅旧版耦合调度器使用
     fast_first_draft_max_repairs: 2
     # Deprecated compatibility field; full context is always used / 兼容旧配置；当前始终使用完整上下文
@@ -291,6 +294,9 @@ agent:
 
   # Agent-level review and structured-output retries / Agent 评审与结构化输出重试
   retries:
+    # strict rejects a candidate when LLM review is exhausted; continue_on_exhaustion
+    # records the finding and relies on mandatory deterministic preflight before execution
+    review_gate_policy: "strict"
     # Maximum role-level review attempts; network retries are handled separately / 审查模型角色级最大尝试次数，网络重试单独处理
     code_review_max_attempts: 2
     # Full same-node regenerations after deterministic preflight still rejects review patches / 确定性预检查仍拒绝补丁后，同节点整稿重生次数

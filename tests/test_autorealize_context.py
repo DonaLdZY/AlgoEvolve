@@ -11,6 +11,12 @@ _CTX = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_CTX)
 
 
+def test_task_description_preserves_requirements_after_30000_characters(tmp_path):
+    description = "Task detail. " * 3000 + "FINAL_MANDATORY_RULE"
+    (tmp_path / "description.md").write_text(description, encoding="utf-8")
+    assert _CTX.load_autorealize_description_md(tmp_path) == description
+
+
 def test_short_autorealize_stub_is_not_prompt_ready(tmp_path: Path) -> None:
     (tmp_path / "autorealize_context.md").write_text(
         "## AutoRealize Structured Context\n\n- problem_paradigm: unknown_but_executable\n",
@@ -19,6 +25,21 @@ def test_short_autorealize_stub_is_not_prompt_ready(tmp_path: Path) -> None:
 
     assert _CTX.has_autorealize_context(tmp_path) is False
     assert _CTX.build_autorealize_context_md(tmp_path, write_context_file=False) == ""
+
+
+def test_json_only_handoff_preserves_large_contracts(tmp_path):
+    pack = {"task_goal": "predict", "data_access": [{"path": "data.csv"}],
+            "evaluation_contract": {"primary_metric": "MAE", "metric_direction": "minimize",
+                "leakage_guards": [f"Do not use future field {i}" for i in range(65)],
+                "validation_protocol": "Precise rule. " * 300 + "LAST_SPLIT_CONDITION"},
+            "output_contract": {"columns": [f"output_{i}" for i in range(150)]},
+            "constraints": [f"Constraint {i}: " + "detail " * 150 + f"END_{i}" for i in range(80)]}
+    (tmp_path / "automl_context_pack.json").write_text(json.dumps(pack), encoding="utf-8")
+    text = _CTX.build_autorealize_context_md(tmp_path, write_context_file=False)
+    assert "Do not use future field 64" in text
+    assert "LAST_SPLIT_CONDITION" in text
+    assert "output_149" in text
+    assert "END_79" in text
 
 
 def test_autorealize_markdown_context_is_used_directly(tmp_path: Path) -> None:

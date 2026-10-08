@@ -5,9 +5,10 @@ Python interpreter for executing code snippets via subprocess.
 - Supports multiple parallel slots (max_parallel_run) with CPU pinning.
 """
 
+import ast
 import logging
 import os
-import signal
+import shutil
 import sys
 import threading
 import time
@@ -22,6 +23,31 @@ import psutil
 from dataclasses_json import DataClassJsonMixin
 
 from engine.dependency_installer import DependencyInstaller, find_unsafe_installation_call
+from utils.resource_limits import terminate_process_tree
+from utils.runtime_threads import candidate_thread_environment
+
+
+def insert_runtime_prelude(code: str, prelude: str) -> str:
+    if not prelude:
+        return code
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    insertion_line = 0
+    for index, statement in enumerate(tree.body):
+        if (index == 0 and isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str)):
+            insertion_line = statement.end_lineno
+        elif isinstance(statement, ast.ImportFrom) and statement.module == "__future__":
+            insertion_line = statement.end_lineno
+        else:
+            break
+    lines = code.splitlines(keepends=True)
+    prefix = "".join(lines[:insertion_line])
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + prelude.rstrip() + "\n" + "".join(lines[insertion_line:])
 
 
 def memory_limited_subprocess_command(
@@ -88,6 +114,7 @@ class Interpreter:
         timeout: int = 3600,
         agent_file_name: str = "runfile.py",
         max_parallel_run: int = 3,
+        isolate_node_workspaces: bool = False,
         cfg=None,
         **kwargs,
     ):
@@ -104,6 +131,7 @@ class Interpreter:
         self.working_dir = Path(working_dir).resolve()
         assert self.working_dir.exists(), f"Working directory {self.working_dir} does not exist"
         self.timeout = timeout
+        self.isolate_node_workspaces = isolate_node_workspaces
         configured_parallel_run = (
             cfg.agent.search.parallel_search_num if (cfg and getattr(cfg.agent.search, "parallel_search_num", None)) else max_parallel_run
         )
@@ -126,6 +154,8 @@ class Interpreter:
         self._procs_lock = threading.Lock()
         self._active_procs: dict[int, subprocess.Popen] = {}
         self.dependency_installer = DependencyInstaller(cfg)
+        from utils.accelerator_runtime import AcceleratorExecutionGuard
+        self.accelerator_guard = AcceleratorExecutionGuard()
 
     def _available_cpus(self) -> list[int]:
         """Return the CPU ids available to this process on the current platform."""
@@ -174,6 +204,7 @@ class Interpreter:
 
     def terminate_all_subprocesses(self) -> None:
         """Terminate all active subprocesses (for graceful Ctrl+C exit)."""
+        self.accelerator_guard.close()
         with self._procs_lock:
             procs = list(self._active_procs.items())
             self._active_procs.clear()
@@ -293,7 +324,7 @@ class Interpreter:
         """Clean up resources for the given process slot."""
         pass
 
-    def run(self, code: str, id, reset_session=True, working_dir: str | None = None):
+    def run(self, code: str, id, reset_session=True, working_dir: str | None = None, *, allow_dependency_retry: bool = True):
         """
         Execute the provided Python command in a subprocess and return its output.
 
@@ -318,9 +349,20 @@ class Interpreter:
                 exc_info={"message": unsafe_install},
                 exc_stack=[],
             )
-        return self._run_subprocess(code=code, id=id, working_dir=working_dir)
+        isolated_run = working_dir is None and self.isolate_node_workspaces
+        if isolated_run:
+            from engine.node_workspace import prepare_node_workspace
+            working_dir = str(prepare_node_workspace(self.working_dir, id))
+        with self.accelerator_guard.admission():
+            result = self._run_subprocess(code=code, id=id, working_dir=working_dir, allow_dependency_retry=allow_dependency_retry)
+        if isolated_run:
+            local_submission = Path(working_dir) / f"submission_{id}.csv"
+            shared_submission = self.working_dir / "submission" / local_submission.name
+            if local_submission.is_file() and not shared_submission.exists():
+                shutil.copy2(local_submission, shared_submission)
+        return result
 
-    def _run_subprocess(self, code: str, id, working_dir: str | None = None):
+    def _run_subprocess(self, code: str, id, working_dir: str | None = None, *, allow_dependency_retry: bool = True):
         """
         Execute code via subprocess (avoids CUDA fork issues).
         Aligned with multiprocessing mode for consistency.
@@ -347,10 +389,10 @@ class Interpreter:
         
         try:
             avail_cpus = self._available_cpus()
-            cpu_set = set(avail_cpus[process_id::self.max_parallel_run])
+            cpu_set = set(avail_cpus if self.accelerator_guard.enabled else avail_cpus[process_id::self.max_parallel_run])
             if not cpu_set and avail_cpus:
                 cpu_set = {avail_cpus[process_id % len(avail_cpus)]}
-            pre_code = self._build_affinity_pre_code(cpu_set)
+            pre_code = self._build_affinity_pre_code(cpu_set) + self.accelerator_guard.runtime_prelude()
             if pre_code:
                 logger.info(f"Set process_id:{process_id} to prefer cpu: {cpu_set}")
             else:
@@ -360,7 +402,7 @@ class Interpreter:
 
             code = self.isolate_submission_path(code=code, _id=id)
             code = self.isolate_model_path(code=code, _id=id)
-            code = pre_code + code
+            code = insert_runtime_prelude(code, pre_code)
 
             # decide runfile location and cwd
             run_wd = Path(working_dir).resolve() if working_dir is not None else self.working_dir
@@ -388,25 +430,27 @@ class Interpreter:
                     text=True,
                     bufsize=1,
                     env=self.dependency_installer.execution_environment(
-                        {**os.environ, "PYTHONUNBUFFERED": "1"}
+                        candidate_thread_environment({**os.environ, "PYTHONUNBUFFERED": "1"})
                     ),
                 )
                 with self._procs_lock:
                     self._active_procs[process_id] = proc
                 try:
-                    stdout, stderr = proc.communicate(timeout=self.timeout)
+                    with self.accelerator_guard.monitor(proc) as gpu_pressure:
+                        stdout, stderr = proc.communicate(timeout=self.timeout)
+                    if gpu_pressure:
+                        stderr = (stderr or "") + "\n" + gpu_pressure[0]
+                    if self.accelerator_guard.observe_failure(proc.returncode, stderr):
+                        logger.warning("Memory allocation failed; shared candidate execution reduced to one")
                     exec_time = time.time() - start_time
                 except subprocess.TimeoutExpired:
-                    logger.warning("Subprocess timeout, sending SIGINT...")
+                    logger.warning("Subprocess timeout, terminating candidate process tree...")
+                    terminate_process_tree(proc.pid, grace_seconds=1.0)
                     try:
-                        proc.send_signal(signal.SIGINT)
                         stdout, stderr = proc.communicate(timeout=2)
                     except subprocess.TimeoutExpired:
-                        logger.warning(
-                            "Subprocess failed to terminate after SIGINT, killing..."
-                        )
                         proc.kill()
-                        stdout, stderr = proc.communicate()
+                        stdout, stderr = proc.communicate(timeout=2)
                     exec_time = time.time() - start_time
                     exc_type = "TimeoutError"
                     exc_info = {}
@@ -416,7 +460,7 @@ class Interpreter:
                     with self._procs_lock:
                         self._active_procs.pop(process_id, None)
 
-                if proc.returncode != 0:
+                if proc.returncode != 0 and allow_dependency_retry:
                     recovery = self.dependency_installer.maybe_recover(
                         code=code,
                         stderr=stderr or "",

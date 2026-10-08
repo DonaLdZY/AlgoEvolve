@@ -14,6 +14,20 @@ import yaml
 from fastapi import HTTPException
 
 import service_api
+
+
+def test_concurrent_jobs_reserve_different_available_cores(monkeypatch):
+    monkeypatch.setattr("utils.resource_limits.available_cpu_ids", lambda: list(range(18)))
+    store = service_api.JobStore()
+    first = store.create("first", "logs1", "work1", resource_limits={"cpu_cores": 8})
+    second = store.create("second", "logs2", "work2", resource_limits={"cpu_cores": 8})
+    assert first.assigned_cpu_ids == list(range(8))
+    assert second.assigned_cpu_ids == list(range(8, 16))
+    store.update(first.job_id, status="completed")
+    third = store.create("third", "logs3", "work3", resource_limits={"cpu_cores": 8})
+    assert third.assigned_cpu_ids == list(range(8))
+
+
 from engine.executor import Interpreter, memory_limited_subprocess_command
 from service_api import (
     JobStore,
@@ -608,3 +622,23 @@ def test_memory_fallback_stops_child_but_preserves_controller(tmp_path: Path, mo
     assert status.resource_warning is not None
     assert "AlgoEvolve controller continues" in status.resource_warning
     assert status.peak_memory_bytes > int(0.03 * (1024**3))
+
+
+def test_process_tree_can_still_stop_root_when_windows_process_scan_runs_out_of_memory(monkeypatch):
+    from utils import resource_limits
+    class Root:
+        pid = 123
+        def children(self, recursive=False):
+            raise OSError(1455, "The paging file is too small")
+    root = Root()
+    monkeypatch.setattr(resource_limits.psutil, "Process", lambda pid: root)
+    assert resource_limits._process_tree(123) == [root]
+
+
+def test_windows_commit_snapshot_is_available_without_starting_a_helper_process():
+    from utils.resource_limits import host_commit_available_bytes
+    available = host_commit_available_bytes()
+    if sys.platform == "win32":
+        assert isinstance(available, int) and available > 0
+    else:
+        assert available is None

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from agents import code_review_agent
 from engine.search_node import SearchNode
 
@@ -64,3 +66,46 @@ def test_unpatchable_feedback_review_escalates_once(monkeypatch) -> None:
 
     assert code == "print(1)"
     assert [call["stage_name"] for call in calls] == ["feedback", "code"]
+
+
+@pytest.mark.parametrize("response", [
+    {}, {"needs_revision": "false"},
+    {"needs_revision": True, "reasoning": "Holdout accessed", "revised_code": None},
+    {"needs_revision": True, "revised_code": "print(2)"},
+    {"needs_revision": True, "revised_code": (
+        "<<<<<<< SEARCH\nprint(1)\n=======\nprint(2)\n>>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\nmissing_code()\n=======\nfixed()\n>>>>>>> REPLACE\n")},
+])
+def test_unresolved_review_never_returns_executable_original(monkeypatch, response):
+    monkeypatch.setattr(code_review_agent, "query", lambda **kwargs: response)
+    with pytest.raises(code_review_agent.CodeReviewFailed):
+        code_review_agent.run(_agent(), _node())
+
+
+def test_review_provider_failure_blocks_candidate(monkeypatch):
+    def fail(**kwargs):
+        raise TimeoutError("provider unavailable")
+    monkeypatch.setattr(code_review_agent, "query", fail)
+    with pytest.raises(code_review_agent.CodeReviewFailed):
+        code_review_agent.run(_agent(), _node())
+
+
+def test_focused_repair_preserves_features_globals_and_evaluator():
+    source = "CONFIG = 1\ndef features(data): return data * 2\ndef train(data, artifact_dir): return None\n"
+    fixed = source.replace("return None", "return artifact_dir")
+    assert code_review_agent.validate_review_edit_scope(source, fixed, ["train"]) == fixed
+    for mutation in (fixed.replace("data * 2", "data"), fixed.replace("CONFIG = 1", "CONFIG = 2")):
+        with pytest.raises(code_review_agent.CodeReviewFailed, match="protected code"):
+            code_review_agent.validate_review_edit_scope(source, mutation, ["train"])
+
+
+def test_retry_receives_failed_patch_evidence(monkeypatch):
+    calls = []
+    def fake_query(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"needs_revision": True, "reasoning": "Repair an interface", "revised_code": None}
+        return {"needs_revision": False, "reasoning": "No issue"}
+    monkeypatch.setattr(code_review_agent, "query", fake_query)
+    code_review_agent.run(_agent(), _node())
+    assert "Required revision has no applicable patch" in calls[1]["user_message"]

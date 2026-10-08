@@ -13,6 +13,7 @@ from typing import Tuple
 from llm import generate
 from utils.response import extract_plan_and_code
 from agents.prompts import plan_and_code_response_format
+from agents.prompts.shared import PLAN_AND_CODE_RESPONSE_FORMAT
 
 logger = logging.getLogger("AlgoEvolve")
 
@@ -26,19 +27,31 @@ RESPONSE_FORMAT = {
 }
 
 
+def complete_script_prompt(prompt):
+    """Keep the task prefix intact while supplying the full-rewrite response contract."""
+    suffix = "\n\n# Required response\n" + RESPONSE_FORMAT["Response format"]
+    if isinstance(prompt, str):
+        return prompt if PLAN_AND_CODE_RESPONSE_FORMAT in prompt else prompt + suffix
+    if isinstance(prompt, dict) and isinstance(prompt.get("user"), str):
+        if PLAN_AND_CODE_RESPONSE_FORMAT in prompt["user"]:
+            return prompt
+        return {**prompt, "user": prompt["user"] + suffix}
+    raise TypeError("Full script generation requires text or a chat dictionary with a user string")
+
+
 def plan_and_code_query(
     agent_instance,
     prompt,
     retries: int = 3,
 ) -> Tuple[str, str]:
-    """Generate plan + code in one LLM call; returns (nl_text, code). On failure returns ("", raw_completion_text)."""
+    """Generate a complete plan and script; never return prose as executable code."""
     retry_cfg = getattr(agent_instance.acfg, "retries", None)
     retries = max(
         1,
         int(getattr(retry_cfg, "code_generation_extract_max_attempts", retries)),
     )
     completion_text = None
-    for _ in range(retries):
+    for attempt in range(retries):
         completion_text = generate(
             prompt=prompt,
             temperature=agent_instance.acfg.code.temp,
@@ -54,7 +67,7 @@ def plan_and_code_query(
                 logger.info("Accepted a valid code-first response without regenerating it.")
             return nl_text, code
 
-        logger.debug("Extraction retry...")
+        logger.warning("No complete Python script extracted from response (%s chars), attempt %s/%s",
+                       len(completion_text or ""), attempt + 1, retries)
 
-    logger.warning("Code extraction failed after retries")
-    return "", completion_text  # type: ignore
+    raise RuntimeError("Code extraction failed after retries; original responses remain in the verbose log")

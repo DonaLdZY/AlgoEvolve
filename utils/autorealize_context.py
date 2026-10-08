@@ -293,7 +293,7 @@ def select_autorealize_context_for_stage(text: str, stage: str) -> str:
     for index, match in enumerate(matches):
         title = match.group(2).strip().lower()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
-        if title in selected:
+        if title in selected or title == "execution contract":
             parts.append(source[match.start() : end].strip())
     return "\n\n".join(parts).strip() or source
 
@@ -335,7 +335,7 @@ def _report_dir(input_dir: Path) -> Path:
     return direct
 
 
-def _nonempty(values: Any, limit: int = 12) -> list[str]:
+def _nonempty(values: Any, limit: int | None = 12) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     if isinstance(values, dict):
@@ -352,7 +352,7 @@ def _nonempty(values: Any, limit: int = 12) -> list[str]:
             continue
         seen.add(text)
         out.append(text)
-        if len(out) >= limit:
+        if limit is not None and len(out) >= limit:
             break
     return out
 
@@ -399,7 +399,7 @@ def _load_contracts(input_dir: Path) -> dict[str, Any]:
         "evaluation_report": _safe_read_json(report_dir / "evaluation_contract_report.json") or {},
         "task_report": _safe_read_json(report_dir / "task_definition_report.json") or {},
         "agent_pack": _safe_read_json(agent_pack_path) if agent_pack_path else {},
-        "description": _safe_read_text(input_dir / "description.md", limit=30000),
+        "description": _safe_read_text(input_dir / "description.md", limit=None),
     }
 
 
@@ -501,28 +501,36 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
         "When this context is present, AlgoEvolve must not regenerate or append a separate data preview; AutoRealize has already authored the stable task/data context.",
         "",
     ]
-    priority_rules = _nonempty(pack.get("priority_rules"), limit=8)
+    priority_rules = _nonempty(pack.get("priority_rules"), limit=None)
     if priority_rules:
         lines.append("### Priority Rules")
         lines.extend(f"- {x}" for x in priority_rules)
         lines.append("")
 
+    execution_contract = pack.get("execution_contract")
+    if isinstance(execution_contract, dict) and execution_contract:
+        lines.extend([
+            "### Execution Contract", "", "```json",
+            json.dumps(execution_contract, ensure_ascii=False, indent=2, sort_keys=True),
+            "```", "",
+        ])
+
     schema_contract = pack.get("data_schema_contract") if isinstance(pack.get("data_schema_contract"), dict) else {}
     if schema_contract:
         lines.append("### Exact Source Schema Contract")
-        for item in _nonempty(schema_contract.get("rules"), limit=10):
+        for item in _nonempty(schema_contract.get("rules"), limit=None):
             lines.append(f"- {item}")
         snippet = str(schema_contract.get("runtime_inspection_snippet", "") or "").strip()
         if snippet:
             lines.append(f"- runtime_inspection_snippet: {_truncate(snippet, 1200)}")
         workbooks = schema_contract.get("workbooks") if isinstance(schema_contract.get("workbooks"), list) else []
-        for workbook in workbooks[:20]:
+        for workbook in workbooks:
             if not isinstance(workbook, dict):
                 continue
-            sheets = [str(x) for x in (workbook.get("valid_sheet_names_exact") or [])[:20]]
+            sheets = [str(x) for x in (workbook.get("valid_sheet_names_exact") or [])]
             lines.append(f"- workbook `{workbook.get('source_file')}` valid_sheet_names_exact: {sheets}")
         tables = schema_contract.get("tables") if isinstance(schema_contract.get("tables"), list) else []
-        for table in tables[:32]:
+        for table in tables:
             if not isinstance(table, dict):
                 continue
             table_id = table.get("table_id") or table.get("source_file") or "table"
@@ -537,7 +545,7 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
                     f"  - schema_group: file_count={group.get('file_count')}; "
                     f"representative_files={group.get('representative_files')}"
                 )
-            columns = [str(x) for x in (table.get("physical_columns_exact") or [])[:120]]
+            columns = [str(x) for x in (table.get("physical_columns_exact") or [])]
             if columns:
                 lines.append("  - physical_columns_exact: " + ", ".join(f"`{x}`" for x in columns))
             omitted = int(table.get("physical_columns_omitted") or 0)
@@ -589,7 +597,7 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
             if key in method:
                 lines.append(f"- {key}: `{method.get(key)}`")
         for key in ["required_method_families", "allowed_method_families", "recommended_solver_families"]:
-            families = _nonempty(method.get(key), limit=16)
+            families = _nonempty(method.get(key), limit=None)
             if families:
                 lines.append(f"- {key}: " + ", ".join(f"`{x}`" for x in families))
         for key in ["first_draft_policy"]:
@@ -634,29 +642,32 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
             "passed",
             "executable",
             "authority_status",
+            "ranking_scope",
             "primary_metric",
             "metric_direction",
             "prediction_unit",
+            "y_true_source",
+            "y_pred_source",
             "computation_scope",
             "aggregation_rule",
             "validation_protocol",
         ]:
             value = str(evaluation.get(key, "") or "").strip()
             if value:
-                lines.append(f"- {key}: {_truncate(value, 1800)}")
+                lines.append(f"- {key}: {value}")
         for key in ["assumptions", "residual_issues"]:
-            values = _nonempty(evaluation.get(key), limit=12)
+            values = _nonempty(evaluation.get(key), limit=None)
             if values:
                 lines.append(f"- {key}:")
-                lines.extend(f"  - {_truncate(x, 800)}" for x in values)
+                lines.extend(f"  - {x}" for x in values)
         if final_formula:
-            lines.append(f"- final_score_formula: {_truncate(final_formula, 1800)}")
+            lines.append(f"- final_score_formula: {final_formula}")
         lines.append("- final_validation_score: print exactly one numeric `Final Validation Score` using `final_score_formula`; do not create or optimize another metric.")
-        for key in ["submission_checks", "invalid_solution_rules", "tie_break_rules"]:
-            values = _nonempty(evaluation.get(key), limit=8)
+        for key in ["submission_checks", "leakage_guards", "invalid_solution_rules", "tie_break_rules", "issues", "fixes"]:
+            values = _nonempty(evaluation.get(key), limit=None)
             if values:
                 lines.append(f"- {key}:")
-                lines.extend(f"  - {_truncate(x, 800)}" for x in values)
+                lines.extend(f"  - {x}" for x in values)
         lines.append("")
 
     output = pack.get("output_contract") if isinstance(pack.get("output_contract"), dict) else {}
@@ -666,21 +677,21 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
             value = output.get(key)
             if value not in (None, "", []):
                 lines.append(f"- {key}: {value}")
-        columns = _nonempty(output.get("columns"), limit=60)
+        columns = _nonempty(output.get("columns"), limit=None)
         if columns:
             lines.append("- columns: " + ", ".join(f"`{x}`" for x in columns))
-        rules = _nonempty(output.get("format_rules"), limit=10)
+        rules = _nonempty(output.get("format_rules"), limit=None)
         if rules:
             lines.append("- format_rules:")
-            lines.extend(f"  - {_truncate(x, 700)}" for x in rules)
+            lines.extend(f"  - {x}" for x in rules)
         lines.append("")
 
     data_access = pack.get("data_access") if isinstance(pack.get("data_access"), list) else []
     if data_access:
         lines.append("### Data Access And Orchestration")
-        for item in _nonempty(pack.get("data_orchestration"), limit=8):
+        for item in _nonempty(pack.get("data_orchestration"), limit=None):
             lines.append(f"- {item}")
-        for entry in data_access[:20]:
+        for entry in data_access:
             if not isinstance(entry, dict):
                 continue
             name = entry.get("pattern") or entry.get("path") or "data file"
@@ -688,21 +699,21 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
             for key in ["kind", "file_count", "read_method", "row_grain", "orchestration_note"]:
                 value = entry.get(key)
                 if value not in (None, "", []):
-                    lines.append(f"  - {key}: {_truncate(value, 700)}")
+                    lines.append(f"  - {key}: {value}")
             read_example = str(entry.get("read_example", "") or "").strip()
             if read_example:
                 lines.append("  - read_example:")
                 lines.append("```python")
                 lines.append(read_example.replace("```python", "").replace("```", "").strip())
                 lines.append("```")
-            notes = _nonempty(entry.get("parsing_notes"), limit=5)
+            notes = _nonempty(entry.get("parsing_notes"), limit=None)
             if notes:
-                lines.append("  - parsing_notes: " + "; ".join(_truncate(x, 280) for x in notes))
+                lines.append("  - parsing_notes: " + "; ".join(notes))
         lines.append("")
 
         read_contracts = [
             entry.get("read_contract")
-            for entry in data_access[:40]
+            for entry in data_access
             if isinstance(entry, dict)
             and isinstance(entry.get("read_contract"), dict)
             and entry.get("read_contract")
@@ -725,10 +736,10 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
         ("Leakage Guards", "leakage_guards"),
         ("Pitfalls", "pitfalls"),
     ]:
-        values = _nonempty(pack.get(key), limit=16)
+        values = _nonempty(pack.get(key), limit=None)
         if values:
             lines.append(f"### {title}")
-            lines.extend(f"- {_truncate(x, 900)}" for x in values)
+            lines.extend(f"- {x}" for x in values)
             lines.append("")
     return "\n".join(lines).strip()
 

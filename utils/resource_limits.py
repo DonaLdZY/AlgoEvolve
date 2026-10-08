@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -36,6 +37,31 @@ class MemoryPressureAction:
     child_pid: int | None
     observed_bytes: int
     limit_bytes: int
+
+
+def host_commit_available_bytes() -> int | None:
+    """Windows commit can be exhausted while physical RAM is still available."""
+    if os.name != "nt":
+        return None
+
+    class PerformanceInfo(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_uint32)] + [
+            (name, ctypes.c_size_t) for name in (
+                "commit_total", "commit_limit", "commit_peak", "physical_total", "physical_available",
+                "system_cache", "kernel_total", "kernel_paged", "kernel_nonpaged", "page_size",
+            )
+        ] + [(name, ctypes.c_uint32) for name in ("handle_count", "process_count", "thread_count")]
+
+    status = PerformanceInfo()
+    status.length = ctypes.sizeof(status)
+    # GlobalMemoryStatusEx also reflects the caller's Job Object quota.
+    # GetPerformanceInfo measures system commit independently of probe limits.
+    query = ctypes.WinDLL("psapi", use_last_error=True).GetPerformanceInfo
+    query.argtypes = [ctypes.POINTER(PerformanceInfo), ctypes.c_uint32]
+    query.restype = ctypes.c_int
+    if not query(ctypes.byref(status), status.length):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return max(0, int(status.commit_limit - status.commit_total)) * int(status.page_size)
 
 
 class ProcessTreeMemoryLimiter:
@@ -964,12 +990,13 @@ def available_cpu_ids() -> list[int]:
     return list(range(max(1, int(psutil.cpu_count(logical=True) or os.cpu_count() or 1))))
 
 
-def choose_cpu_ids(cpu_cores: int) -> list[int]:
+def choose_cpu_ids(cpu_cores: int, *, occupied_ids: Iterable[int] = ()) -> list[int]:
     available = available_cpu_ids()
     requested = max(1, int(cpu_cores))
     if requested > len(available):
         raise ValueError(f"requested {requested} CPU cores, but only {len(available)} are available")
-    return available[:requested]
+    occupancy = Counter(occupied_ids)
+    return sorted(sorted(available, key=lambda item: (occupancy[item], item))[:requested])
 
 
 def _process_tree(root_pid: int) -> list[psutil.Process]:
@@ -980,7 +1007,7 @@ def _process_tree(root_pid: int) -> list[psutil.Process]:
     processes = [root]
     try:
         processes.extend(root.children(recursive=True))
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         pass
     unique: dict[int, psutil.Process] = {proc.pid: proc for proc in processes}
     return list(unique.values())

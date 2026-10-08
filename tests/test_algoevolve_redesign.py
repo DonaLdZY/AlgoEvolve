@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from agents.coder import stepwise_coder
-from agents import code_review_agent, result_parse_agent
+from agents import code_review_agent, result_parse_agent, draft_agent
 from agents.prompt_policy import (
     autonomous_method_selection_guidance,
     dynamic_expansion_instruction,
@@ -173,8 +173,12 @@ def test_finite_solution_interfaces_and_dangerous_code_preflight() -> None:
     assert dangerous.dangerous_findings
 
 
+@pytest.mark.parametrize("formal_task", [False, True])
+@pytest.mark.parametrize("initially_valid", [False, True])
 def test_preflight_rejection_regenerates_same_draft_instead_of_dropping_it(
     monkeypatch,
+    formal_task,
+    initially_valid,
 ) -> None:
     root = SearchNode(code="", plan="root", stage="root", step=0)
     agent = AgentSearch.__new__(AgentSearch)
@@ -182,27 +186,34 @@ def test_preflight_rejection_regenerates_same_draft_instead_of_dropping_it(
     agent.task_desc = "Minimize assignment cost under capacity constraints."
     agent.data_preview = ""
     agent.autorealize_context = ""
+    agent.has_autorealize_context = formal_task
     agent.coldstart_description = ""
     agent.runtime_checkpoint_callback = None
     agent.scfg = SimpleNamespace(num_drafts=8)
+    agent.cfg = SimpleNamespace(runtime=SimpleNamespace(resume_run=False))
     agent.acfg = SimpleNamespace(
-        draft=SimpleNamespace(fast_first_draft_skip_pre_review=False),
+        draft=SimpleNamespace(fast_first_draft_skip_pre_review=True),
         retries=SimpleNamespace(preflight_regeneration_max_attempts=2),
     )
 
     rejected = SearchNode(
-        code="def solve(data, artifact_dir): return data\n",
+        code=("def solve(model_path, data): return data\ndef final_evaluate(data, artifact_dir): return {}\n"
+              if initially_valid else "def solve(data, artifact_dir): return data\n"),
         plan="simulated annealing",
         stage="draft",
         parent=root,
     )
-    monkeypatch.setattr(code_review_agent, "run", lambda _agent, node: node.code)
+    reviews = []
+    def review(_agent, node):
+        reviews.append(node.id)
+        return node.code
+    monkeypatch.setattr(code_review_agent, "run", review)
     monkeypatch.setattr(
         code_review_agent,
         "regenerate_after_preflight_failure",
         lambda *_args, **_kwargs: (
             "same simulated annealing method with corrected interface",
-            "def solve(model_path, data): return data\n",
+            "def solve(model_path, data): return data\ndef final_evaluate(data, artifact_dir): return {'status': 'not_applicable', 'reason': 'No empirical holdout'}\n",
         ),
     )
     from agents import draft_agent
@@ -213,6 +224,7 @@ def test_preflight_rejection_regenerates_same_draft_instead_of_dropping_it(
         root,
         exec_callback=lambda *_args, **_kwargs: None,
         execute_immediately=False,
+        fast_draft_mode=True,
         expansion_profile=ExpansionProfile.create(
             1,
             operator="draft",
@@ -223,8 +235,92 @@ def test_preflight_rejection_regenerates_same_draft_instead_of_dropping_it(
     assert result is rejected
     assert result.pending_execution is True
     assert result.preflight_report["ok"] is True
-    assert result.plan.startswith("same simulated annealing")
+    assert result.plan.startswith("simulated annealing" if initially_valid else "same simulated annealing")
     assert "def solve(model_path, data)" in result.code
+    assert bool(reviews) is (formal_task or not initially_valid)
+
+
+def test_exhausted_review_can_continue_only_when_deterministic_preflight_passes(monkeypatch):
+    root = SearchNode(code="", plan="root", stage="root", step=0)
+    agent = AgentSearch.__new__(AgentSearch)
+    agent.virtual_root = root
+    agent.task_desc = "Minimize assignment cost."
+    agent.data_preview = ""
+    agent.autorealize_context = ""
+    agent.has_autorealize_context = False
+    agent.coldstart_description = ""
+    agent.runtime_checkpoint_callback = None
+    agent.scfg = SimpleNamespace(num_drafts=2)
+    agent.cfg = SimpleNamespace(runtime=SimpleNamespace(resume_run=False))
+    agent.acfg = SimpleNamespace(
+        draft=SimpleNamespace(fast_first_draft_skip_pre_review=False),
+        retries=SimpleNamespace(preflight_regeneration_max_attempts=0, review_gate_policy="continue_on_exhaustion"),
+    )
+    candidate = SearchNode(
+        code=(
+            "def train(data, artifact_dir): return artifact_dir\n"
+            "def predict(model_path, data): return data\n"
+            "def solve(model_path, data): return data\n"
+        ),
+        plan="heuristic", stage="draft", parent=root,
+    )
+    monkeypatch.setattr(draft_agent, "run", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(code_review_agent, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(code_review_agent.CodeReviewFailed("provider exhausted")))
+    _root, result = agent._run_single_step(
+        root, exec_callback=lambda *_args, **_kwargs: None, execute_immediately=False,
+        fast_draft_mode=False, expansion_profile=ExpansionProfile.create(1, operator="draft", task_family="decision"),
+    )
+    assert result is candidate
+    assert result.pending_execution is True
+    assert result.preexecution_review_warnings == ["Pre-execution LLM review exhausted without approval: provider exhausted"]
+
+
+def test_exhausted_review_does_not_bypass_deterministic_preflight(monkeypatch):
+    root = SearchNode(code="", plan="root", stage="root", step=0)
+    agent = AgentSearch.__new__(AgentSearch)
+    agent.virtual_root = root
+    agent.task_desc = "Minimize assignment cost."
+    agent.data_preview = ""
+    agent.autorealize_context = ""
+    agent.has_autorealize_context = False
+    agent.coldstart_description = ""
+    agent.runtime_checkpoint_callback = None
+    agent.scfg = SimpleNamespace(num_drafts=2)
+    agent.cfg = SimpleNamespace(runtime=SimpleNamespace(resume_run=False))
+    agent.acfg = SimpleNamespace(
+        draft=SimpleNamespace(fast_first_draft_skip_pre_review=False),
+        retries=SimpleNamespace(preflight_regeneration_max_attempts=0, review_gate_policy="continue_on_exhaustion"),
+    )
+    candidate = SearchNode(code="def solve(data, artifact_dir): return data\n", plan="heuristic", stage="draft", parent=root)
+    monkeypatch.setattr(draft_agent, "run", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(code_review_agent, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(code_review_agent.CodeReviewFailed("provider exhausted")))
+    with pytest.raises(code_review_agent.CodeReviewFailed):
+        agent._run_single_step(
+            root, exec_callback=lambda *_args, **_kwargs: None, execute_immediately=False,
+            fast_draft_mode=False, expansion_profile=ExpansionProfile.create(1, operator="draft", task_family="decision"),
+        )
+
+
+@pytest.mark.parametrize("suffix", [
+    "", "def final_evaluate(recipe): return recipe\n",
+    "def final_evaluate(data, artifact_dir, holdout_positions): return {}\n",
+    "def final_evaluate(data, artifact_dir, *, recipe): return {}\n",
+    "async def final_evaluate(data, artifact_dir): return {}\n",
+    "def final_evaluate(data, artifact_dir): return {}\nfinal_evaluate(None, None)\n",
+    "def final_evaluate(data, artifact_dir): return {}\ndef main():\n    callback = final_evaluate\n",
+])
+def test_formal_preflight_blocks_missing_wrong_or_candidate_called_final(suffix):
+    code = "def train(data, artifact_dir): pass\ndef predict(model_path, data): pass\n" + suffix
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    assert not preflight_code(code, interface, require_final_evaluation=True).ok
+
+
+def test_final_preflight_allows_engine_only_entrypoint():
+    code = ("def train(data, artifact_dir): pass\ndef predict(model_path, data): pass\n"
+            "def final_evaluate(data, artifact_dir): return {'status': 'not_applicable', 'reason': 'No holdout'}\n"
+            "if __name__ == '__main__': train(None, None)\n")
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    assert preflight_code(code, interface, require_final_evaluation=True).ok
 
 
 def test_preflight_regeneration_prompt_ends_with_exact_rejection_evidence(

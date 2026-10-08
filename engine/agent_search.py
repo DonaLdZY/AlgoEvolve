@@ -1,6 +1,8 @@
 """AgentSearch: tree search coordinator; delegates to node_selection, evaluation, execution, solution_manager."""
 
 import logging
+import os
+from pathlib import Path
 import random
 import time
 from typing import Callable, List, Dict, Optional
@@ -35,6 +37,7 @@ from agents.prompt_policy import (
     infer_task_family,
 )
 from engine.solution_protocol import interface_for, preflight_code
+from agents.coder.recovery import first_draft_recovery_profile
 
 logger = logging.getLogger("AlgoEvolve")
 
@@ -69,6 +72,18 @@ class AgentSearch:
             )
         else:
             self.task_desc = clean_task_desc(task_desc, cfg)
+        from utils.resource_updates import snapshot_resource_update
+        resource_source = Path(cfg.data_dir).parent / "runtime_resource_override.json" if getattr(cfg, "data_dir", None) else None
+        override_path = snapshot_resource_update(cfg.workspace_dir, resource_source)
+        if override_path.is_file():
+            override = json.loads(override_path.read_text(encoding="utf-8"))
+            if override.get("authorization") != "explicit_user_update":
+                raise ValueError("Resource override lacks explicit user-update provenance")
+            self.task_desc += ("\n\n# Latest User-Authorized Runtime Resource Update\n"
+                               "This update replaces ONLY earlier CPU-only, CPU-count and memory-budget statements. "
+                               "All original data, split, metric, leakage, feature-source, output and business constraints remain mandatory. "
+                               "Use supported GPU training where useful; do not reject it because the earlier task definition said CPU-only.\n"
+                               + json.dumps(override, ensure_ascii=False, sort_keys=True))
         context_submission_required = submission_required_from_context(input_dir)
         if context_submission_required is False and getattr(self.acfg, "generate_submission", True):
             self.acfg.generate_submission = False
@@ -311,7 +326,7 @@ class AgentSearch:
                             logger.info("Aggregation failed or limit reached, skipping. Will continue normal search.")
                             result_node = None
                     else:
-                        profile = ensure_expansion_profile(
+                        profile = first_draft_recovery_profile(self) or ensure_expansion_profile(
                             self, parent_node, expansion_profile, "draft"
                         )
                         result_node = draft_agent.run(
@@ -385,11 +400,15 @@ class AgentSearch:
                         task_family=infer_task_family(self),
                         method_family=result_node.method_family,
                     )
-                    initial_preflight = preflight_code(result_node.code, interface)
-                    if init_solution_path:
+                    require_final_evaluation = bool(getattr(self, "has_autorealize_context", False))
+                    def candidate_preflight(code):
+                        return preflight_code(code, interface, require_final_evaluation=require_final_evaluation)
+
+                    initial_preflight = candidate_preflight(result_node.code)
+                    if init_solution_path and not require_final_evaluation:
                         logger.info(f"Node {result_node.id} from init_solution, skipping code review")
-                    elif fast_draft_mode and initial_preflight.ok and bool(
-                        getattr(self.acfg.draft, "fast_first_draft_skip_pre_review", True)
+                    elif not require_final_evaluation and fast_draft_mode and initial_preflight.ok and bool(
+                        getattr(self.acfg.draft, "fast_first_draft_skip_pre_review", False)
                     ):
                         result_node.fast_draft = True
                         logger.info(
@@ -398,14 +417,31 @@ class AgentSearch:
                             result_node.id,
                         )
                     else:
-                        reviewed_code = code_review_agent.run(self, result_node)
+                        try:
+                            reviewed_code = code_review_agent.run(self, result_node)
+                        except code_review_agent.CodeReviewFailed as exc:
+                            review_policy = str(
+                                getattr(getattr(self.acfg, "retries", None), "review_gate_policy", "strict")
+                                or "strict"
+                            ).strip().lower()
+                            if review_policy != "continue_on_exhaustion" or not initial_preflight.ok:
+                                raise
+                            warning = f"Pre-execution LLM review exhausted without approval: {exc}"
+                            result_node.preexecution_review_warnings.append(warning)
+                            logger.warning(
+                                "Node %s continues after exhausted LLM review under task policy; "
+                                "mandatory deterministic preflight still passed. %s",
+                                result_node.id,
+                                exc,
+                            )
+                            reviewed_code = result_node.code
                         if reviewed_code.strip() != result_node.code.strip():
                             logger.info(f"Node {result_node.id} code has been reviewed and modified")
                             result_node.code = reviewed_code
                         else:
                             logger.info(f"Node {result_node.id} passed code review without changes")
 
-                    final_preflight = preflight_code(result_node.code, interface)
+                    final_preflight = candidate_preflight(result_node.code)
                     if not final_preflight.ok:
                         result_node.preflight_report = final_preflight.__dict__
                         logger.warning(
@@ -415,7 +451,7 @@ class AgentSearch:
                         repaired_code = code_review_agent.run(self, result_node)
                         if repaired_code.strip() != result_node.code.strip():
                             result_node.code = repaired_code
-                        final_preflight = preflight_code(result_node.code, interface)
+                        final_preflight = candidate_preflight(result_node.code)
                     max_regenerations = max(
                         0,
                         int(
@@ -459,7 +495,7 @@ class AgentSearch:
                             continue
                         result_node.plan = regenerated_plan or result_node.plan
                         result_node.code = regenerated_code
-                        final_preflight = preflight_code(result_node.code, interface)
+                        final_preflight = candidate_preflight(result_node.code)
                         logger.info(
                             "Preflight regeneration %s/%s for node %s: ok=%s issues=%s",
                             regeneration_attempt,

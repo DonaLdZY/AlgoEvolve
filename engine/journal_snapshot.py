@@ -126,6 +126,7 @@ class NodeSnapshot:
     id: str = ""
     ctime: float = 0.0
     parent_id: str | None = None
+    fusion_sources: Any = None
     local_best_node_id: str | None = None
     term_out: Any = None
     exec_time: float | None = None
@@ -135,6 +136,7 @@ class NodeSnapshot:
     analysis: str | None = None
     parser_analysis: str | None = None
     decision_signals: Any = None
+    evaluation_protocol: Any = None
     llm_insight: str | None = None
     metric: MetricSnapshot | None = None
     is_buggy: bool | None = None
@@ -155,9 +157,11 @@ class NodeSnapshot:
     expansion_operator: str = "unknown"
     solution_interface: str = ""
     preflight_report: Any = None
+    preexecution_review_warnings: Any = None
     review_verdict: str = ""
     review_reason_codes: Any = None
     review_confidence: float | None = None
+    output_scope: str = "unknown"
     visits: int = 0
     total_reward: float = 0.0
     is_terminal: bool = False
@@ -196,6 +200,7 @@ class NodeSnapshot:
             id=str(getattr(node, "id", "") or ""),
             ctime=float(getattr(node, "ctime", 0.0) or 0.0),
             parent_id=str(parent.id) if parent is not None else None,
+            fusion_sources=_safe_json_value(getattr(node, "fusion_sources", [])),
             local_best_node_id=str(local_best.id) if local_best is not None else None,
             term_out=(
                 "<OMITTED>"
@@ -213,6 +218,7 @@ class NodeSnapshot:
             analysis=getattr(node, "analysis", None),
             parser_analysis=getattr(node, "parser_analysis", None),
             decision_signals=_safe_json_value(getattr(node, "decision_signals", None)),
+            evaluation_protocol=_safe_json_value(getattr(node, "evaluation_protocol", {})),
             llm_insight=getattr(node, "llm_insight", None),
             metric=MetricSnapshot.from_metric(getattr(node, "metric", None)),
             is_buggy=getattr(node, "is_buggy", None),
@@ -233,9 +239,11 @@ class NodeSnapshot:
             expansion_operator=str(getattr(node, "expansion_operator", "unknown") or "unknown"),
             solution_interface=str(getattr(node, "solution_interface", "") or ""),
             preflight_report=_safe_json_value(getattr(node, "preflight_report", None)),
+            preexecution_review_warnings=_safe_json_value(getattr(node, "preexecution_review_warnings", [])),
             review_verdict=str(getattr(node, "review_verdict", "") or ""),
             review_reason_codes=_safe_json_value(getattr(node, "review_reason_codes", [])),
             review_confidence=getattr(node, "review_confidence", None),
+            output_scope=str(getattr(node, "output_scope", "unknown") or "unknown"),
             visits=int(getattr(node, "visits", 0) or 0),
             total_reward=float(getattr(node, "total_reward", 0.0) or 0.0),
             is_terminal=bool(getattr(node, "is_terminal", False)),
@@ -285,6 +293,7 @@ class NodeSnapshot:
             id=str(payload.get("id") or ""),
             ctime=ctime_value,
             parent_id=parent_id,
+            fusion_sources=_safe_json_value(payload.get("fusion_sources") or []),
             local_best_node_id=local_best_node_id,
             term_out=_safe_json_value(payload.get("_term_out")),
             exec_time=payload.get("exec_time"),
@@ -294,6 +303,7 @@ class NodeSnapshot:
             analysis=payload.get("analysis"),
             parser_analysis=payload.get("parser_analysis"),
             decision_signals=_safe_json_value(payload.get("decision_signals")),
+            evaluation_protocol=_safe_json_value(payload.get("evaluation_protocol") or {}),
             llm_insight=payload.get("llm_insight"),
             metric=MetricSnapshot.from_payload(payload.get("metric")),
             is_buggy=payload.get("is_buggy"),
@@ -323,9 +333,11 @@ class NodeSnapshot:
             expansion_operator=str(payload.get("expansion_operator") or "unknown"),
             solution_interface=str(payload.get("solution_interface") or ""),
             preflight_report=_safe_json_value(payload.get("preflight_report")),
+            preexecution_review_warnings=_safe_json_value(payload.get("preexecution_review_warnings") or []),
             review_verdict=str(payload.get("review_verdict") or ""),
             review_reason_codes=_safe_json_value(payload.get("review_reason_codes") or []),
             review_confidence=payload.get("review_confidence"),
+            output_scope=str(payload.get("output_scope") or "unknown"),
             visits=int(payload.get("visits") or 0),
             total_reward=float(payload.get("total_reward") or 0.0),
             is_terminal=bool(payload.get("is_terminal", False)),
@@ -358,6 +370,7 @@ class NodeSnapshot:
             step=self.step,
             id=self.id,
             ctime=self.ctime,
+            fusion_sources=list(self.fusion_sources or []),
             _term_out=self.term_out,
             exec_time=self.exec_time,
             exc_type=self.exc_type,
@@ -366,6 +379,7 @@ class NodeSnapshot:
             analysis=self.analysis,
             parser_analysis=self.parser_analysis,
             decision_signals=self.decision_signals,
+            evaluation_protocol=dict(self.evaluation_protocol or {}),
             llm_insight=self.llm_insight,
             metric=self.metric.to_metric() if self.metric is not None else None,
             is_buggy=self.is_buggy,
@@ -386,9 +400,11 @@ class NodeSnapshot:
             expansion_operator=self.expansion_operator,
             solution_interface=self.solution_interface,
             preflight_report=self.preflight_report,
+            preexecution_review_warnings=list(self.preexecution_review_warnings or []),
             review_verdict=self.review_verdict,
             review_reason_codes=list(self.review_reason_codes or []),
             review_confidence=self.review_confidence,
+            output_scope=self.output_scope,
             visits=self.visits,
             total_reward=self.total_reward,
             is_terminal=self.is_terminal,
@@ -421,6 +437,7 @@ class NodeSnapshot:
             "id": self.id,
             "ctime": self.ctime,
             "parent": None,
+            "fusion_sources": list(self.fusion_sources or []),
             "children": [],
             "_term_out": self.term_out,
             "exec_time": self.exec_time,
@@ -430,6 +447,7 @@ class NodeSnapshot:
             "analysis": self.analysis,
             "parser_analysis": self.parser_analysis,
             "decision_signals": self.decision_signals,
+            "evaluation_protocol": self.evaluation_protocol or {},
             "llm_insight": self.llm_insight,
             "metric": self.metric.to_payload() if self.metric is not None else None,
             "is_buggy": self.is_buggy,
@@ -450,9 +468,11 @@ class NodeSnapshot:
             "expansion_operator": self.expansion_operator,
             "solution_interface": self.solution_interface,
             "preflight_report": self.preflight_report,
+            "preexecution_review_warnings": self.preexecution_review_warnings,
             "review_verdict": self.review_verdict,
             "review_reason_codes": self.review_reason_codes,
             "review_confidence": self.review_confidence,
+            "output_scope": self.output_scope,
             "stage": self.stage,
             "visits": self.visits,
             "total_reward": self.total_reward,

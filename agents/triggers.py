@@ -1,6 +1,7 @@
 import logging
 
 from engine.search_node import SearchNode
+from utils.evaluation_protocol import extract_contract_identity
 
 logger = logging.getLogger("AlgoEvolve")
 
@@ -51,6 +52,7 @@ def register_node(agent, node: SearchNode, prompt, parent_node=None, new_branch:
     import time
 
     node.prompt_input = agent._serialize_prompt(prompt)
+    node.evaluation_protocol.update(extract_contract_identity(getattr(agent, "data_preview", "")))
     node.created_time = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     state_lock = getattr(agent, "tree_state_lock", None)
