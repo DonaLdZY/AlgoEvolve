@@ -194,6 +194,30 @@ def test_allowlist_policy_rejects_unlisted_distribution(tmp_path: Path) -> None:
     assert selection is None
 
 
+def test_candidate_execution_environment_redacts_credentials_only_when_requested(
+    tmp_path: Path,
+) -> None:
+    installer = DependencyInstaller(_cfg(tmp_path))
+    source = {
+        "OPENAI_API_KEY": "secret-api-key",
+        "DEEPSEEK_SEARCH_API_KEY": "secret-search-key",
+        "DATABASE_PASSWORD": "secret-password",
+        "AUTODECISION_RUN_KIND": "candidate",
+        "PATH": "system-path",
+    }
+
+    candidate_env = installer.execution_environment(source, redact_credentials=True)
+    installer_env = installer.execution_environment(source)
+
+    assert "OPENAI_API_KEY" not in candidate_env
+    assert "DEEPSEEK_SEARCH_API_KEY" not in candidate_env
+    assert "DATABASE_PASSWORD" not in candidate_env
+    assert candidate_env["PATH"] == "system-path"
+    assert candidate_env["AUTODECISION_RUN_KIND"] == "candidate"
+    assert candidate_env["ALGOEVOLVE_TASK_PACKAGE_DIR"] == str(installer.install_target_path)
+    assert installer_env["OPENAI_API_KEY"] == "secret-api-key"
+
+
 def test_known_mapping_wins_when_code_declares_multiple_packages(tmp_path: Path) -> None:
     installer = DependencyInstaller(_cfg(tmp_path))
 

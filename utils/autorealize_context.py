@@ -252,6 +252,66 @@ _STAGE_CONTEXT_SECTIONS: dict[str, set[str] | None] = {
     },
 }
 
+# These blocks define executable semantics. All stages receive them verbatim,
+# including stages that only interpret an execution result. A newly introduced
+# section is also retained until explicitly classified as optional below.
+_CONTRACT_SECTIONS = {
+    "execution contract", "priority rules", "exact source schema contract",
+    "executable data read recipes", "source alias guard", "minimal task reference",
+    "evaluation contract reference", "output contract reference",
+    "problem boundary reference", "constraints reference", "leakage guards",
+    "problem and goal", "evaluation contract", "output contract", "constraints",
+    "modeling boundary", "pitfalls",
+}
+_ROUTABLE_SECTIONS = {
+    "supplemental data facts", "supplementary data facts", "data access",
+    "data access and orchestration", "relation cards", "entity alias candidates",
+    "method strategy", "table cards", "filename group cards",
+}
+_STAGE_CONTEXT_SECTIONS["result_parsing"] = {
+    "autorealize structured context",
+    "priority rules",
+    "minimal task reference",
+    "execution contract",
+    "evaluation contract reference",
+    "evaluation contract",
+    "output contract reference",
+    "output contract",
+    "problem boundary reference",
+    "problem and goal",
+    "constraints reference",
+    "constraints",
+    "leakage guards",
+    "modeling boundary",
+}
+
+# Reviews already receive the complete candidate implementation and raw
+# execution evidence. Keep only contract sections that can change the verdict;
+# code repair additionally needs the exact physical schema and read recipes.
+_STAGE_CONTEXT_SECTIONS["code_review"] = {
+    "autorealize structured context",
+    "priority rules",
+    "execution contract",
+    "source coverage ledger",
+    "exact source schema contract",
+    "source alias guard",
+    "minimal task reference",
+    "evaluation contract reference",
+    "evaluation contract",
+    "output contract reference",
+    "output contract",
+    "data access",
+    "data access and orchestration",
+    "executable data read recipes",
+    "problem boundary reference",
+    "problem and goal",
+    "constraints reference",
+    "constraints",
+    "leakage guards",
+    "modeling boundary",
+}
+_STRICT_STAGE_ROUTING = {"result_parsing", "code_review"}
+
 
 def select_autorealize_context_for_stage(text: str, stage: str) -> str:
     """Select complete AutoRealize contract sections needed by one code stage.
@@ -293,7 +353,11 @@ def select_autorealize_context_for_stage(text: str, stage: str) -> str:
     for index, match in enumerate(matches):
         title = match.group(2).strip().lower()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
-        if title in selected or title == "execution contract":
+        if (
+            title in selected or title not in _ROUTABLE_SECTIONS
+            if str(stage or "").strip() in _STRICT_STAGE_ROUTING
+            else title in selected or title in _CONTRACT_SECTIONS or title not in _ROUTABLE_SECTIONS
+        ):
             parts.append(source[match.start() : end].strip())
     return "\n\n".join(parts).strip() or source
 
@@ -651,6 +715,10 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
             "computation_scope",
             "aggregation_rule",
             "validation_protocol",
+            "final_evaluation_metric",
+            "final_evaluation_direction",
+            "final_evaluation_formula",
+            "final_evaluation_protocol",
         ]:
             value = str(evaluation.get(key, "") or "").strip()
             if value:
@@ -662,7 +730,7 @@ def _render_from_pack(pack: dict[str, Any]) -> str:
                 lines.extend(f"  - {x}" for x in values)
         if final_formula:
             lines.append(f"- final_score_formula: {final_formula}")
-        lines.append("- final_validation_score: print exactly one numeric `Final Validation Score` using `final_score_formula`; do not create or optimize another metric.")
+        lines.append("- final_validation_score: print exactly one numeric search score on the development population using `final_score_formula`; final_evaluation_* is post-selection only and never affects candidate search.")
         for key in ["submission_checks", "leakage_guards", "invalid_solution_rules", "tie_break_rules", "issues", "fixes"]:
             values = _nonempty(evaluation.get(key), limit=None)
             if values:
@@ -764,13 +832,15 @@ def _render_fallback(contracts: dict[str, Any]) -> str:
     if evaluation:
         lines.extend(["", "### Evaluation Contract"])
         final_formula = str(evaluation.get("final_score_formula") or evaluation.get("metric_formula") or "").strip()
-        for key in ["primary_metric", "metric_direction", "aggregation_rule", "validation_protocol"]:
+        for key in ["primary_metric", "metric_direction", "aggregation_rule", "validation_protocol",
+                    "final_evaluation_metric", "final_evaluation_direction", "final_evaluation_formula",
+                    "final_evaluation_protocol"]:
             value = str(evaluation.get(key, "") or "").strip()
             if value:
                 lines.append(f"- {key}: {_truncate(value, 1800)}")
         if final_formula:
             lines.append(f"- final_score_formula: {_truncate(final_formula, 1800)}")
-        lines.append("- final_validation_score: print exactly one numeric scalar using `final_score_formula`.")
+        lines.append("- final_validation_score: print exactly one development/search scalar using `final_score_formula`; final_evaluation_* applies only after global selection.")
     output = bundle.get("output") if isinstance(bundle.get("output"), dict) else {}
     if output:
         lines.extend(["", "### Output Contract"])
@@ -836,6 +906,27 @@ def load_autorealize_description_md(input_dir: Path, *, fallback: str = "") -> s
     contracts = _load_contracts(Path(input_dir))
     text = str(contracts.get("description") or "").strip()
     return text or str(fallback or "").strip()
+
+
+def load_autorealize_task_summary(input_dir: Path, *, fallback: str = "") -> str:
+    """Use the structured objective when its complete contract accompanies prompts."""
+    contracts = _load_contracts(Path(input_dir))
+    pack = contracts.get("automl_pack")
+    goal = str(pack.get("task_goal") or "").strip() if isinstance(pack, dict) else ""
+    if not goal:
+        context = str(contracts.get("automl_md") or "")
+        match = re.search(
+            r"(?im)^\s*-\s*task_goal\s*:\s*(.+?)\s*$",
+            context,
+        )
+        goal = match.group(1).strip() if match else ""
+    if goal and len(goal) <= 1600:
+        goal = re.sub(r"\s+", " ", goal)
+        return (
+            "任务目标（完整数据、评估、输出和约束合同见下方 AutoRealize 结构化上下文）：\n"
+            + goal
+        )
+    return load_autorealize_description_md(input_dir, fallback=fallback)
 
 
 def submission_required_from_context(input_dir: Path) -> bool | None:

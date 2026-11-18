@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
 from llm import generate, compile_prompt_to_md
-from utils.response import extract_plan_and_code, wrap_code
+from utils.response import extract_plan_and_code, wrap_code, code_extraction_diagnostic
 from agents.prompts import infer_task_mode, plan_and_code_response_format
 from agents.prompt_cache import dataset_reference_sentence, task_section
+from utils.autorealize_context import select_autorealize_context_for_stage
 from agents.memory.optimization_experience import build_optimization_experience_for_agent
 from llm.usage import estimate_text_tokens
 from agents.prompt_policy import (
@@ -40,6 +41,21 @@ STEPWISE_CONTEXT_ACK = (
     "I have loaded the authoritative task/data context, shared instructions, and every stage contract. "
     "I will preserve them while handling the appended stage requests in order."
 )
+
+
+def _correction_prompt(original, response: str, diagnostic: str):
+    instruction = (
+        "The previous response was rejected before execution. " + diagnostic
+        + "\nFix this actual error while preserving all task contracts and exact stage interfaces. "
+          "Return ONE complete Python script for the requested stage or merge, not a patch or subset."
+    )
+    if isinstance(original, list):
+        return [*original, {"role": "assistant", "content": response},
+                {"role": "user", "content": instruction}]
+    tail = "\n\n# Rejected response\n" + response + "\n\n# Required correction\n" + instruction
+    if isinstance(original, dict):
+        return {**original, "user": str(original.get("user", "")) + tail}
+    return str(original) + tail
 
 
 def _message_text(messages: List[Dict[str, str]]) -> str:
@@ -108,7 +124,9 @@ class StepwiseConversation:
                             "# Compacted earlier stepwise history\n"
                             f"{self.compacted_history}\n\n"
                             "If an exact omitted detail is required, respond only with "
-                            "`REQUEST_CONTEXT_SNAPSHOT: <snapshot_id> | <reason>`; the host will append the exact snapshot once."
+                            "`REQUEST_CONTEXT_SNAPSHOT: <snapshot_id> | <reason>`; the host will append the exact snapshot once. "
+                            "One successful retrieval per stage does not consume a code-generation attempt; "
+                            "invalid or repeated retrieval requests count as failed code attempts."
                         ),
                     },
                     {
@@ -156,10 +174,12 @@ class StepwiseConversation:
         )
         headroom_ratio = min(
             0.5,
-            max(0.05, float(getattr(draft_cfg, "stepwise_context_headroom_ratio", 0.15) or 0.15)),
+            max(0.01, float(getattr(draft_cfg, "stepwise_context_headroom_ratio", 0.01) or 0.01)),
         )
         if context_window > 0:
-            window_budget = int(context_window * (1.0 - headroom_ratio))
+            code_cfg = getattr(agent_instance.acfg, "code", None)
+            reply_reserve = int(getattr(code_cfg, "max_tokens", 32768) or 32768)
+            window_budget = max(1, int(context_window * (1.0 - headroom_ratio)) - reply_reserve - 2048)
             max_tokens = min(max_tokens, window_budget) if max_tokens > 0 else window_budget
         keep_steps = max(
             0,
@@ -168,6 +188,18 @@ class StepwiseConversation:
         keep_messages = keep_steps * 2
         if max_tokens <= 0 or self._estimated_tokens(next_instruction) <= max_tokens:
             return
+        if context_window > 0 and self.turns:
+            summary_allowance = max(512, int(getattr(draft_cfg, "stepwise_compaction_max_tokens", 8192) or 8192))
+            # Keeping N recent steps is a preference. Preserve exact snapshots
+            # while reducing the retained suffix when it cannot fit with output.
+            keep_messages = min(keep_messages, max(0, len(self.turns) - 2))
+            while keep_messages > 0:
+                suffix = self.turns[-keep_messages:]
+                estimate = estimate_text_tokens(_message_text([
+                    *self.base_messages, *suffix, {"role": "user", "content": next_instruction}]))
+                if estimate + summary_allowance + 2048 <= max_tokens:
+                    break
+                keep_messages -= 2
         if len(self.turns) <= keep_messages:
             logger.warning(
                 "Stepwise prompt is above budget (%s tokens) but no older complete turns can be compacted.",
@@ -220,7 +252,7 @@ class StepwiseConversation:
             f"{older_text}"
         )
         compaction_prompt = [
-            *self.base_messages,
+            {"role": "system", "content": "Summarize only the supplied completed coding turns faithfully. The caller retains the complete original task and authoritative constraints unchanged."},
             {"role": "user", "content": compaction_instruction},
         ]
         output_limit = max(
@@ -240,6 +272,7 @@ class StepwiseConversation:
                 max_tokens=output_limit,
                 max_retries=2,
                 cfg=agent_instance.cfg,
+                stage_id="stepwise_history_compaction",
             ).strip()
         except Exception as exc:  # noqa: BLE001
             self._fallback_to_legacy_rebuild(f"history compaction failed: {exc}")
@@ -396,11 +429,14 @@ class StepAgent:
 
         completion_text = None
         snapshot_retrieved = False
-        for _ in range(retries):
+        attempts = 0
+        original_prompt = request_prompt
+        while attempts < retries:
             completion_text = generate(
                 prompt=request_prompt,
                 temperature=agent_instance.acfg.code.temp,
-                cfg=agent_instance.cfg
+                cfg=agent_instance.cfg,
+                stage_id="stepwise_candidate_generation",
             )
             snapshot_request = (
                 conversation.requested_snapshot(completion_text)
@@ -424,8 +460,10 @@ class StepAgent:
                     )
                     if cumulative_prompt is not None:
                         request_prompt = cumulative_prompt
+                        original_prompt = cumulative_prompt
                         snapshot_retrieved = True
                         continue
+            attempts += 1
             nl_text, code = extract_plan_and_code(
                 completion_text,
                 default_plan=f"Implement only the {self.name} stage.",
@@ -438,11 +476,13 @@ class StepAgent:
                     logger.info("Accepted a valid code-first response for %s.", self.name)
                 return nl_text, code
 
-            logger.debug(f"Extraction retry for {self.name}...")
+            diagnostic = code_extraction_diagnostic(completion_text or "")
+            logger.warning("Extraction rejected for %s (%s/%s): %s", self.name, attempts, retries, diagnostic)
+            request_prompt = _correction_prompt(original_prompt, completion_text or "", diagnostic)
         logger.warning(f"Code extraction failed after retries for {self.name}")
         if conversation is not None and incremental_instruction and completion_text:
             conversation.record(incremental_instruction, completion_text)
-        return "", completion_text  # type: ignore
+        raise RuntimeError(f"No complete compilable code for stage {self.name} after {retries} attempts")
 
     def _build_prompt(
         self,
@@ -552,7 +592,7 @@ class StepAgent:
             else:
                 prompt_instructions["Implementation guideline"] = [base_impl_guideline] + step_specific_impl
 
-        stage_data_preview = data_preview_str
+        stage_data_preview = select_autorealize_context_for_stage(data_preview_str, self.name)
         logger.info(
             "Stepwise context route %s: %s -> %s chars",
             self.name,
@@ -671,50 +711,34 @@ class MetaAgent:
         request_prompt: str | dict[str, str] | List[Dict[str, str]] = prompt
         incremental_instruction = ""
         if conversation is not None and isinstance(prompt, dict):
+            # A faithful integration needs exact source, even when the working
+            # conversation has summarized earlier stages. Reuse the unchanged
+            # task prefix and supply each complete stage once; do not ask the
+            # model to reconstruct code from summaries or a retrieval round.
             incremental_instruction = _incremental_instruction(prompt, merge=True)
-            if context.expansion_control:
-                incremental_instruction = (
-                    f"{incremental_instruction}\n\n{context.expansion_control}"
-                )
-            cumulative_prompt = conversation.messages_for(
-                incremental_instruction,
-                agent_instance,
+            exact_stages = "\n\n".join(
+                f"## {stage['name']}\nPlan: {stage['plan']}\n{wrap_code(stage['code'])}"
+                for stage in step_results
             )
-            if cumulative_prompt is not None:
-                request_prompt = cumulative_prompt
-            else:
-                incremental_instruction = ""
+            incremental_instruction += (
+                "\n\n# Complete generated stage sources\n"
+                "These are the exact source modules to integrate. No source retrieval is necessary.\n"
+                + exact_stages
+            )
+            if context.expansion_control:
+                incremental_instruction += "\n\n" + context.expansion_control
+            request_prompt = [*conversation.base_messages,
+                              {"role": "user", "content": incremental_instruction}]
+        original_prompt = request_prompt
 
         completion_text = None
         for attempt in range(1, retries + 1):
             completion_text = generate(
                 prompt=request_prompt,
                 temperature=agent_instance.acfg.code.temp,
-                cfg=agent_instance.cfg
+                cfg=agent_instance.cfg,
+                stage_id="stepwise_solution_merge",
             )
-            snapshot_request = (
-                conversation.requested_snapshot(completion_text)
-                if conversation is not None and attempt == 1
-                else None
-            )
-            if snapshot_request is not None:
-                snapshot_id, reason = snapshot_request
-                exact_history = conversation.retrieve_snapshot(snapshot_id)
-                if exact_history:
-                    if incremental_instruction:
-                        conversation.record(incremental_instruction, completion_text)
-                    incremental_instruction = (
-                        f"# Exact retrieved context snapshot: {snapshot_id}\n"
-                        f"Reason requested: {reason}\n\n{exact_history}\n\n"
-                        "# Resume merge\nNow faithfully merge the three generated stages under the original latest instruction."
-                    )
-                    cumulative_prompt = conversation.messages_for(
-                        incremental_instruction,
-                        agent_instance,
-                    )
-                    if cumulative_prompt is not None:
-                        request_prompt = cumulative_prompt
-                        continue
             nl_text, code = extract_plan_and_code(
                 completion_text,
                 default_plan="Merge the generated stages into one runnable solution.",
@@ -725,7 +749,9 @@ class MetaAgent:
                     conversation.record(incremental_instruction, completion_text)
                 return nl_text or "Merged code from stepwise agents.", code
 
-            logger.debug("Extraction retry for MetaAgent merge after attempt %s/%s...", attempt, retries)
+            diagnostic = code_extraction_diagnostic(completion_text or "")
+            logger.warning("MetaAgent merge rejected (%s/%s): %s", attempt, retries, diagnostic)
+            request_prompt = _correction_prompt(original_prompt, completion_text or "", diagnostic)
         logger.error("Code extraction failed after %s MetaAgent merge attempts", retries)
         if conversation is not None and incremental_instruction and completion_text:
             conversation.record(incremental_instruction, completion_text)
@@ -812,7 +838,7 @@ class MetaAgent:
             "- All parts must work together seamlessly",
         ]
 
-        merge_data_preview = data_preview_str
+        merge_data_preview = select_autorealize_context_for_stage(data_preview_str, "merge")
         logger.info(
             "Stepwise context route merge: %s -> %s chars",
             len(data_preview_str or ""),

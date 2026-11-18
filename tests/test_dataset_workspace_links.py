@@ -1,8 +1,6 @@
 from pathlib import Path
 
 import utils
-
-
 def test_linked_nested_dataset_supports_recursive_discovery_and_relative_paths(tmp_path):
     source = tmp_path / "source"
     nested = source / "experiment" / "measurements"

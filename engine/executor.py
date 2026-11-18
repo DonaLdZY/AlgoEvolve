@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import threading
+import tempfile
 import time
 import traceback
 import subprocess
@@ -386,6 +387,7 @@ class Interpreter:
         start_time = time.time()
         runfile_path = None
         proc = None
+        subprocess_cwd_alias = None
         
         try:
             avail_cpus = self._available_cpus()
@@ -411,6 +413,13 @@ class Interpreter:
             with open(runfile_path, "w") as f:
                 f.write(code)
 
+            subprocess_wd = run_wd
+            if os.name == "nt" and len(str(run_wd)) >= 240:
+                alias_parent = tempfile.TemporaryDirectory(prefix="ade-")
+                subprocess_cwd_alias = alias_parent
+                subprocess_wd = Path(alias_parent.name) / "cwd"
+                subprocess_wd.symlink_to(run_wd, target_is_directory=True)
+
             child_in_overtime = False
             exc_type = None
             exc_info = {}
@@ -420,17 +429,18 @@ class Interpreter:
             while True:
                 execution_started_monotonic = time.monotonic()
                 cmd = memory_limited_subprocess_command(
-                    [sys.executable, str(runfile_path)]
+                    [sys.executable, str(subprocess_wd / runfile_path.name)]
                 )
                 proc = subprocess.Popen(
                     cmd,
-                    cwd=str(run_wd),
+                    cwd=str(subprocess_wd),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
                     env=self.dependency_installer.execution_environment(
-                        candidate_thread_environment({**os.environ, "PYTHONUNBUFFERED": "1"})
+                        candidate_thread_environment({**os.environ, "PYTHONUNBUFFERED": "1"}),
+                        redact_credentials=True,
                     ),
                 )
                 with self._procs_lock:
@@ -600,6 +610,11 @@ class Interpreter:
                     os.remove(runfile_path)
             except Exception as e:
                 logger.warning(f"Failed to remove runfile after subprocess execution: {e}")
+            if subprocess_cwd_alias is not None:
+                try:
+                    subprocess_cwd_alias.cleanup()
+                except Exception as e:
+                    logger.warning(f"Failed to remove temporary subprocess cwd alias: {e}")
             
             with self.lock:
                 if process_id is not None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
 from typing import Any, Iterable
 
@@ -158,23 +159,41 @@ def method_family_for_node(node: Any, *, task_family: str) -> str:
     )
 
 
-def _node_record(node: Any, *, task_family: str) -> dict[str, Any]:
+def _node_metric(node: Any) -> tuple[float | None, bool | None]:
     metric = getattr(node, "metric", None)
-    return {
-        "node_id": str(getattr(node, "id", "")),
-        "operator": str(getattr(node, "stage", "unknown")),
-        "sibling_ordinal": getattr(node, "sibling_ordinal", None),
-        "complexity": str(getattr(node, "expansion_complexity", "unknown")),
-        "method_family": method_family_for_node(node, task_family=task_family),
-        "score": getattr(metric, "value", None) if metric is not None else None,
-        "runtime_seconds": getattr(node, "exec_time", None),
-        "change": trim_long_string(str(getattr(node, "plan", "") or ""), threshold=700, k=350),
-        "failure_evidence": trim_long_string(
+    value = getattr(metric, "value", None) if metric is not None else None
+    direction = getattr(metric, "maximize", None) if metric is not None else None
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        value = None
+    return value, direction if isinstance(direction, bool) else None
+
+
+def _node_record(node: Any, *, task_family: str, direction: bool | None) -> str:
+    score, node_direction = _node_metric(node)
+    method = method_family_for_node(node, task_family=task_family)
+    label = str(getattr(node, "id", ""))[:8] or "unknown"
+    plan = trim_long_string(str(getattr(node, "plan", "") or ""), threshold=260, k=140)
+    if getattr(node, "is_buggy", None) is True:
+        status = "failed"
+    elif getattr(node, "is_buggy", None) is None:
+        status = "pending"
+    else:
+        status = "completed"
+
+    parts = [f"- {label} | {method} | {status}"]
+    if score is not None and direction is not None and node_direction is direction:
+        parts[0] += f" | score {score:.6g}"
+    if plan:
+        parts.append(f"  Approach: {plan}")
+    if status == "failed":
+        failure = trim_long_string(
             str(getattr(node, "analysis_for_prompt", "") or getattr(node, "analysis", "") or ""),
-            threshold=900,
-            k=450,
-        ),
-    }
+            threshold=320,
+            k=170,
+        )
+        if failure and failure != "N/A":
+            parts.append(f"  Observed failure: {failure}")
+    return "\n".join(parts)
 
 
 def _ancestors(node: Any) -> list[Any]:
@@ -194,9 +213,9 @@ def scoped_search_memory(
     operator: str,
     *,
     source_nodes: Iterable[Any] | None = None,
-    max_nodes: int = 12,
+    max_nodes: int = 8,
 ) -> str:
-    """Return operator-specific evidence rather than a global unbounded transcript."""
+    """Return a compact, score-aware evidence summary for the active search operator."""
 
     family = infer_task_family(agent)
     op = str(operator or "").lower()
@@ -228,9 +247,65 @@ def scoped_search_memory(
             continue
         seen.add(node_id)
         deduped.append(node)
-    deduped = sorted(deduped, key=lambda item: float(getattr(item, "ctime", 0.0) or 0.0))[-max_nodes:]
-    records = [_node_record(node, task_family=family) for node in deduped]
-    return json.dumps(records, ensure_ascii=False, sort_keys=True, indent=2, default=str)
+    directions = {
+        direction
+        for node in deduped
+        if getattr(node, "is_buggy", None) is False
+        for score, direction in [_node_metric(node)]
+        if score is not None and direction is not None
+    }
+    _, parent_direction = _node_metric(parent_node)
+    direction = parent_direction if parent_direction is not None else (next(iter(directions)) if len(directions) == 1 else None)
+
+    def recent(nodes: list[Any]) -> list[Any]:
+        return sorted(
+            nodes,
+            key=lambda item: (float(getattr(item, "ctime", 0.0) or 0.0), str(getattr(item, "id", ""))),
+            reverse=True,
+        )
+
+    scored = [
+        node for node in deduped
+        if getattr(node, "is_buggy", None) is False
+        and _node_metric(node)[0] is not None
+        and direction is not None
+        and _node_metric(node)[1] is direction
+    ]
+    scored.sort(
+        key=lambda item: (
+            _node_metric(item)[0] * (1 if direction else -1),
+            float(getattr(item, "ctime", 0.0) or 0.0),
+            str(getattr(item, "id", "")),
+        ),
+        reverse=True,
+    )
+    failed = recent([node for node in deduped if getattr(node, "is_buggy", None) is True])
+    pending = recent([node for node in deduped if getattr(node, "is_buggy", None) is None])
+    unscored = recent([
+        node for node in deduped
+        if getattr(node, "is_buggy", None) is False and node not in scored
+    ])
+    ordered = []
+    if parent_node in deduped:
+        ordered.append(parent_node)
+    ordered.extend(scored[:3])
+    ordered.extend(failed[:1])
+    ordered.extend(pending[:1])
+    ordered.extend(unscored)
+    ordered.extend(scored[3:])
+    ordered.extend(failed[1:])
+    ordered.extend(pending[1:])
+    ordered = list(dict.fromkeys(ordered))[:max(1, max_nodes)]
+
+    if not ordered:
+        return ""
+    if direction is None:
+        objective = "Score direction is unresolved; do not compare unverified or mixed-direction scores."
+    else:
+        objective = f"Score direction: {'higher' if direction else 'lower'} is better."
+    heading = f"Search evidence ({len(ordered)} selected attempts). {objective}"
+    records = [_node_record(node, task_family=family, direction=direction) for node in ordered]
+    return heading + "\n" + "\n".join(records)
 
 
 def method_family_coverage(agent: Any) -> dict[str, int]:
@@ -303,7 +378,12 @@ def dynamic_expansion_instruction(
         }
     else:
         complexity_rules = {
-            "simple": "Choose the best-fitting reliable approach with a short feedback loop, leakage-safe validation, and a reusable interface.",
+            "simple": (
+                "Get one complete, reliable method running with a short feedback loop, leakage-safe validation, and a reusable interface. "
+                "Use a single bounded training recipe: no multi-model tournament, stacking, broad grid or nested CV unless the task explicitly requires it. "
+                "A small neural model is allowed when appropriate; simple limits experiment cost, not model family. "
+                "Compare heavier alternatives in subsequent search nodes after the first runnable result."
+            ),
             "normal": "Choose a materially stronger or different approach supported by task structure and completed-node evidence.",
             "complex": "Permit a high-upside, higher-cost approach only when evidence, validation, and remaining runtime justify it.",
         }

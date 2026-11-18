@@ -46,30 +46,56 @@ def extract_evaluation_protocol(output: Any) -> dict[str, Any]:
         except (ValueError, TypeError):
             continue
         if isinstance(parsed, dict):
-            protocol = {
-                key: item for key, item in parsed.items()
-                if key in PROTOCOL_FIELDS and (
-                    isinstance(item, (str, int, float, bool, type(None)))
-                    or (key in {"cutoff", "horizon"} and isinstance(item, (dict, list)))
-                )
-            }
+            protocol = normalize_evaluation_protocol(parsed)
     summary = extract_decision_validation_summary(text)
     nested = summary.get("evaluation_protocol") if isinstance(summary, dict) else None
     if isinstance(nested, dict):
-        nested = {
-            key: item for key, item in nested.items()
-            if key in PROTOCOL_FIELDS and (
-                isinstance(item, (str, int, float, bool, type(None)))
-                or (key in {"cutoff", "horizon"} and isinstance(item, (dict, list)))
-            )
-        }
-        conflicts = {
-            key for key in protocol.keys() & nested.keys()
-            if json.dumps(protocol[key], sort_keys=True) != json.dumps(nested[key], sort_keys=True)
-        }
-        if conflicts:
-            # Conflicting reports must not hide exposure or qualify for ranking.
-            exposed = protocol.get("final_evaluation_accessed") is True or nested.get("final_evaluation_accessed") is True
-            return {"final_evaluation_accessed": exposed}
-        protocol = {**nested, **protocol}
+        return merge_evaluation_protocols(protocol, nested)
     return protocol
+
+
+def normalize_evaluation_protocol(value: Any) -> dict[str, Any]:
+    """Keep only bounded protocol fields from an untrusted candidate document."""
+
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: item for key, item in value.items()
+        if key in PROTOCOL_FIELDS and (
+            isinstance(item, (str, int, float, bool, type(None)))
+            or (key in {"cutoff", "horizon"} and isinstance(item, (dict, list)))
+        )
+    }
+
+
+def merge_evaluation_protocols(*values: Any) -> dict[str, Any]:
+    """Merge protocol receipts, marking disagreement instead of picking a winner."""
+
+    trusted_base = values[0] if values and isinstance(values[0], dict) else {}
+    expected = {
+        key: trusted_base[key]
+        for key in ("expected_contract_id", "expected_evaluation_id")
+        if isinstance(trusted_base.get(key), str) and trusted_base[key]
+    }
+    protocols = [normalize_evaluation_protocol(value) for value in values]
+    merged: dict[str, Any] = {}
+    conflicts: set[str] = set()
+    for protocol in protocols:
+        for key, value in protocol.items():
+            if key in merged and json.dumps(merged[key], sort_keys=True) != json.dumps(value, sort_keys=True):
+                conflicts.add(key)
+            else:
+                merged[key] = value
+
+    if conflicts or any(
+        isinstance(value, dict) and value.get("protocol_conflict") is True
+        for value in values
+    ):
+        result = {**expected, "protocol_conflict": True}
+        if any(protocol.get("final_evaluation_accessed") is True for protocol in protocols):
+            result["final_evaluation_accessed"] = True
+        elif any(protocol.get("final_evaluation_accessed") is False for protocol in protocols):
+            result["final_evaluation_accessed"] = False
+        return result
+
+    return {**expected, **merged}

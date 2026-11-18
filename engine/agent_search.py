@@ -10,7 +10,7 @@ from typing import Callable, List, Dict, Optional
 from engine.executor import ExecutionResult
 from engine.search_node import SearchNode, Journal
 from engine.expansion_profile import ExpansionProfile
-import utils.data_preview as data_preview
+from utils import data_preview
 from config import Config
 from utils.metric import WorstMetricValue
 import threading
@@ -28,7 +28,7 @@ from utils.data_preview import clean_task_desc
 from utils.autorealize_context import (
     build_autorealize_context_md,
     has_autorealize_context,
-    load_autorealize_description_md,
+    load_autorealize_task_summary,
     submission_required_from_context,
 )
 from agents.prompt_policy import (
@@ -65,10 +65,10 @@ class AgentSearch:
             )
         self.has_autorealize_context = bool(str(self.autorealize_context or "").strip())
         if self.has_autorealize_context:
-            self.task_desc = load_autorealize_description_md(input_dir, fallback=task_desc)
+            self.task_desc = load_autorealize_task_summary(input_dir, fallback=task_desc)
             logger.info(
-                "[AgentSearch] AutoRealize context detected; using description.md as task_desc "
-                "and automl_context.md as the replacement data context."
+                "[AgentSearch] AutoRealize context detected; using its structured objective as task_desc "
+                "and the stage-routed contract as data context."
             )
         else:
             self.task_desc = clean_task_desc(task_desc, cfg)
@@ -405,6 +405,28 @@ class AgentSearch:
                         return preflight_code(code, interface, require_final_evaluation=require_final_evaluation)
 
                     initial_preflight = candidate_preflight(result_node.code)
+                    original_code = result_node.code
+
+                    def preflight_issue_count(report):
+                        return (
+                            int(bool(report.syntax_error))
+                            + len(report.missing_functions)
+                            + len(report.invalid_signatures)
+                            + len(getattr(report, "invalid_calls", ()))
+                            + len(report.dangerous_findings)
+                            + len(getattr(report, "policy_findings", ()))
+                        )
+
+                    def preflight_signature(report):
+                        return (
+                            report.syntax_error,
+                            report.missing_functions,
+                            report.invalid_signatures,
+                            getattr(report, "invalid_calls", ()),
+                            report.dangerous_findings,
+                            getattr(report, "policy_findings", ()),
+                        )
+
                     if init_solution_path and not require_final_evaluation:
                         logger.info(f"Node {result_node.id} from init_solution, skipping code review")
                     elif not require_final_evaluation and fast_draft_mode and initial_preflight.ok and bool(
@@ -436,22 +458,31 @@ class AgentSearch:
                             )
                             reviewed_code = result_node.code
                         if reviewed_code.strip() != result_node.code.strip():
-                            logger.info(f"Node {result_node.id} code has been reviewed and modified")
-                            result_node.code = reviewed_code
+                            reviewed_preflight = candidate_preflight(reviewed_code)
+                            edit_reduces_preflight = (
+                                reviewed_preflight.ok
+                                if initial_preflight.ok
+                                else (
+                                    reviewed_preflight.ok
+                                    or preflight_issue_count(reviewed_preflight)
+                                    < preflight_issue_count(initial_preflight)
+                                )
+                            )
+                            if edit_reduces_preflight:
+                                logger.info(f"Node {result_node.id} code has been reviewed and modified")
+                                result_node.code = reviewed_code
+                            else:
+                                result_node.preexecution_review_warnings.append(
+                                    "Reviewer edit did not improve deterministic preflight; original code was retained."
+                                )
+                                logger.warning(
+                                    "Discarding review edit for node %s because deterministic preflight did not improve",
+                                    result_node.id,
+                                )
                         else:
-                            logger.info(f"Node {result_node.id} passed code review without changes")
+                            logger.info(f"Node {result_node.id} review returned no code changes")
 
                     final_preflight = candidate_preflight(result_node.code)
-                    if not final_preflight.ok:
-                        result_node.preflight_report = final_preflight.__dict__
-                        logger.warning(
-                            "Node %s still fails deterministic preflight; requesting one focused repair",
-                            result_node.id,
-                        )
-                        repaired_code = code_review_agent.run(self, result_node)
-                        if repaired_code.strip() != result_node.code.strip():
-                            result_node.code = repaired_code
-                        final_preflight = candidate_preflight(result_node.code)
                     max_regenerations = max(
                         0,
                         int(
@@ -495,15 +526,27 @@ class AgentSearch:
                             continue
                         result_node.plan = regenerated_plan or result_node.plan
                         result_node.code = regenerated_code
-                        final_preflight = candidate_preflight(result_node.code)
+                        next_preflight = candidate_preflight(result_node.code)
                         logger.info(
                             "Preflight regeneration %s/%s for node %s: ok=%s issues=%s",
                             regeneration_attempt,
                             max_regenerations,
                             result_node.id,
-                            final_preflight.ok,
-                            final_preflight,
+                            next_preflight.ok,
+                            next_preflight,
                         )
+                        if (
+                            not next_preflight.ok
+                            and preflight_signature(next_preflight)
+                            == preflight_signature(final_preflight)
+                        ):
+                            logger.warning(
+                                "Stopping preflight regeneration for node %s because the deterministic failure did not change",
+                                result_node.id,
+                            )
+                            final_preflight = next_preflight
+                            break
+                        final_preflight = next_preflight
                     result_node.solution_interface = interface.kind
                     result_node.preflight_report = final_preflight.__dict__
                     if not final_preflight.ok:

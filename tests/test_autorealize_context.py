@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "utils" / "autorealize_context.py"
 _SPEC = importlib.util.spec_from_file_location("algoevolve_autorealize_context_for_test", _MODULE_PATH)
@@ -11,10 +12,75 @@ _CTX = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_CTX)
 
 
+def test_routing_preserves_contract_tail_unknown_sections_and_schema():
+    from agents.prompt_cache import routed_data_context
+    text = """## AutoRealize Structured Context
+## Evaluation Contract Reference
+Fixed chronological split. Do not access final holdout.
+## Exact Source Schema Contract
+""" + "exact source column\n" * 4000 + """LAST_PHYSICAL_COLUMN
+## Supplemental Data Facts
+optional verbose profile
+## Newly Added Mandatory Contract
+Never discard an unclassified requirement.
+## Output Contract Reference
+FINAL_REQUIRED_OUTPUT
+"""
+    agent = SimpleNamespace(autorealize_context=text, data_preview="stale preview")
+    for stage in ("draft", "debug", "improve", "fusion", "code_review", "result_parse"):
+        routed = routed_data_context(agent, stage)
+        assert "LAST_PHYSICAL_COLUMN" in routed
+        assert "Fixed chronological split" in routed
+        assert "Never discard an unclassified requirement" in routed
+        assert "FINAL_REQUIRED_OUTPUT" in routed
+        assert "optional verbose profile" not in routed
+    assert routed_data_context(agent, "unknown-stage") == text.strip()
+    assert routed_data_context(SimpleNamespace(data_preview="plain preview"), "draft") == "plain preview"
+
+
 def test_task_description_preserves_requirements_after_30000_characters(tmp_path):
     description = "Task detail. " * 3000 + "FINAL_MANDATORY_RULE"
     (tmp_path / "description.md").write_text(description, encoding="utf-8")
     assert _CTX.load_autorealize_description_md(tmp_path) == description
+
+
+def test_autorealize_search_summary_is_short_while_full_contract_remains_routed(tmp_path):
+    description = "Repeated descriptive background. " * 900 + "Final source record remains unchanged."
+    (tmp_path / "description.md").write_text(description, encoding="utf-8")
+    pack = {
+        "problem_paradigm": "ml_dl_prediction",
+        "task_goal": "Predict the next hour Al(N) using only observations visible by the cutoff.",
+        "data_access": [{"path": "设备.csv", "read_method": "pandas.read_csv"}],
+        "data_schema_contract": {
+            "rules": ["Use exact source columns."],
+            "tables": [{"table_id": "设备.csv", "physical_columns_exact": ["SampleTime", "蒸汽进气流量"]}],
+        },
+        "evaluation_contract": {
+            "primary_metric": "MAE",
+            "metric_direction": "minimize",
+            "validation_protocol": "Chronological 60/20/20 split; never access holdout during search.",
+            "leakage_guards": ["Use no observation after prediction cutoff."],
+        },
+        "output_contract": {
+            "output_kind": "artifact",
+            "output_filename": "model package",
+            "columns": ["prediction_time", "predicted_al_n"],
+        },
+    }
+    (tmp_path / "automl_context_pack.json").write_text(json.dumps(pack), encoding="utf-8")
+
+    summary = _CTX.load_autorealize_task_summary(tmp_path)
+    context = _CTX.build_autorealize_context_md(tmp_path, write_context_file=False)
+    routed = _CTX.select_autorealize_context_for_stage(context, "code_review")
+
+    assert len(summary) < 250
+    assert "next hour Al(N)" in summary
+    assert "Repeated descriptive background" not in summary
+    assert _CTX.load_autorealize_description_md(tmp_path) == description
+    assert "SampleTime" in routed
+    assert "never access holdout during search" in routed
+    assert "Use no observation after prediction cutoff" in routed
+    assert "predicted_al_n" in routed
 
 
 def test_short_autorealize_stub_is_not_prompt_ready(tmp_path: Path) -> None:
@@ -221,3 +287,47 @@ Stable introduction.
     assert "metric_direction: minimize" in model_context
     assert "output_filename: submission.csv" in training_context
     assert _CTX.select_autorealize_context_for_stage("plain preview", "model_design") == "plain preview"
+
+
+def test_review_routes_keep_contracts_but_drop_unrelated_long_sections() -> None:
+    text = """## AutoRealize Structured Context
+Stable introduction.
+
+## Execution Contract
+- split and final evaluation isolation
+
+## Exact Source Schema Contract
+- physical_columns_exact: `exact_field`
+
+## Evaluation Contract Reference
+- metric_direction: minimize
+
+## Output Contract Reference
+- output_filename: submission.csv
+
+## Problem Boundary Reference
+- data boundary and prediction population
+
+## Constraints Reference
+- hard constraint
+
+## Leakage Guards
+- no leakage
+
+## Supplemental Data Facts
+- verbose table profile that should not be repeated in result review
+
+## Method Strategy
+- irrelevant method suggestion
+"""
+
+    result_context = _CTX.select_autorealize_context_for_stage(text, "result_parsing")
+    code_context = _CTX.select_autorealize_context_for_stage(text, "code_review")
+
+    assert "split and final evaluation isolation" in result_context
+    assert "metric_direction: minimize" in result_context
+    assert "data boundary and prediction population" in result_context
+    assert "verbose table profile" not in result_context
+    assert "irrelevant method suggestion" not in result_context
+    assert "physical_columns_exact: `exact_field`" in code_context
+    assert "verbose table profile" not in code_context

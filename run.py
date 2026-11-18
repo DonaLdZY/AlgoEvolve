@@ -703,7 +703,7 @@ def run():
                     (ordinal == 1 and getattr(draft_cfg, "fast_first_draft", True))
                     or (
                         ordinal > 1
-                        and not getattr(draft_cfg, "use_stepwise_after_first", True)
+                        and not getattr(draft_cfg, "use_stepwise_after_first", False)
                     )
                 )
             )
@@ -745,7 +745,7 @@ def run():
     logger.info(
         "Worker-local draft generation: fast_first=%s, stepwise_after_first=%s",
         bool(getattr(draft_cfg, "fast_first_draft", True)),
-        bool(getattr(draft_cfg, "use_stepwise_after_first", True)),
+        bool(getattr(draft_cfg, "use_stepwise_after_first", False)),
     )
     if run_deadline is not None:
         logger.info(

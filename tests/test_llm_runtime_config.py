@@ -24,15 +24,34 @@ def test_request_context_allots_output_after_complete_input(monkeypatch):
     assert len(received) == 1
 
 
-def test_normal_requests_enforce_32768_output_floor_for_both_backends() -> None:
+def test_explicit_stage_budgets_take_precedence_for_both_backends() -> None:
     stage = SimpleNamespace(max_tokens=4096, minimum_output_tokens=32768)
 
-    assert openai_backend._resolve_max_tokens(3072, stage) == 32768
-    assert gemini_backend._resolve_max_tokens(3072, stage) == 32768
+    assert openai_backend._resolve_max_tokens(3072, stage) == 3072
+    assert gemini_backend._resolve_max_tokens(3072, stage) == 3072
     assert openai_backend._resolve_max_tokens(65536, stage) == 65536
     assert gemini_backend._resolve_max_tokens(65536, stage) == 65536
-    assert openai_backend._resolve_max_tokens(None, SimpleNamespace(max_tokens=None)) == 32768
-    assert gemini_backend._resolve_max_tokens(None, SimpleNamespace(max_tokens=None)) == 32768
+    for backend in (openai_backend, gemini_backend):
+        assert backend._resolve_max_tokens(None, SimpleNamespace(max_tokens=None)) is None
+        assert backend._resolve_max_tokens(None, stage) == 32768
+        assert backend._resolve_max_tokens(None, SimpleNamespace(max_tokens=8192)) == 8192
+
+
+def test_long_complete_review_can_use_remaining_reply_budget_without_clipping_input(monkeypatch):
+    calls = []
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kw: calls.append(kw) or "ok")))
+    stage = SimpleNamespace(context_window_tokens=131072)
+    original = [{"role": "user", "content": "Entire task, candidate, and all review evidence"}]
+    monkeypatch.setattr(openai_backend, "estimate_text_tokens", lambda _: 76544)
+    assert openai_backend._create_with_retry(client, {"messages": original, "max_tokens": 32768},
+        label="review", stage=stage) == "ok"
+    assert calls[0]["max_tokens"] == 131072 - 76544 - int(131072 * .18)
+    assert calls[0]["messages"] == original
+    stage.context_minimum_reply_tokens = 32768
+    with pytest.raises(ValueError, match="context budget"):
+        openai_backend._create_with_retry(client, {"messages": original, "max_tokens": 32768},
+            label="review", stage=stage)
 
 
 def test_openai_retry_policy_uses_stage_config(monkeypatch) -> None:
@@ -70,6 +89,15 @@ def test_continuation_overlap_window_is_configurable() -> None:
     overlap = "0123456789abcdefghij"
     assert openai_backend._append_with_overlap(f"abc{overlap}", f"{overlap}def", 20) == f"abc{overlap}def"
     assert openai_backend._append_with_overlap(f"abc{overlap}", f"{overlap}def", 15) == f"abc{overlap}{overlap}def"
+
+
+def test_continuation_removes_short_repeated_identifier_fragment() -> None:
+    prefix = "import warnings\nwarnings.filterw"
+    continuation = 'filterwarnings("ignore")\n'
+    expected = 'import warnings\nwarnings.filterwarnings("ignore")\n'
+
+    assert openai_backend._append_with_overlap(prefix, continuation) == expected
+    assert gemini_backend._append_with_overlap(prefix, continuation) == expected
 
 
 def test_deepseek_beta_uses_chat_prefix_completion_and_continuation_clears_marker() -> None:

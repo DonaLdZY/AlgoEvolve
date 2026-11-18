@@ -1,7 +1,12 @@
 import json
 import pytest
 
-from engine.execution_evidence import candidate_failure_evidence, failure_csv_header_evidence, failure_context
+from engine.execution_evidence import (
+    candidate_evaluation_protocol,
+    candidate_failure_evidence,
+    failure_csv_header_evidence,
+    failure_context,
+)
 
 
 @pytest.mark.parametrize("filename", ["evaluation_failure.json", "run_failure.json"])
@@ -31,6 +36,52 @@ def test_failure_evidence_handles_large_or_malformed_payload(tmp_path):
     assert candidate_failure_evidence(tmp_path, "candidate")["content_status"] == "unreadable_json"
     path.write_bytes(b"x" * 16385)
     assert candidate_failure_evidence(tmp_path, "candidate")["content_status"] == "exceeds_16KiB_diagnostic_limit"
+
+
+def test_protocol_evidence_reads_only_current_node_allowlisted_paths(tmp_path):
+    evidence = tmp_path / "node_runs/candidate/working/evidence"
+    evidence.mkdir(parents=True)
+    protocol = {
+        "evaluation_phase": "search",
+        "scoring_split": "development",
+        "final_evaluation_accessed": False,
+        "private_extra": "ignored by protocol normalizer",
+    }
+    (evidence / "evaluation_protocol.json").write_text(json.dumps(protocol), encoding="utf-8")
+
+    assert candidate_evaluation_protocol(tmp_path, "candidate") == (protocol, "read")
+    assert candidate_evaluation_protocol(tmp_path, "another") == (None, "missing")
+
+
+def test_protocol_evidence_rejects_symlinks_malformed_and_oversized_files(tmp_path):
+    evidence = tmp_path / "node_runs/candidate/working/evidence"
+    evidence.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"evaluation_phase":"search"}', encoding="utf-8")
+    (evidence / "evaluation_protocol.json").symlink_to(outside)
+    assert candidate_evaluation_protocol(tmp_path, "candidate") == (None, "unsafe_path")
+
+    (evidence / "evaluation_protocol.json").unlink()
+    (evidence / "evaluation_protocol.json").write_text("{", encoding="utf-8")
+    assert candidate_evaluation_protocol(tmp_path, "candidate") == (None, "invalid")
+
+    (evidence / "evaluation_protocol.json").write_bytes(b"x" * (16 * 1024 + 1))
+    assert candidate_evaluation_protocol(tmp_path, "candidate") == (None, "too_large")
+
+
+def test_conflicting_protocol_receipt_files_fail_closed(tmp_path):
+    evidence = tmp_path / "node_runs/candidate/working/evidence"
+    evidence.mkdir(parents=True)
+    (evidence / "evaluation_protocol.json").write_text(
+        '{"evaluation_phase":"search","scoring_split":"development","final_evaluation_accessed":false}',
+        encoding="utf-8",
+    )
+    (evidence / "evaluation_protocol_summary.json").write_text(
+        '{"evaluation_phase":"search","scoring_split":"holdout","final_evaluation_accessed":false}',
+        encoding="utf-8",
+    )
+
+    assert candidate_evaluation_protocol(tmp_path, "candidate") == (None, "conflict")
 
 
 def test_header_probe_preserves_actual_encoding_and_only_reads_named_failure(tmp_path):

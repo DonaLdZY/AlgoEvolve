@@ -96,6 +96,7 @@ def run(agent, node: SearchNode) -> dict:
                 model=agent.acfg.feedback.model,
                 temperature=agent.acfg.feedback.temp,
                 stage_name="feedback",
+                stage_id="data_leakage_review",
                 cfg=agent.cfg
             ),
         )

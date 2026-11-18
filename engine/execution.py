@@ -84,15 +84,38 @@ def update_node_certification(agent, node: SearchNode) -> None:
     metric = getattr(node, "metric", None)
     protocol = getattr(node, "evaluation_protocol", {}) or {}
     if getattr(agent, "has_autorealize_context", False) and node.exc_type is None:
+        expected_identity_matches = all(
+            not protocol.get(expected_key)
+            or protocol.get(actual_key) == protocol[expected_key]
+            for expected_key, actual_key in (
+                ("expected_contract_id", "contract_id"),
+                ("expected_evaluation_id", "evaluation_id"),
+            )
+        )
         phase_ok = (
-            protocol.get("evaluation_phase") == "search"
+            protocol.get("protocol_evidence_status") == "read"
+            and protocol.get("protocol_conflict") is not True
+            and expected_identity_matches
+            and protocol.get("evaluation_phase") == "search"
             and isinstance(protocol.get("scoring_split"), str)
             and bool(protocol["scoring_split"].strip())
             and protocol.get("final_evaluation_accessed") is False
         )
         if not phase_ok:
             node.is_valid = False
-            _append_nonfatal_decision_warning(node, "Search scoring provenance is missing or reports final-evaluation access; this candidate cannot be ranked. Required: evaluation_phase=search, actual scoring_split, final_evaluation_accessed=false.")
+            _append_nonfatal_decision_warning(
+                node,
+                "Search scoring provenance is missing, conflicting, or mismatched; "
+                "this candidate cannot be ranked. Required: a readable current-node "
+                "./working/evidence/evaluation_protocol.json file (max 16 KiB; "
+                "other filenames are not read), matching contract/evaluation IDs when supplied, "
+                "evaluation_phase=search, actual scoring_split, and "
+                "final_evaluation_accessed=false. Keep row-ID arrays in a separate file; "
+                "split_fingerprint must be a digest string. "
+                f"Observed protocol_evidence_status={protocol.get('protocol_evidence_status', 'missing')}; "
+                f"expected_contract_id={protocol.get('expected_contract_id')}; "
+                f"expected_evaluation_id={protocol.get('expected_evaluation_id')}.",
+            )
     metric_value = getattr(metric, "value", None) if metric is not None else None
     finite_metric = isinstance(metric_value, (int, float)) and math.isfinite(float(metric_value))
     artifacts = find_model_artifacts(agent.cfg.workspace_dir, str(node.id))
@@ -114,7 +137,11 @@ def update_node_certification(agent, node: SearchNode) -> None:
     # longer form an independent gate for best-node or Top-K selection.
     output_deferred = getattr(node, "output_scope", "unknown") == "development_validation_only"
     node.delivery_ready = node.search_eligible and not output_deferred
-    node.delivery_certified = bool(node.delivery_ready and node.score_recomputed)
+    node.delivery_certified = bool(
+        node.delivery_ready
+        and node.score_recomputed
+        and node.artifact_ready
+    )
     node.certification_source = (
         "independent_evaluator"
         if node.delivery_certified

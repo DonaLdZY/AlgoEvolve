@@ -90,6 +90,7 @@ def generate(
     json_schema=None,
     max_retries=None,
     retry_delay=None,
+    stage_id=None,
 ):
     """Streaming text generation. Dispatches to Gemini or OpenAI-compatible backend by cfg.agent.code.model."""
     model = getattr(cfg.agent.code, "model", "") or ""
@@ -103,6 +104,7 @@ def generate(
             json_schema=json_schema,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            stage_id=stage_id,
         )
     return _gemini.generate(
         prompt=prompt,
@@ -113,4 +115,5 @@ def generate(
         json_schema=json_schema,
         max_retries=max_retries,
         retry_delay=retry_delay,
+        stage_id=stage_id,
     )

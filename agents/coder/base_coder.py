@@ -11,7 +11,7 @@ import logging
 from typing import Tuple
 
 from llm import generate
-from utils.response import extract_plan_and_code
+from utils.response import extract_plan_and_code, code_extraction_diagnostic
 from agents.prompts import plan_and_code_response_format
 from agents.prompts.shared import PLAN_AND_CODE_RESPONSE_FORMAT
 
@@ -43,6 +43,7 @@ def plan_and_code_query(
     agent_instance,
     prompt,
     retries: int = 3,
+    stage_id: str = "candidate_code_generation",
 ) -> Tuple[str, str]:
     """Generate a complete plan and script; never return prose as executable code."""
     retry_cfg = getattr(agent_instance.acfg, "retries", None)
@@ -51,15 +52,18 @@ def plan_and_code_query(
         int(getattr(retry_cfg, "code_generation_extract_max_attempts", retries)),
     )
     completion_text = None
+    current_prompt = prompt
     for attempt in range(retries):
         completion_text = generate(
-            prompt=prompt,
+            prompt=current_prompt,
             temperature=agent_instance.acfg.code.temp,
             cfg=agent_instance.cfg,
+            stage_id=stage_id,
         )
         nl_text, code = extract_plan_and_code(
             completion_text,
             default_plan="Implement the requested complete solution and report its validation metric.",
+            allow_last_complete_block=True,
         )
 
         if code:
@@ -69,5 +73,25 @@ def plan_and_code_query(
 
         logger.warning("No complete Python script extracted from response (%s chars), attempt %s/%s",
                        len(completion_text or ""), attempt + 1, retries)
+        if attempt + 1 < retries:
+            diagnostic = code_extraction_diagnostic(completion_text or "")[:1200]
+            logger.warning("Code extraction diagnostic: %s", diagnostic)
+            instruction = ("The previous response was rejected before execution. " + diagnostic
+                + "\nRegenerate the complete solution from the original task and data contract. "
+                  "Preserve all constraints, interfaces, and evaluation boundaries. Return one short plan "
+                  "and exactly one complete runnable Python code block. Do not include analysis or examples. "
+                  "No previous code was executed.")
+            if isinstance(prompt, list):
+                current_prompt = [
+                    *prompt,
+                    {"role": "user", "content": "# Required correction\n" + instruction},
+                ]
+            elif isinstance(prompt, dict) and isinstance(prompt.get("user"), str):
+                current_prompt = {
+                    **prompt,
+                    "user": prompt["user"] + "\n\n# Required correction\n" + instruction,
+                }
+            else:
+                current_prompt = str(prompt) + "\n\n# Required correction\n" + instruction
 
     raise RuntimeError("Code extraction failed after retries; original responses remain in the verbose log")

@@ -53,7 +53,11 @@ def _append_with_overlap(
     if not base or not addition:
         return f"{base}{addition}"
     max_scan = min(len(base), len(addition), max(0, int(max_scan_chars)))
-    for size in range(max_scan, 15, -1):
+    minimum_overlap = 6 if (
+        (base[-1].isalnum() or base[-1] == "_")
+        and (addition[0].isalnum() or addition[0] == "_")
+    ) else 16
+    for size in range(max_scan, minimum_overlap - 1, -1):
         if base[-size:] == addition[:size]:
             return base + addition[size:]
     return base + addition
@@ -218,9 +222,9 @@ def _stage_max_tokens(stage) -> int | None:
 
 def _stage_minimum_output_tokens(stage) -> int:
     try:
-        tokens = int(getattr(stage, "minimum_output_tokens", 32768) or 0)
+        tokens = int(getattr(stage, "minimum_output_tokens", 0) or 0)
     except (TypeError, ValueError):
-        tokens = 32768
+        tokens = 0
     return max(0, tokens)
 
 
@@ -229,8 +233,9 @@ def _resolve_max_tokens(explicit_value, stage) -> int | None:
         explicit = int(explicit_value) if explicit_value is not None else 0
     except (TypeError, ValueError):
         explicit = 0
-    requested = explicit if explicit > 0 else int(_stage_max_tokens(stage) or 0)
-    effective = max(requested, _stage_minimum_output_tokens(stage))
+    if explicit > 0:
+        return explicit
+    effective = max(int(_stage_max_tokens(stage) or 0), _stage_minimum_output_tokens(stage))
     return effective or None
 
 
@@ -380,6 +385,7 @@ def query(
     t0 = time.time()
     logger.info(f"Querying Gemini with model: {filtered_kwargs.get('model')}")
     prompt_name = str(filtered_kwargs.get("prompt_name") or infer_prompt_name("query"))
+    stage_id = str(filtered_kwargs.get("stage_id") or "").strip() or None
 
     try:
         last_exc: Exception | None = None
@@ -445,6 +451,7 @@ def query(
         log_llm_usage(
             cfg=cfg,
             prompt_name=prompt_name,
+            stage_id=stage_id,
             mode="query_function" if func_spec is not None else "query_text",
             provider="gemini",
             model=filtered_kwargs.get("model", "gemini-3-pro-preview"),
@@ -491,6 +498,7 @@ def generate(
     json_schema: dict | None = None,
     max_retries: int | None = None,
     retry_delay: float | None = None,
+    stage_id: str | None = None,
 ) -> str:
     """Streaming text generation via Gemini API.
 
@@ -599,6 +607,7 @@ def generate(
             log_llm_usage(
                 cfg=cfg,
                 prompt_name=prompt_name,
+                stage_id=stage_id,
                 mode="generate_stream",
                 provider="gemini",
                 model=model_name,
@@ -667,6 +676,7 @@ def generate(
                 log_llm_usage(
                     cfg=cfg,
                     prompt_name=f"{prompt_name}:continuation_{continuation_round}",
+                    stage_id=stage_id,
                     mode="generate_stream_continuation",
                     provider="gemini",
                     model=model_name,

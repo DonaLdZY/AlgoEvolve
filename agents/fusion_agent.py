@@ -144,9 +144,17 @@ def fuse_two_nodes(
             plan, code = _diff_fusion(agent, prompt, routed_data_context(agent, "merge"), source_node)
         except Exception as e:
             logger.warning(f"Diff fusion failed: {e}, falling back to full fusion")
-            plan, code = plan_and_code_query(agent, prompt_complete)
+            plan, code = plan_and_code_query(
+                agent,
+                prompt_complete,
+                stage_id="fusion_code_generation",
+            )
     else:
-        plan, code = plan_and_code_query(agent, prompt_complete)
+        plan, code = plan_and_code_query(
+            agent,
+            prompt_complete,
+            stage_id="fusion_code_generation",
+        )
 
     from_topk = getattr(source_node, '_topk_triggered', False)
 
@@ -262,9 +270,17 @@ def _fuse_with_multiple_references(
             plan, code = _diff_multi_fusion(agent, prompt, routed_data_context(agent, "merge"), parent_node)
         except Exception as e:
             logger.warning(f"Diff multi-fusion failed: {e}, falling back to full rewrite")
-            plan, code = plan_and_code_query(agent, prompt_complete)
+            plan, code = plan_and_code_query(
+                agent,
+                prompt_complete,
+                stage_id="multi_fusion_code_generation",
+            )
     else:
-        plan, code = plan_and_code_query(agent, prompt_complete)
+        plan, code = plan_and_code_query(
+            agent,
+            prompt_complete,
+            stage_id="multi_fusion_code_generation",
+        )
 
     from_topk = getattr(parent_node, '_topk_triggered', False)
 
@@ -415,6 +431,7 @@ def _diff_fusion(agent, prompt_base, data_preview, source_node):
         your_task_section=_FUSION_PLANNER_TASK,
         assistant_suffix=_build_fusion_planner_suffix(prompt_base, data_preview, context),
         stage_name="FusionPlanning",
+        stage_id="fusion_planning",
     )
 
     modules = planning_result.get('module', [])
@@ -442,6 +459,7 @@ def _diff_fusion(agent, prompt_base, data_preview, source_node):
         execution_output="",
         introduction=_FUSION_DIFF_INTRODUCTION,
         extra_context=extra_context,
+        stage_id="fusion_diff_generation",
     )
 
 
@@ -465,6 +483,7 @@ def _diff_multi_fusion(agent, prompt_base, data_preview, parent_node):
         your_task_section=_MULTI_FUSION_PLANNER_TASK,
         assistant_suffix=_build_multi_fusion_planner_suffix(prompt_base, data_preview, context),
         stage_name="MultiFusionPlanning",
+        stage_id="multi_fusion_planning",
     )
 
     modules = planning_result.get('module', [])
@@ -492,4 +511,5 @@ def _diff_multi_fusion(agent, prompt_base, data_preview, parent_node):
         execution_output="",
         introduction=_MULTI_FUSION_DIFF_INTRODUCTION,
         extra_context=extra_context,
+        stage_id="multi_fusion_diff_generation",
     )

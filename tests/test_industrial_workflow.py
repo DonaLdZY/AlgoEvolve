@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 from agents.aggregation_agent import _collect_branch_representatives
@@ -84,6 +85,63 @@ def test_structured_decision_route_has_no_prediction_wrapper_requirement():
     assert list(result)[-1] == "Current execution budget"
 
 
+def test_simple_non_autorealize_prediction_draft_uses_compact_scoped_contract():
+    agent = SimpleNamespace(
+        task_desc="Build a binary classifier from the supplied CSV and score accuracy.",
+        coldstart_description="",
+        data_preview="Columns: x1, x2, label. 100 rows.",
+        autorealize_context="",
+        has_autorealize_context=False,
+        start_time=time.time(),
+        current_step=1,
+        acfg=SimpleNamespace(
+            time_limit=600, steps=4, expose_prediction=False,
+            k_fold_validation=0, generate_submission=False,
+        ),
+        cfg=SimpleNamespace(
+            exec=SimpleNamespace(timeout=60, auto_install_missing_dependencies=False),
+            pretrain_model_dir="",
+        ),
+    )
+
+    result = get_impl_guideline_from_agent(agent, fast_draft=True)
+    guidelines = "\n".join(result["Implementation guideline"])
+
+    assert len(guidelines) < 1800
+    assert "train(data, artifact_dir)" in guidelines
+    assert "predict(model_path, data)" in guidelines
+    assert "Keep standard output limited" in guidelines
+    assert "Evaluation Protocol Summary" not in guidelines
+    assert "final_evaluate(data, artifact_dir)" not in guidelines
+
+
+def test_formal_autorealize_fast_draft_keeps_lifecycle_contract_without_stdout_diagnostic():
+    agent = SimpleNamespace(
+        task_desc="Forecast the next observation.",
+        coldstart_description="",
+        data_preview="## AutoRealize Structured Context\nExecution Contract: contract-1",
+        autorealize_context="## AutoRealize Structured Context\nExecution Contract: contract-1",
+        has_autorealize_context=True,
+        start_time=time.time(),
+        current_step=1,
+        acfg=SimpleNamespace(
+            time_limit=600, steps=4, expose_prediction=False,
+            k_fold_validation=0, generate_submission=False,
+        ),
+        cfg=SimpleNamespace(
+            exec=SimpleNamespace(timeout=60, auto_install_missing_dependencies=False),
+            pretrain_model_dir="",
+        ),
+    )
+
+    result = get_impl_guideline_from_agent(agent, fast_draft=True)
+    guidelines = "\n".join(result["Implementation guideline"])
+
+    assert "Formal AutoRealize tasks must define" in guidelines
+    assert "Persist an Evaluation Protocol Summary" in guidelines
+    assert "Print Evaluation Protocol Summary" not in guidelines
+
+
 def test_resource_budget_changes_leave_long_implementation_prefix_identical():
     first = get_impl_guideline(3600, 20, 120)
     second = get_impl_guideline(1200, 8, 60)
@@ -100,6 +158,8 @@ def test_generation_and_review_require_selected_recipe_for_reusable_training():
         assert "relative to the solution" in rules
         assert "artifact manifest" in rules
         assert "fallback" in rules or "fall back" in rules
+        assert "./working/artifact/" in rules
+        assert "./working/evidence/" in rules
 
 
 def test_preflight_uses_exported_entrypoints_despite_estimator_method_names():

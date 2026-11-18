@@ -120,6 +120,16 @@ def _prompt_stage(prompt_name: str) -> str:
     return "other"
 
 
+def _single_stage_id(prompt_item: dict[str, Any]) -> str:
+    counts = prompt_item.get("stage_id_counts", {})
+    if not isinstance(counts, dict):
+        return "unknown_stage"
+    stage_ids = [str(key) for key, count in counts.items() if int(count or 0) > 0]
+    if len(stage_ids) == 1:
+        return stage_ids[0]
+    return "mixed_stage" if stage_ids else "unknown_stage"
+
+
 def infer_prompt_name(prefix: str) -> str:
     """Infer a useful prompt label without changing every agent call site."""
     try:
@@ -282,6 +292,9 @@ def _new_summary() -> dict[str, Any]:
         "prompt_cache_miss_tokens": 0,
         "provider_cache_known_prompt_tokens": 0,
         "provider_cache_unknown_prompt_tokens": 0,
+        "provider_cache_observed_calls": 0,
+        "provider_cache_hit_calls": 0,
+        "provider_cache_unknown_calls": 0,
         "provider_usage_missing_calls": 0,
         "estimated_prompt_tokens": 0,
         "estimated_completion_tokens": 0,
@@ -289,6 +302,7 @@ def _new_summary() -> dict[str, Any]:
         "system_fingerprints": {},
         "by_prompt_part": {},
         "by_prompt": {},
+        "by_stage_id": {},
         "by_model": {},
     }
 
@@ -306,7 +320,35 @@ def _new_model_bucket(model: str) -> dict[str, Any]:
         "prompt_cache_miss_tokens": 0,
         "provider_cache_known_prompt_tokens": 0,
         "provider_cache_unknown_prompt_tokens": 0,
+        "provider_cache_observed_calls": 0,
+        "provider_cache_hit_calls": 0,
+        "provider_cache_unknown_calls": 0,
         "provider_usage_missing_calls": 0,
+    }
+
+
+def _new_stage_bucket(stage_id: str) -> dict[str, Any]:
+    return {
+        "stage_id": stage_id,
+        "calls": 0,
+        "seconds": 0.0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 0,
+        "provider_cache_known_prompt_tokens": 0,
+        "provider_cache_unknown_prompt_tokens": 0,
+        "provider_cache_observed_calls": 0,
+        "provider_cache_hit_calls": 0,
+        "provider_cache_unknown_calls": 0,
+        "provider_usage_missing_calls": 0,
+        "estimated_prompt_tokens": 0,
+        "estimated_completion_tokens": 0,
+        "stage_id_source_counts": {},
+        "prompt_names": {},
+        "by_model": {},
     }
 
 
@@ -348,6 +390,15 @@ def _accumulate_model_usage(
     bucket[cache_bucket] = int(bucket.get(cache_bucket, 0)) + int(
         row.get("prompt_tokens", 0) or 0
     )
+    bucket["provider_cache_observed_calls"] = int(
+        bucket.get("provider_cache_observed_calls", 0)
+    ) + int(cache_known)
+    bucket["provider_cache_hit_calls"] = int(
+        bucket.get("provider_cache_hit_calls", 0)
+    ) + int(cache_known and int(row.get("prompt_cache_hit_tokens", 0) or 0) > 0)
+    bucket["provider_cache_unknown_calls"] = int(
+        bucket.get("provider_cache_unknown_calls", 0)
+    ) + int(not cache_known)
 
 
 def _apply_deepseek_costs_by_model(target: dict[str, Any]) -> None:
@@ -427,11 +478,204 @@ def _apply_deepseek_costs_by_model(target: dict[str, Any]) -> None:
         target.pop("deepseek_pricing_usd_per_1m", None)
 
 
+def _accumulate_usage_row(summary: dict[str, Any], row: dict[str, Any]) -> None:
+    """One accumulator shared by live logging and checkpoint-resume replay."""
+    model = str(row['model'])
+    prompt_name = str(row['prompt_name'])
+    stage_id = str(row.get("stage_id") or "unknown_stage")
+    stage_id_source = str(row.get("stage_id_source") or "missing")
+    seconds = float(row.get('seconds') or 0.0)
+    usage_available = bool(row.get('usage_available', True))
+    cache_known = bool(row.get('provider_cache_tokens_known', False))
+    estimated_prompt_tokens = int(row.get('estimated_prompt_tokens') or 0)
+    estimated_completion_tokens = int(row.get('estimated_completion_tokens') or 0)
+    prompt_tokens = int(row.get('prompt_tokens') or 0)
+    part_rows = row.get('prompt_parts') or []
+    summary["calls"] = int(summary.get("calls", 0)) + 1
+    summary["seconds"] = round(float(summary.get("seconds", 0.0) or 0.0) + float(seconds or 0.0), 4)
+    summary["model"] = model
+    if not usage_available:
+        summary["provider_usage_missing_calls"] = int(summary.get("provider_usage_missing_calls", 0)) + 1
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ]:
+        summary[key] = int(summary.get(key, 0)) + int(row.get(key, 0) or 0)
+    _accumulate_model_usage(
+        summary,
+        model=model,
+        row=row,
+        seconds=seconds,
+        usage_available=usage_available,
+        cache_known=cache_known,
+    )
+    stage_item = summary.setdefault("by_stage_id", {}).setdefault(
+        stage_id,
+        _new_stage_bucket(stage_id),
+    )
+    stage_item["calls"] = int(stage_item.get("calls", 0)) + 1
+    stage_item["seconds"] = round(
+        float(stage_item.get("seconds", 0.0) or 0.0) + seconds,
+        4,
+    )
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ]:
+        stage_item[key] = int(stage_item.get(key, 0)) + int(row.get(key, 0) or 0)
+    stage_cache_bucket = (
+        "provider_cache_known_prompt_tokens"
+        if cache_known
+        else "provider_cache_unknown_prompt_tokens"
+    )
+    stage_item[stage_cache_bucket] = int(stage_item.get(stage_cache_bucket, 0)) + prompt_tokens
+    stage_item["provider_cache_observed_calls"] = int(
+        stage_item.get("provider_cache_observed_calls", 0)
+    ) + int(cache_known)
+    stage_item["provider_cache_hit_calls"] = int(
+        stage_item.get("provider_cache_hit_calls", 0)
+    ) + int(cache_known and int(row.get("prompt_cache_hit_tokens", 0) or 0) > 0)
+    stage_item["provider_cache_unknown_calls"] = int(
+        stage_item.get("provider_cache_unknown_calls", 0)
+    ) + int(not cache_known)
+    if not usage_available:
+        stage_item["provider_usage_missing_calls"] = int(
+            stage_item.get("provider_usage_missing_calls", 0)
+        ) + 1
+    stage_item["estimated_prompt_tokens"] = int(
+        stage_item.get("estimated_prompt_tokens", 0)
+    ) + estimated_prompt_tokens
+    stage_item["estimated_completion_tokens"] = int(
+        stage_item.get("estimated_completion_tokens", 0)
+    ) + estimated_completion_tokens
+    sources = stage_item.setdefault("stage_id_source_counts", {})
+    sources[stage_id_source] = int(sources.get(stage_id_source, 0)) + 1
+    prompt_names = stage_item.setdefault("prompt_names", {})
+    prompt_names[prompt_name] = int(prompt_names.get(prompt_name, 0)) + 1
+    _accumulate_model_usage(
+        stage_item,
+        model=model,
+        row=row,
+        seconds=seconds,
+        usage_available=usage_available,
+        cache_known=cache_known,
+    )
+    for summary_key, value in [
+        ("provider_response_models", row.get("response_model", "")),
+        ("system_fingerprints", row.get("system_fingerprint", "")),
+    ]:
+        if value:
+            counts = summary.setdefault(summary_key, {})
+            counts[value] = int(counts.get(value, 0)) + 1
+    summary["estimated_prompt_tokens"] = int(summary.get("estimated_prompt_tokens", 0)) + estimated_prompt_tokens
+    summary["estimated_completion_tokens"] = int(summary.get("estimated_completion_tokens", 0)) + estimated_completion_tokens
+    bucket = "provider_cache_known_prompt_tokens" if cache_known else "provider_cache_unknown_prompt_tokens"
+    summary[bucket] = int(summary.get(bucket, 0)) + prompt_tokens
+    summary["provider_cache_observed_calls"] = int(
+        summary.get("provider_cache_observed_calls", 0)
+    ) + int(cache_known)
+    summary["provider_cache_hit_calls"] = int(
+        summary.get("provider_cache_hit_calls", 0)
+    ) + int(cache_known and int(row.get("prompt_cache_hit_tokens", 0) or 0) > 0)
+    summary["provider_cache_unknown_calls"] = int(
+        summary.get("provider_cache_unknown_calls", 0)
+    ) + int(not cache_known)
+    _accumulate_parts(summary, prompt_name, part_rows)
+    by_prompt = summary.setdefault("by_prompt", {})
+    item = by_prompt.setdefault(
+        prompt_name,
+        {
+            "calls": 0,
+            "seconds": 0.0,
+            "model": model,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+            "provider_cache_known_prompt_tokens": 0,
+            "provider_cache_unknown_prompt_tokens": 0,
+            "provider_cache_observed_calls": 0,
+            "provider_cache_hit_calls": 0,
+            "provider_cache_unknown_calls": 0,
+            "provider_usage_missing_calls": 0,
+            "estimated_prompt_tokens": 0,
+            "estimated_completion_tokens": 0,
+            "by_part": {},
+            "by_model": {},
+        },
+    )
+    stage_ids = item.setdefault("stage_id_counts", {})
+    stage_ids[stage_id] = int(stage_ids.get(stage_id, 0)) + 1
+    stage_sources = item.setdefault("stage_id_source_counts", {})
+    stage_sources[stage_id_source] = int(stage_sources.get(stage_id_source, 0)) + 1
+    item["calls"] = int(item.get("calls", 0)) + 1
+    item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + float(seconds or 0.0), 4)
+    item["model"] = model
+    if not usage_available:
+        item["provider_usage_missing_calls"] = int(item.get("provider_usage_missing_calls", 0)) + 1
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ]:
+        item[key] = int(item.get(key, 0)) + int(row.get(key, 0) or 0)
+    item[bucket] = int(item.get(bucket, 0)) + prompt_tokens
+    item["provider_cache_observed_calls"] = int(
+        item.get("provider_cache_observed_calls", 0)
+    ) + int(cache_known)
+    item["provider_cache_hit_calls"] = int(
+        item.get("provider_cache_hit_calls", 0)
+    ) + int(cache_known and int(row.get("prompt_cache_hit_tokens", 0) or 0) > 0)
+    item["provider_cache_unknown_calls"] = int(
+        item.get("provider_cache_unknown_calls", 0)
+    ) + int(not cache_known)
+    item["estimated_prompt_tokens"] = int(item.get("estimated_prompt_tokens", 0)) + estimated_prompt_tokens
+    item["estimated_completion_tokens"] = int(item.get("estimated_completion_tokens", 0)) + estimated_completion_tokens
+    _accumulate_model_usage(
+        item,
+        model=model,
+        row=row,
+        seconds=seconds,
+        usage_available=usage_available,
+        cache_known=cache_known,
+    )
+    _accumulate_prompt_item_parts(item, part_rows)
+
+
 def _summary_for(path: Path) -> dict[str, Any]:
     key = str(path.resolve())
     summary = _SUMMARIES.get(key)
     if summary is None:
         summary = _new_summary()
+        events = path.with_name('llm_usage.jsonl')
+        if events.is_file():
+            # Summaries may predate the last append or have been overwritten by
+            # an older process. The append-only events are the source of truth.
+            with events.open(encoding='utf-8') as stream:
+                for number, line in enumerate(stream, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                        if not isinstance(row, dict) or not {'model', 'prompt_name'} <= row.keys():
+                            raise ValueError('incomplete usage row')
+                        _accumulate_usage_row(summary, row)
+                    except (ValueError, TypeError, KeyError):
+                        summary['usage_replay_skipped_rows'] = int(summary.get('usage_replay_skipped_rows', 0)) + 1
+                        logger.warning('Usage replay skipped malformed event %s in %s; original retained', number, events)
         _SUMMARIES[key] = summary
     return summary
 
@@ -496,6 +740,11 @@ def _write_summary(path: Path, summary: dict[str, Any]) -> None:
     out["provider_cache_telemetry_coverage"] = round(known_prompt_tokens / prompt_tokens, 6) if prompt_tokens else None
     out["known_provider_cache_hit_ratio"] = round(cached / known_prompt_tokens, 6) if known_prompt_tokens else None
     out["known_provider_cache_miss_ratio"] = round(missed / known_prompt_tokens, 6) if known_prompt_tokens else None
+    observed_calls = int(out.get("provider_cache_observed_calls", 0) or 0)
+    hit_calls = int(out.get("provider_cache_hit_calls", 0) or 0)
+    out["provider_cache_hit_request_ratio"] = (
+        round(hit_calls / observed_calls, 6) if observed_calls else None
+    )
     _apply_deepseek_costs_by_model(out)
     models = out.get("models", {}) if isinstance(out.get("models"), dict) else {}
     model_name = next(iter(models)) if len(models) == 1 else "mixed" if models else ""
@@ -518,6 +767,44 @@ def _write_summary(path: Path, summary: dict[str, Any]) -> None:
                     est = int(row.get("estimated_tokens", 0) or 0)
                     row["share_of_estimated_prompt"] = round(est / prompt_est, 6) if prompt_est else 0.0
                 item["by_part_ranked"] = ranked
+    by_stage_id = out.get("by_stage_id", {})
+    if isinstance(by_stage_id, dict):
+        for item in by_stage_id.values():
+            stage_input = int(item.get("prompt_tokens", 0) or 0)
+            stage_known = int(item.get("provider_cache_known_prompt_tokens", 0) or 0)
+            stage_cached = int(item.get("prompt_cache_hit_tokens", 0) or 0)
+            stage_missed = int(item.get("prompt_cache_miss_tokens", 0) or 0)
+            stage_unknown_calls = int(item.get("provider_cache_unknown_calls", 0) or 0)
+            stage_usage_missing = int(item.get("provider_usage_missing_calls", 0) or 0)
+            stage_observed_calls = int(item.get("provider_cache_observed_calls", 0) or 0)
+            stage_hit_calls = int(item.get("provider_cache_hit_calls", 0) or 0)
+            complete_stage_cache = (
+                stage_input > 0
+                and stage_known == stage_input
+                and stage_unknown_calls == 0
+                and stage_usage_missing == 0
+            )
+            item["provider_cache_telemetry_coverage"] = (
+                round(stage_known / stage_input, 6) if stage_input else None
+            )
+            item["provider_cache_hit_ratio"] = (
+                round(stage_cached / stage_input, 6) if complete_stage_cache else None
+            )
+            item["known_provider_cache_hit_ratio"] = (
+                round(stage_cached / stage_known, 6) if stage_known else None
+            )
+            item["provider_cache_observed_hit_ratio_lower_bound"] = (
+                round(stage_cached / stage_input, 6) if stage_input else None
+            )
+            item["provider_cache_hit_request_ratio"] = (
+                round(stage_hit_calls / stage_observed_calls, 6)
+                if stage_observed_calls
+                else None
+            )
+            item["provider_cache_miss_ratio"] = (
+                round(stage_missed / stage_input, 6) if complete_stage_cache else None
+            )
+            _apply_deepseek_costs_by_model(item)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     brief_path = path.with_name("llm_usage_brief.json")
@@ -531,23 +818,59 @@ def _build_usage_brief(summary: dict[str, Any], *, model_name: str) -> dict[str,
         for name, item in by_prompt.items():
             if not isinstance(item, dict):
                 continue
+            input_tokens = int(item.get("prompt_tokens", 0) or 0)
+            known_input_tokens = int(item.get("provider_cache_known_prompt_tokens", 0) or 0)
+            observed_calls = int(item.get("provider_cache_observed_calls", 0) or 0)
+            hit_calls = int(item.get("provider_cache_hit_calls", 0) or 0)
+            cache_hit_tokens = int(item.get("prompt_cache_hit_tokens", 0) or 0)
+            usage_missing_calls = int(item.get("provider_usage_missing_calls", 0) or 0)
             prompt_rows.append(
                 {
                     "prompt_name": name,
-                    "stage": _prompt_stage(str(name)),
+                    "stage": _single_stage_id(item),
+                    "stage_id": _single_stage_id(item),
+                    "legacy_prompt_stage_guess": _prompt_stage(str(name)),
+                    "stage_id_source_counts": item.get("stage_id_source_counts", {}),
                     "models": item.get("models", {}),
                     "calls": int(item.get("calls", 0) or 0),
                     "seconds": round(float(item.get("seconds", 0.0) or 0.0), 4),
-                    "input_tokens": int(item.get("prompt_tokens", 0) or 0),
-                    "cache_hit_tokens": int(item.get("prompt_cache_hit_tokens", 0) or 0),
+                    "input_tokens": input_tokens,
+                    "estimated_input_tokens": int(item.get("estimated_prompt_tokens", 0) or 0),
+                    "cache_hit_tokens": cache_hit_tokens,
                     "cache_miss_tokens": int(item.get("prompt_cache_miss_tokens", 0) or 0),
                     "reasoning_tokens": int(item.get("reasoning_tokens", 0) or 0),
+                    "cache_telemetry_known_input_tokens": known_input_tokens,
                     "unknown_input_tokens": int(
-                        (item.get("deepseek_cost_breakdown_usd") or {}).get("unknown_input_tokens", 0)
-                        if isinstance(item.get("deepseek_cost_breakdown_usd"), dict)
-                        else 0
+                        item.get("provider_cache_unknown_prompt_tokens", 0) or 0
+                    ),
+                    "cache_telemetry_coverage": (
+                        round(known_input_tokens / input_tokens, 6) if input_tokens else None
+                    ),
+                    "cache_observed_calls": observed_calls,
+                    "cache_hit_calls": hit_calls,
+                    "cache_unknown_calls": int(
+                        item.get("provider_cache_unknown_calls", 0) or 0
+                    ),
+                    "cache_hit_request_ratio": (
+                        round(hit_calls / observed_calls, 6) if observed_calls else None
+                    ),
+                    "known_input_cache_hit_ratio": (
+                        round(cache_hit_tokens / known_input_tokens, 6)
+                        if known_input_tokens
+                        else None
+                    ),
+                    "provider_usage_missing_calls": usage_missing_calls,
+                    "provider_cache_hit_ratio": (
+                        round(cache_hit_tokens / input_tokens, 6)
+                        if input_tokens
+                        and known_input_tokens == input_tokens
+                        and usage_missing_calls == 0
+                        else None
                     ),
                     "output_tokens": int(item.get("completion_tokens", 0) or 0),
+                    "estimated_output_tokens": int(
+                        item.get("estimated_completion_tokens", 0) or 0
+                    ),
                     "deepseek_cost_breakdown_usd": (
                         item.get("deepseek_cost_breakdown_usd")
                         if isinstance(item.get("deepseek_cost_breakdown_usd"), dict)
@@ -564,60 +887,102 @@ def _build_usage_brief(summary: dict[str, Any], *, model_name: str) -> dict[str,
         ),
         reverse=True,
     )
-    stage_rows_by_name: dict[str, dict[str, Any]] = {}
-    for row in prompt_rows:
-        stage = str(row.get("stage") or "other")
-        item = stage_rows_by_name.setdefault(
-            stage,
-            {
-                "stage": stage,
-                "calls": 0,
-                "seconds": 0.0,
-                "input_tokens": 0,
-                "cache_hit_tokens": 0,
-                "cache_miss_tokens": 0,
-                "reasoning_tokens": 0,
-                "unknown_input_tokens": 0,
-                "output_tokens": 0,
-                "estimated_deepseek_usd": 0.0,
-            },
-        )
-        item["calls"] = int(item.get("calls", 0)) + int(row.get("calls", 0) or 0)
-        item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + float(row.get("seconds", 0.0) or 0.0), 4)
-        for key in [
-            "input_tokens",
-            "cache_hit_tokens",
-            "cache_miss_tokens",
-            "reasoning_tokens",
-            "unknown_input_tokens",
-            "output_tokens",
-        ]:
-            item[key] = int(item.get(key, 0)) + int(row.get(key, 0) or 0)
-        item["estimated_deepseek_usd"] = round(
-            float(item.get("estimated_deepseek_usd", 0.0) or 0.0)
-            + float(row.get("estimated_deepseek_usd", 0.0) or 0.0),
-            9,
-        )
-    stage_rows = sorted(
-        stage_rows_by_name.values(),
+    stage_rows = []
+    by_stage_id = summary.get("by_stage_id", {})
+    if isinstance(by_stage_id, dict):
+        for stage_id, item in by_stage_id.items():
+            if not isinstance(item, dict):
+                continue
+            stage_rows.append(
+                {
+                    "stage": stage_id,
+                    "stage_id": stage_id,
+                    "stage_id_source_counts": item.get("stage_id_source_counts", {}),
+                    "prompt_names": item.get("prompt_names", {}),
+                    "models": item.get("models", {}),
+                    "calls": int(item.get("calls", 0) or 0),
+                    "seconds": round(float(item.get("seconds", 0.0) or 0.0), 4),
+                    "input_tokens": int(item.get("prompt_tokens", 0) or 0),
+                    "estimated_input_tokens": int(item.get("estimated_prompt_tokens", 0) or 0),
+                    "cache_hit_tokens": int(item.get("prompt_cache_hit_tokens", 0) or 0),
+                    "cache_miss_tokens": int(item.get("prompt_cache_miss_tokens", 0) or 0),
+                    "cache_telemetry_known_input_tokens": int(
+                        item.get("provider_cache_known_prompt_tokens", 0) or 0
+                    ),
+                    "cache_telemetry_coverage": item.get(
+                        "provider_cache_telemetry_coverage"
+                    ),
+                    "known_input_cache_hit_ratio": item.get(
+                        "known_provider_cache_hit_ratio"
+                    ),
+                    "provider_cache_hit_ratio": item.get("provider_cache_hit_ratio"),
+                    "cache_observed_calls": int(
+                        item.get("provider_cache_observed_calls", 0) or 0
+                    ),
+                    "cache_hit_calls": int(item.get("provider_cache_hit_calls", 0) or 0),
+                    "cache_unknown_calls": int(
+                        item.get("provider_cache_unknown_calls", 0) or 0
+                    ),
+                    "cache_hit_request_ratio": item.get(
+                        "provider_cache_hit_request_ratio"
+                    ),
+                    "unknown_input_tokens": int(
+                        item.get("provider_cache_unknown_prompt_tokens", 0) or 0
+                    ),
+                    "provider_usage_missing_calls": int(
+                        item.get("provider_usage_missing_calls", 0) or 0
+                    ),
+                    "reasoning_tokens": int(item.get("reasoning_tokens", 0) or 0),
+                    "output_tokens": int(item.get("completion_tokens", 0) or 0),
+                    "estimated_output_tokens": int(
+                        item.get("estimated_completion_tokens", 0) or 0
+                    ),
+                    "deepseek_cost_breakdown_usd": item.get(
+                        "deepseek_cost_breakdown_usd", {}
+                    ),
+                    "estimated_deepseek_usd": item.get(
+                        "estimated_deepseek_usd_unknown_prompt_as_miss"
+                    ),
+                }
+            )
+    stage_rows.sort(
         key=lambda row: (
             float(row.get("estimated_deepseek_usd") or 0.0),
-            int(row.get("cache_miss_tokens", 0) or 0),
+            int(row.get("input_tokens", 0) or 0),
             int(row.get("output_tokens", 0) or 0),
         ),
         reverse=True,
     )
     return {
-        "schema_version": "algoevolve.llm_usage_brief.v2",
+        "schema_version": "algoevolve.llm_usage_brief.v4",
         "model": model_name,
         "models": summary.get("models", {}),
         "calls": int(summary.get("calls", 0) or 0),
         "llm_seconds": round(float(summary.get("seconds", 0.0) or 0.0), 4),
         "input_tokens": int(summary.get("prompt_tokens", 0) or 0),
+        "estimated_input_tokens": int(summary.get("estimated_prompt_tokens", 0) or 0),
         "cache_hit_tokens": int(summary.get("prompt_cache_hit_tokens", 0) or 0),
         "cache_miss_tokens": int(summary.get("prompt_cache_miss_tokens", 0) or 0),
+        "cache_telemetry_known_input_tokens": int(
+            summary.get("provider_cache_known_prompt_tokens", 0) or 0
+        ),
+        "unknown_input_tokens": int(
+            summary.get("provider_cache_unknown_prompt_tokens", 0) or 0
+        ),
+        "cache_telemetry_coverage": summary.get("provider_cache_telemetry_coverage"),
+        "cache_observed_calls": int(summary.get("provider_cache_observed_calls", 0) or 0),
+        "cache_hit_calls": int(summary.get("provider_cache_hit_calls", 0) or 0),
+        "cache_unknown_calls": int(summary.get("provider_cache_unknown_calls", 0) or 0),
+        "cache_hit_request_ratio": summary.get("provider_cache_hit_request_ratio"),
+        "known_input_cache_hit_ratio": summary.get("known_provider_cache_hit_ratio"),
+        "provider_usage_missing_calls": int(
+            summary.get("provider_usage_missing_calls", 0) or 0
+        ),
         "reasoning_tokens": int(summary.get("reasoning_tokens", 0) or 0),
         "output_tokens": int(summary.get("completion_tokens", 0) or 0),
+        "estimated_output_tokens": int(
+            summary.get("estimated_completion_tokens", 0) or 0
+        ),
         "provider_response_models": summary.get("provider_response_models", {}),
         "system_fingerprints": summary.get("system_fingerprints", {}),
         "provider_cache_hit_ratio": summary.get("provider_cache_hit_ratio", 0.0),
@@ -641,6 +1006,7 @@ def log_llm_usage(
     *,
     cfg: Any,
     prompt_name: str,
+    stage_id: str | None = None,
     mode: str,
     provider: str,
     model: str,
@@ -673,9 +1039,12 @@ def log_llm_usage(
         cache_known = False
         cached_tokens = miss_tokens = None
     estimated_completion_tokens = estimate_text_tokens(estimated_completion_text or "")
+    normalized_stage_id = str(stage_id or "").strip() or "unknown_stage"
     row = {
         "ts": time.time(),
         "prompt_name": prompt_name,
+        "stage_id": normalized_stage_id,
+        "stage_id_source": "explicit" if normalized_stage_id != "unknown_stage" else "missing",
         "mode": mode,
         "provider": provider,
         "source": source,
@@ -706,91 +1075,16 @@ def log_llm_usage(
     }
     with _LOCK:
         usage_path.parent.mkdir(parents=True, exist_ok=True)
-        with usage_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         summary = _summary_for(summary_path)
-        summary["calls"] = int(summary.get("calls", 0)) + 1
-        summary["seconds"] = round(float(summary.get("seconds", 0.0) or 0.0) + float(seconds or 0.0), 4)
-        summary["model"] = model
-        if not usage_available:
-            summary["provider_usage_missing_calls"] = int(summary.get("provider_usage_missing_calls", 0)) + 1
-        for key in [
-            "prompt_tokens",
-            "completion_tokens",
-            "reasoning_tokens",
-            "total_tokens",
-            "prompt_cache_hit_tokens",
-            "prompt_cache_miss_tokens",
-        ]:
-            summary[key] = int(summary.get(key, 0)) + int(row.get(key, 0) or 0)
-        _accumulate_model_usage(
-            summary,
-            model=model,
-            row=row,
-            seconds=seconds,
-            usage_available=usage_available,
-            cache_known=cache_known,
-        )
-        for summary_key, value in [
-            ("provider_response_models", row["response_model"]),
-            ("system_fingerprints", row["system_fingerprint"]),
-        ]:
-            if value:
-                counts = summary.setdefault(summary_key, {})
-                counts[value] = int(counts.get(value, 0)) + 1
-        summary["estimated_prompt_tokens"] = int(summary.get("estimated_prompt_tokens", 0)) + estimated_prompt_tokens
-        summary["estimated_completion_tokens"] = int(summary.get("estimated_completion_tokens", 0)) + estimated_completion_tokens
-        bucket = "provider_cache_known_prompt_tokens" if cache_known else "provider_cache_unknown_prompt_tokens"
-        summary[bucket] = int(summary.get(bucket, 0)) + prompt_tokens
-        _accumulate_parts(summary, prompt_name, part_rows)
-        by_prompt = summary.setdefault("by_prompt", {})
-        item = by_prompt.setdefault(
-            prompt_name,
-            {
-                "calls": 0,
-                "seconds": 0.0,
-                "model": model,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "reasoning_tokens": 0,
-                "total_tokens": 0,
-                "prompt_cache_hit_tokens": 0,
-                "prompt_cache_miss_tokens": 0,
-                "provider_cache_known_prompt_tokens": 0,
-                "provider_cache_unknown_prompt_tokens": 0,
-                "provider_usage_missing_calls": 0,
-                "estimated_prompt_tokens": 0,
-                "estimated_completion_tokens": 0,
-                "by_part": {},
-                "by_model": {},
-            },
-        )
-        item["calls"] = int(item.get("calls", 0)) + 1
-        item["seconds"] = round(float(item.get("seconds", 0.0) or 0.0) + float(seconds or 0.0), 4)
-        item["model"] = model
-        if not usage_available:
-            item["provider_usage_missing_calls"] = int(item.get("provider_usage_missing_calls", 0)) + 1
-        for key in [
-            "prompt_tokens",
-            "completion_tokens",
-            "reasoning_tokens",
-            "total_tokens",
-            "prompt_cache_hit_tokens",
-            "prompt_cache_miss_tokens",
-        ]:
-            item[key] = int(item.get(key, 0)) + int(row.get(key, 0) or 0)
-        item[bucket] = int(item.get(bucket, 0)) + prompt_tokens
-        item["estimated_prompt_tokens"] = int(item.get("estimated_prompt_tokens", 0)) + estimated_prompt_tokens
-        item["estimated_completion_tokens"] = int(item.get("estimated_completion_tokens", 0)) + estimated_completion_tokens
-        _accumulate_model_usage(
-            item,
-            model=model,
-            row=row,
-            seconds=seconds,
-            usage_available=usage_available,
-            cache_known=cache_known,
-        )
-        _accumulate_prompt_item_parts(item, part_rows)
+        separator = ""
+        if usage_path.is_file() and usage_path.stat().st_size:
+            with usage_path.open('rb') as previous:
+                previous.seek(-1, 2)
+                if previous.read(1) != b'\n':
+                    separator = "\n"
+        with usage_path.open("a", encoding="utf-8") as f:
+            f.write(separator + json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        _accumulate_usage_row(summary, row)
         _write_summary(summary_path, summary)
     logger.info(
         "[llm_usage] prompt=%s mode=%s provider=%s input=%s cached=%s miss=%s reasoning=%s output=%s total=%s est_input=%s usage_available=%s",
@@ -798,8 +1092,8 @@ def log_llm_usage(
         mode,
         provider,
         prompt_tokens,
-        cached_tokens or 0,
-        miss_tokens or 0,
+        cached_tokens if cached_tokens is not None else "unknown",
+        miss_tokens if miss_tokens is not None else "unknown",
         reasoning_tokens,
         completion_tokens,
         total_tokens,

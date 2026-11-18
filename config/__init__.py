@@ -47,7 +47,8 @@ class StageConfig:
     api_key: str
     enable_thinking: bool | None = None
     reasoning_effort: str | None = None
-    minimum_output_tokens: int = 32768
+    # Legacy compatibility only. Explicit request budgets always take precedence.
+    minimum_output_tokens: int = 0
     max_tokens: int | None = 32768
     request_timeout_seconds: float = 1200.0
     network_retry_max_attempts: int = 5
@@ -59,6 +60,8 @@ class StageConfig:
     continuation_overlap_scan_chars: int = 4096
     # Used only for local headroom accounting; zero means unknown/provider-managed.
     context_window_tokens: int = 0
+    # Minimum viable reply when the complete input leaves less than max_tokens.
+    context_minimum_reply_tokens: int = 8192
 
 
 @dataclass
@@ -71,7 +74,7 @@ class DraftConfig:
     fast_first_draft_max_repairs: int = 2
     # Deprecated: full AutoRealize context is always used.
     fast_first_draft_compact_context: bool = False
-    use_stepwise_after_first: bool = True
+    use_stepwise_after_first: bool = False
     # Deprecated compatibility field. agent.initial_drafts is authoritative.
     optimization_initial_drafts_cap: int = 0
     show_pending_draft_nodes: bool = True
@@ -80,10 +83,10 @@ class DraftConfig:
     # Deprecated: full AutoRealize context is always used.
     stepwise_stage_context: bool = False
     stepwise_accumulate_context: bool = True
-    stepwise_context_max_tokens: int = 90000
+    stepwise_context_max_tokens: int = 0
     stepwise_compaction_keep_recent_steps: int = 2
     stepwise_compaction_max_tokens: int = 32768
-    stepwise_context_headroom_ratio: float = 0.15
+    stepwise_context_headroom_ratio: float = 0.01
     stepwise_snapshot_dirname: str = "context_snapshots"
 
 
@@ -149,6 +152,16 @@ class SearchConfig:
     fusion_min_remaining_seconds: int = 300
 
 @dataclass
+class WebResearchConfig:
+    enabled: bool = False
+    query: str = ""
+    timeout_seconds: float = 12.0
+    fetch_timeout_seconds: float = 8.0
+    max_results: int = 3
+    max_context_chars: int = 2800
+
+
+@dataclass
 class AgentConfig:
     steps: int
     time_limit: int
@@ -181,6 +194,9 @@ class AgentConfig:
     optimization_experience_min_score: float = 3.0
     optimization_experience_max_chars: int = 6000
     output_language: str = "english"
+    web_research: WebResearchConfig = field(default_factory=WebResearchConfig)
+
+
 @dataclass
 class ExecConfig:
     timeout: int
@@ -465,7 +481,7 @@ def prep_cfg(cfg: Config):
     cfg.agent.feedback.context_window_tokens = max(0, int(cfg.agent.feedback.context_window_tokens or 0))
     cfg.agent.draft.stepwise_context_headroom_ratio = min(
         0.5,
-        max(0.05, float(cfg.agent.draft.stepwise_context_headroom_ratio)),
+        max(0.01, float(cfg.agent.draft.stepwise_context_headroom_ratio)),
     )
     cfg.agent.code.api_key = (
         str(cfg.agent.code.api_key or "").strip()

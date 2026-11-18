@@ -11,7 +11,7 @@ from __future__ import annotations
 # Tells the LLM what output format to use
 
 DIFF_SYS_FORMAT = """
-***You are required to explain your plan in detail and clearly indicate the code improvements using the exact SEARCH/REPLACE diff format specified below (ensure the format is strictly followed without deviations).***
+Return `Plan: ...` in at most two concise sentences, followed by the exact SEARCH/REPLACE blocks below. Keep reasoning internal. Include no analysis, alternatives, examples, repeated task description or text after the patches.
 
 # Code format:
 <<<<<<< SEARCH

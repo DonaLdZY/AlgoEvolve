@@ -128,7 +128,7 @@ class SearchNode(DataClassJsonMixin):
 
     def absorb_exec_result(self, exec_result: ExecutionResult):
         """Absorb the result of executing the code from this node."""
-        self._term_out = exec_result.term_out
+        self._term_out = list(exec_result.term_out)
         self.evaluation_protocol = {
             **{key: value for key, value in self.evaluation_protocol.items() if key.startswith("expected_")},
             **extract_evaluation_protocol(exec_result.term_out),
@@ -297,14 +297,33 @@ class SearchNode(DataClassJsonMixin):
         """Build memory string from children for the model (include draft nodes; optionally include code diff)."""
         logger.info("fetch_child_memory")
         summary = []
+        children = [n for n in self.children if n.is_buggy is not None or n.stage == "draft"]
+        # A metric's magnitude is not its quality: MAE/cost must be minimized.
+        # Do not guess a direction or compare NaN, missing, or mixed-direction
+        # scores. Stable ties also avoid changing the prompt prefix at random
+        # when children (a set) happen to have equal results.
+        directions = {
+            n.metric.maximize for n in children
+            if n.is_buggy is False and n.metric and n.metric.value is not None
+            and math.isfinite(n.metric.value) and isinstance(n.metric.maximize, bool)
+        }
+        direction = self.metric.maximize if self.metric and isinstance(self.metric.maximize, bool) else None
+        if direction is None and len(directions) == 1:
+            direction = next(iter(directions))
+
+        def comparable(n):
+            return (n.is_buggy is False and n.metric is not None
+                    and n.metric.value is not None and math.isfinite(n.metric.value)
+                    and direction is not None and n.metric.maximize is direction)
+
+        def memory_order(n):
+            quality = n.metric.value * (1 if direction else -1) if comparable(n) else float("-inf")
+            return (comparable(n), n.is_buggy is False, n.is_buggy is not None,
+                    quality, -n.ctime, n.id)
 
         sorted_children = sorted(
-            [n for n in self.children if n.is_buggy is not None or n.stage == "draft"],
-            key=lambda n: (
-                n.is_buggy is False,
-                n.is_buggy is not None,
-                n.metric.value if (n.metric and n.metric.value is not None) else float('-inf')
-            ),
+            children,
+            key=memory_order,
             reverse=True
         )
 
@@ -328,9 +347,11 @@ class SearchNode(DataClassJsonMixin):
                 node_analysis = n.analysis_for_prompt
                 if node_analysis and node_analysis != "N/A":
                     summary_part += f"Results:\n{node_analysis}\n"
-                if n.metric and n.metric.value is not None:
+                if comparable(n):
                     metric_display = self._format_metric_change(n)
                     summary_part += f"Validation Metric: {metric_display}\n"
+                else:
+                    summary_part += "Validation Metric: not comparable (missing, non-finite, or unresolved/mismatched direction).\n"
                 if hasattr(n, 'exec_time') and n.exec_time is not None:
                     summary_part += f"Execution Time: {n.exec_time:.2f}s\n"
 
@@ -350,8 +371,13 @@ class SearchNode(DataClassJsonMixin):
             if executed:
                 stats_parts.append(f"{len(executed)} executed")
                 if successful:
-                    best_metric = max(n.metric.value for n in successful if n.metric and n.metric.value is not None)
-                    stats_parts.append(f"{len(successful)} successful (best: {best_metric:.4f})")
+                    scored = [n for n in successful if comparable(n)]
+                    if scored:
+                        best_metric = scored[0].metric.value
+                        objective = "maximize" if direction else "minimize"
+                        stats_parts.append(f"{len(successful)} successful (best: {best_metric:.4f}; {objective})")
+                    else:
+                        stats_parts.append(f"{len(successful)} executed without bugs; no comparable finite metric")
                 else:
                     stats_parts.append(f"0 successful (all failed or buggy)")
 

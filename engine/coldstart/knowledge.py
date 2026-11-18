@@ -25,10 +25,21 @@ Rules:
 You MUST call the classify function with your answer."""
 
 
+def _task_description_text(task_desc: Any) -> str:
+    """Normalize file and inline task descriptions to the same readable text."""
+    if isinstance(task_desc, dict):
+        return "\n\n".join(
+            f"# {key}\n{value}"
+            for key, value in task_desc.items()
+            if value is not None and str(value).strip()
+        )
+    return str(task_desc or "")
+
+
 def _authoritative_category(cfg: Any, task_desc: str) -> str | None:
     """Read an explicit AutoRealize paradigm before asking a classifier LLM."""
 
-    texts = [str(task_desc or "")]
+    texts = [_task_description_text(task_desc)]
     try:
         from utils.autorealize_context import build_autorealize_context_md
 
@@ -106,8 +117,9 @@ def _build_guidance_text(task_name: str, tasks: Dict, models: Dict) -> str:
     return _build_guidance_text_from_models(collect_models_for_task(task_name, tasks, models))
 
 
-def _classify_task_with_llm(cfg: Any, task_desc: str) -> str | None:
+def _classify_task_with_llm(cfg: Any, task_desc: Any) -> str | None:
     """Classify an unmapped task at runtime using the configured feedback model."""
+    task_desc = _task_description_text(task_desc)
     if not task_desc or not task_desc.strip():
         return None
 
@@ -155,6 +167,7 @@ def _classify_task_with_llm(cfg: Any, task_desc: str) -> str | None:
                 model=model,
                 temperature=temperature,
                 stage_name="feedback",
+                stage_id="cold_start_classification",
                 cfg=cfg,
             )
             if not isinstance(response, dict):

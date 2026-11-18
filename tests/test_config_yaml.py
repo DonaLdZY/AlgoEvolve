@@ -19,6 +19,8 @@ def test_commented_default_yaml_matches_runtime_schema() -> None:
     assert merged.agent.steps == 50
     assert merged.agent.time_limit == 10800
     assert merged.agent.output_language == "english"
+    assert merged.agent.web_research.enabled is False
+    assert merged.agent.web_research.fetch_timeout_seconds == 8.0
     assert merged.agent.search.parallel_search_num == 4
     assert merged.runtime.resume_budget_mode == "total"
     assert merged.agent.search.num_drafts == 8
@@ -40,20 +42,20 @@ def test_commented_default_yaml_matches_runtime_schema() -> None:
         == "scikit-learn>=1.4.0,<2"
     )
     assert merged.exec.dependency_package_specs.ortools == "ortools>=9.9.0,<10"
-    assert merged.agent.draft.use_stepwise_after_first is True
+    assert merged.agent.draft.use_stepwise_after_first is False
     assert merged.agent.retries.preflight_regeneration_max_attempts == 2
     assert merged.agent.draft.optimization_initial_drafts_cap == 0
     assert merged.agent.initial_drafts == 3
     assert merged.agent.draft.stepwise_stage_context is False
     assert merged.agent.draft.stepwise_accumulate_context is True
-    assert merged.agent.draft.stepwise_context_max_tokens == 90000
+    assert merged.agent.draft.stepwise_context_max_tokens == 0
     assert merged.agent.draft.stepwise_compaction_max_tokens == 32768
     assert merged.agent.draft.stepwise_compaction_keep_recent_steps == 2
-    assert merged.agent.draft.stepwise_context_headroom_ratio == 0.15
+    assert merged.agent.draft.stepwise_context_headroom_ratio == 0.01
     assert merged.agent.code.context_window_tokens == 131072
-    assert merged.agent.code.minimum_output_tokens == 32768
+    assert merged.agent.code.minimum_output_tokens == 0
     assert merged.agent.code.max_tokens == 32768
-    assert merged.agent.feedback.minimum_output_tokens == 32768
+    assert merged.agent.feedback.minimum_output_tokens == 0
     assert merged.agent.feedback.max_tokens == 32768
     assert merged.agent.code.request_timeout_seconds == 1200.0
     assert merged.agent.code.continuation_max_rounds == 2

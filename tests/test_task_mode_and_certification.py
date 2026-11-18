@@ -207,6 +207,38 @@ def test_rl_without_policy_artifact_is_review_evidence_not_a_third_gate(tmp_path
     assert any("no persisted model/policy artifact" in note for note in node.certification_notes)
 
 
+def test_stateful_candidate_requires_artifact_before_delivery_certification(tmp_path: Path) -> None:
+    context = _context(
+        structure="decision_optimization",
+        rl_required=True,
+        first_method="reinforcement_learning",
+    )
+    agent = _agent(tmp_path, context)
+    node = SearchNode(
+        id="node-stateful",
+        code="def predict(model_path, data):\n    return data\n",
+        stage="improve",
+        _term_out=["Method Usage Summary: pure_rl\nFinal Validation Score: 1.0\n"],
+        metric=MetricValue(1.0, maximize=False),
+        is_buggy=False,
+        is_valid=True,
+        search_eligible=True,
+        delivery_ready=True,
+        score_recomputed=True,
+    )
+
+    update_node_certification(agent, node)
+    assert node.artifact_ready is False
+    assert node.delivery_certified is False
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "policy-node-stateful.joblib").write_bytes(b"model")
+    update_node_certification(agent, node)
+    assert node.artifact_ready is True
+    assert node.delivery_certified is True
+
+
 def test_invalid_search_candidate_never_replaces_delivery_best(tmp_path: Path) -> None:
     context = _context(
         structure="decision_optimization",

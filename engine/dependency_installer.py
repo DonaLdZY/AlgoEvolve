@@ -318,8 +318,20 @@ class DependencyInstaller:
     def execution_environment(
         self,
         base_environment: Mapping[str, str] | None = None,
+        *,
+        redact_credentials: bool = False,
     ) -> dict[str, str]:
         environment = dict(base_environment or os.environ)
+        if redact_credentials:
+            credential_name = re.compile(
+                r"(?:API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|(?:^|_)KEY$|"
+                r"AUTHORIZATION|BEARER|TOKEN|PASSWORD|SECRET|CREDENTIAL)",
+                re.IGNORECASE,
+            )
+            environment = {
+                key: value for key, value in environment.items()
+                if not credential_name.search(key)
+            }
         target = str(self.install_target_path)
         existing = str(environment.get("PYTHONPATH") or "").strip()
         environment["PYTHONPATH"] = (

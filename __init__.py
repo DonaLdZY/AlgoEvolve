@@ -1,4 +1,16 @@
+"""Public wrapper over the engine's historical flat module layout.
+
+The CLI and service start inside AlgoEvolve. Importing the optional wrapper
+from its parent must resolve those same modules, rather than loading a second
+set with incompatible class identities under a relative package name.
+"""
 from dataclasses import dataclass
+from pathlib import Path
+import sys
+
+_ENGINE_ROOT = str(Path(__file__).resolve().parent)
+if _ENGINE_ROOT not in sys.path:
+    sys.path.insert(0, _ENGINE_ROOT)
 
 from llm import compile_prompt_to_md
 
@@ -9,7 +21,6 @@ from engine.search_node import SearchNode
 from omegaconf import OmegaConf
 from rich.status import Status
 from config import load_task_desc, prep_agent_workspace, save_run, _load_cfg, prep_cfg
-from pathlib import Path
 
 @dataclass
 class Solution:

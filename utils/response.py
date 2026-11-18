@@ -67,7 +67,13 @@ def extract_code(text):
         else:
             return ""
     code = "\n\n".join(parsed_codes)
-    return format_code(code) if code and is_valid_python_script(code) else ""
+    if code and is_valid_python_script(code):
+        return format_code(code)
+    # Explanatory text can contain short Python examples before the actual
+    # deliverable. The canonical response contract requires one complete
+    # implementation, so prefer the final complete block over concatenating
+    # unrelated examples when the combined script is invalid.
+    return format_code(parsed_codes[-1]) if parsed_codes else ""
 
 
 def extract_text_up_to_code(s):
@@ -76,7 +82,50 @@ def extract_text_up_to_code(s):
     return s[: s.find("```")].strip()
 
 
-def extract_plan_and_code(text: str, default_plan: str) -> tuple[str, str]:
+def _extract_last_complete_python_block(text: str, required_marker: str = "") -> str:
+    """Recover the final complete implementation after malformed prose examples."""
+    opening = re.compile(r"(?<!`)(`{3,})(?:python3?|py)?[ \t]*\r?\n", re.IGNORECASE)
+    openings = list(opening.finditer(text or ""))
+    for match in reversed(openings):
+        closing = re.compile(
+            r"^[ \t]*`{" + str(len(match[1])) + r",}[ \t]*\r?$",
+            re.MULTILINE,
+        )
+        for end in closing.finditer(text, match.end()):
+            candidate = text[match.end():end.start()].strip()
+            if not candidate or not is_valid_python_script(candidate):
+                continue
+            if required_marker and required_marker not in candidate:
+                continue
+            return format_code(candidate)
+    return ""
+
+
+def code_extraction_diagnostic(text: str) -> str:
+    """Describe a rejected response for repair; never accept partial code."""
+    opening = re.search(r"(?<!`)(`{3,})(?:python3?|py)?[ \t]*\r?\n", text, re.IGNORECASE)
+    candidate = text
+    if opening:
+        ends = list(re.finditer(r"^[ \t]*`{" + str(len(opening[1])) + r",}[ \t]*\r?$",
+                               text[opening.end():], re.MULTILINE))
+        if not ends:
+            return "The Python fence has no closing fence. Return one complete runnable script."
+        candidate = text[opening.end():opening.end() + ends[-1].start()].strip()
+    try:
+        compile(candidate, "<rejected response>", "exec")
+    except SyntaxError as exc:
+        lines = candidate.splitlines()
+        line = exc.text or (lines[exc.lineno - 1] if exc.lineno and exc.lineno <= len(lines) else "")
+        return f"Python compiler rejected the response: {exc.msg}; line {exc.lineno}, column {exc.offset}. Source line: {line.strip()}"
+    return "No complete script could be extracted. Return exactly one complete Python code block; no pseudocode or partial examples."
+
+
+def extract_plan_and_code(
+    text: str,
+    default_plan: str,
+    *,
+    allow_last_complete_block: bool = False,
+) -> tuple[str, str]:
     """Extract valid Python code while treating the prose plan as optional.
 
     Prompts request a short plan for readability, but a response that starts
@@ -85,9 +134,19 @@ def extract_plan_and_code(text: str, default_plan: str) -> tuple[str, str]:
     """
 
     code = extract_code(text or "")
+    recovered_last_block = False
+    if not code and allow_last_complete_block:
+        code = _extract_last_complete_python_block(
+            text or "",
+            required_marker="Final Validation Score",
+        )
+        recovered_last_block = bool(code)
     if not code:
         return "", ""
-    plan = extract_text_up_to_code(text or "").strip() or default_plan.strip()
+    plan = extract_text_up_to_code(text or "").strip()
+    if recovered_last_block or len(plan) > 400:
+        plan = ""
+    plan = plan or default_plan.strip()
     return plan, code
 
 

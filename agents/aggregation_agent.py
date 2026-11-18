@@ -187,7 +187,11 @@ def run(
     )
     prompt_complete = build_chat_prompt_for_model(agent.acfg.code.model, introduction, user_prompt, assistant_prefix)
 
-    plan, code = plan_and_code_query(agent, prompt_complete)
+    plan, code = plan_and_code_query(
+        agent,
+        prompt_complete,
+        stage_id="aggregation_code_generation",
+    )
 
     aggregation_node = SearchNode(
         plan=plan,

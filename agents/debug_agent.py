@@ -245,7 +245,8 @@ def run(
                 response = generate(
                     prompt=prompt_with_diff,
                     temperature=agent.acfg.code.temp,
-                    cfg=agent.cfg
+                    cfg=agent.cfg,
+                    stage_id="debug_diff_generation",
                 )
 
                 if response and ("<<<<<<< SEARCH" in response or "< SEARCH" in response or "<<<<<<<" in response):
@@ -343,7 +344,11 @@ def run(
     if code is None:
         logger.info(f"Falling back to full code rewrite debugging method for node {parent_node.id}")
         prompt_complete = build_prompt_complete(base_instructions, use_full_code_requirement=True)
-        plan, code = plan_and_code_query(agent, prompt_complete)
+        plan, code = plan_and_code_query(
+            agent,
+            prompt_complete,
+            stage_id="debug_code_rewrite",
+        )
 
     from_topk = getattr(parent_node, '_topk_triggered', False)
 

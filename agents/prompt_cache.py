@@ -15,6 +15,7 @@ DATA_CONTEXT_REFERENCE = (
     "section above. Do not expect it to be repeated here."
 )
 TASK_CONTEXT_END_MARKER = "# End stable task/data context"
+CANDIDATE_CODE_END_MARKER = "# End candidate implementation"
 
 
 def _norm(text: Any) -> str:
@@ -55,6 +56,16 @@ def task_section(task_desc: Any, data_preview: Any = "") -> str:
     return f"\n# Task description\n{context}\n\n{TASK_CONTEXT_END_MARKER}\n"
 
 
+def candidate_review_section(task_desc: Any, data_preview: Any, code: str) -> str:
+    """Identical task + exact implementation prefix for both review roles."""
+    from utils.response import wrap_code
+
+    wrapped = wrap_code(code)
+    return (task_section(task_desc, data_preview) + "\n# Candidate implementation\n"
+            + f"<!-- candidate-code-chars: {len(wrapped)} -->\n" + wrapped
+            + "\n\n" + CANDIDATE_CODE_END_MARKER + "\n\n")
+
+
 def dataset_reference_sentence(task_desc: Any, data_preview: Any = "") -> str:
     ref = dynamic_data_reference(task_desc, data_preview)
     if ref == DATA_CONTEXT_REFERENCE:
@@ -70,7 +81,16 @@ def context_fingerprint(text: Any) -> str:
 
 
 def routed_data_context(agent: Any, stage: str) -> str:
-    """Return the complete AutoRealize context for every search stage."""
+    """Route whole sections while keeping the task contract lossless.
 
-    del stage
-    return _norm(getattr(agent, "data_preview", ""))
+    Standalone previews and unknown stages deliberately keep their full input.
+    Never slice a schema or a task requirement to meet a character budget.
+    """
+    from utils.autorealize_context import select_autorealize_context_for_stage
+
+    aliases = {"draft": "fast_draft", "debug": "code_review", "improve": "merge",
+               "fusion": "merge", "evolution": "merge", "result_parse": "result_parsing"}
+    return select_autorealize_context_for_stage(
+        _norm(getattr(agent, "autorealize_context", "") or getattr(agent, "data_preview", "")),
+        aliases.get(stage, stage),
+    )

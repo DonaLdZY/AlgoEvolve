@@ -251,9 +251,17 @@ def run(
             plan, code = _diff_improve(agent, prompt, data_context, parent_node)
         except Exception as e:
             logger.warning(f"Diff improve failed: {e}, falling back to full rewrite")
-            plan, code = plan_and_code_query(agent, prompt_complete)
+            plan, code = plan_and_code_query(
+                agent,
+                prompt_complete,
+                stage_id="improve_code_generation",
+            )
     else:
-        plan, code = plan_and_code_query(agent, prompt_complete)
+        plan, code = plan_and_code_query(
+            agent,
+            prompt_complete,
+            stage_id="improve_code_generation",
+        )
 
     from_topk = getattr(parent_node, '_topk_triggered', False)
 
@@ -324,6 +332,7 @@ def _diff_improve(agent, prompt_base, data_preview, parent_node):
             your_task_section=_IMPROVE_PLANNER_TASK,
             assistant_suffix=build_planner_suffix(prompt_base, data_preview, context, extra_text=_IMPROVE_SUFFIX_EXTRA),
             stage_name="ImprovePlanning",
+            stage_id="improve_planning",
         )
 
     modules = planning_result.get('module', [])
@@ -342,4 +351,5 @@ def _diff_improve(agent, prompt_base, data_preview, parent_node):
         data_preview=data_preview,
         execution_output=context["execution_output"],
         introduction=_IMPROVE_DIFF_INTRODUCTION,
+        stage_id="improve_diff_generation",
     )

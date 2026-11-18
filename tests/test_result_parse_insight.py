@@ -16,6 +16,33 @@ from engine.search_node import SearchNode
 from utils.metric import MetricValue
 
 
+@pytest.mark.parametrize("use_memory", [False, True])
+@pytest.mark.parametrize("optimization_rl", [False, True])
+def test_failed_review_null_metric_passes_provider_validation(use_memory, optimization_rl):
+    """A crash verdict must survive JSON validation without another paid request."""
+    import json
+    import jsonschema
+    from llm.openai import _validated_json_content, _build_json_mode_messages
+
+    response = {
+        "verdict": "reject", "is_bug": True, "summary": "Prediction parity check failed.",
+        "reason_codes": ["runtime_exception"], "debug_hint": "Use identical feature windows.",
+        "technical_summary": "Execution raised RuntimeError before producing a score.",
+        "human_insight": "The candidate needs repair before it can be compared.",
+        "confidence": 1.0, "metric": None, "lower_is_better": True,
+        "output_scope": "unknown",
+    }
+    if use_memory:
+        response["code_summary"] = "A regression model with trailing history features."
+    spec = result_parse_agent.get_review_func_spec(use_memory, optimization_rl)
+    messages = _build_json_mode_messages('Review the execution.', 'RuntimeError: parity', spec)
+    assert '"metric":null' in '\n'.join(m['content'] for m in messages)
+    assert _validated_json_content(json.dumps(response), spec, "stop") == response
+    # Nullable does not allow prose or a fabricated numeric fallback as a metric.
+    with pytest.raises(jsonschema.ValidationError):
+        _validated_json_content(json.dumps({**response, "metric": "not available"}), spec, "stop")
+
+
 @pytest.mark.parametrize("scope,context,artifact,phase,accepted", [
     ("development_validation_only", True, True, "search", True),
     ("provided_prediction_population", True, True, "search", False),
@@ -33,7 +60,12 @@ def test_development_score_does_not_claim_missing_new_output_delivery(monkeypatc
                             metric_maximize=True, has_autorealize_context=context, global_memory=None,
                             task_desc="Classify equipment state", data_preview="", coldstart_description="")
     node = SearchNode(code="def predict(model_path, data): return data", stage="draft", _term_out=[],
-                      evaluation_protocol={"evaluation_phase": phase, "scoring_split": "development", "final_evaluation_accessed": False})
+                      evaluation_protocol={
+                          "evaluation_phase": phase,
+                          "scoring_split": "development",
+                          "final_evaluation_accessed": False,
+                          "protocol_evidence_status": "read",
+                      })
     response = {"verdict": "accept", "is_bug": False, "metric": 0.7, "lower_is_better": False,
                 "summary": "Development probabilities were evaluated.", "reason_codes": ["accepted"],
                 "output_scope": scope, "confidence": 0.9}
@@ -41,6 +73,31 @@ def test_development_score_does_not_claim_missing_new_output_delivery(monkeypatc
     update_node_certification(agent, node)
     assert node.search_eligible is accepted
     assert node.delivery_ready is False
+
+
+@pytest.mark.parametrize("csv_text,expected_scope", [
+    ("Id,prediction\n", "development_validation_only"),
+    ("Id,prediction\n1,2.1\n2,3.2\n", "provided_prediction_population"),
+])
+def test_populated_submission_scope_still_runs_normal_validation(monkeypatch, tmp_path, csv_text, expected_scope):
+    agent = SimpleNamespace(cfg=SimpleNamespace(workspace_dir=tmp_path),
+                            acfg=SimpleNamespace(generate_submission=True, use_global_memory=False, output_language="english"),
+                            metric_maximize=False, has_autorealize_context=True, global_memory=None,
+                            task_desc="Regression", data_preview="", coldstart_description="")
+    node = SearchNode(code="def predict(model_path, data): return data", stage="draft", _term_out=[],
+                      evaluation_protocol={"evaluation_phase": "search", "final_evaluation_accessed": False})
+    path = tmp_path / "submission" / f"submission_{node.id}.csv"
+    path.parent.mkdir()
+    path.write_text(csv_text, encoding="utf-8")
+    monkeypatch.setattr(result_parse_agent, "find_model_artifacts", lambda *a: [tmp_path / "model.pkl"])
+    validations = []
+    monkeypatch.setattr(result_parse_agent, "_validate_format_with_retry", lambda *a: validations.append(True))
+    response = {"verdict": "accept", "is_bug": False, "metric": .12, "lower_is_better": True,
+                "summary": "Development score is correct.", "reason_codes": ["accepted"],
+                "output_scope": "development_validation_only", "confidence": .9}
+    result_parse_agent._apply_review_response(agent, node, response)
+    assert node.output_scope == expected_scope
+    assert len(validations) == (1 if expected_scope == "provided_prediction_population" else 0)
 
 
 def test_result_review_supplies_ui_insight_without_a_second_llm_call(
@@ -190,6 +247,40 @@ def test_final_score_always_routes_through_llm_reviewer(monkeypatch, tmp_path) -
     assert node.metric.value == -2.5
 
 
+def test_standalone_result_review_includes_task_description(monkeypatch, tmp_path) -> None:
+    agent = _parse_agent(tmp_path, "")
+    agent.autorealize_context = ""
+    agent.data_preview = ""
+    agent.task_desc = "Choose a feasible production schedule with minimum total cost."
+    calls: list[dict] = []
+
+    def fake_query(**kwargs):
+        calls.append(kwargs)
+        return {
+            "is_bug": False,
+            "summary": "The task evaluator produced a comparable score.",
+            "metric": 12.0,
+            "lower_is_better": True,
+        }
+
+    monkeypatch.setattr(result_parse_agent, "query", fake_query)
+    node = SearchNode(
+        code="print('Final Validation Score: 12')",
+        stage="draft",
+        _term_out=[],
+    )
+
+    result_parse_agent.run(
+        agent,
+        node,
+        ExecutionResult(term_out=["Final Validation Score: 12\n"], exec_time=1, exc_type=None),
+    )
+
+    assert len(calls) == 1
+    assert agent.task_desc in calls[0]["user_message"]
+    assert "# Task description" in calls[0]["user_message"]
+
+
 def test_llm_accepted_decision_score_is_valid_without_submission(monkeypatch, tmp_path) -> None:
     contract = """## AutoRealize Structured Context
 ## Evaluation Contract Reference
@@ -275,19 +366,12 @@ def test_llm_reviewer_can_reject_candidate_reported_score(monkeypatch, tmp_path)
     assert node.decision_signals["reported_feasible"] is False
 
 
-def test_execution_exception_still_routes_through_llm_reviewer(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("exception_type", ["KeyError", "TimeoutError", "RuntimeError", "PermissionError"])
+def test_executor_failure_skips_paid_review_and_preserves_debug_evidence(monkeypatch, tmp_path, exception_type) -> None:
     contract = "## AutoRealize Structured Context\n## Evaluation Contract Reference\n- metric_direction: minimize\n"
     agent = _parse_agent(tmp_path, contract)
-    calls: list[dict] = []
-
     def fake_query(**kwargs):
-        calls.append(kwargs)
-        return {
-            "is_bug": True,
-            "summary": "Execution raised KeyError before producing a comparable result.",
-            "metric": None,
-            "lower_is_better": True,
-        }
+        pytest.fail("An executor-confirmed failure must not call the result reviewer")
 
     monkeypatch.setattr(result_parse_agent, "query", fake_query)
     node = SearchNode(
@@ -300,17 +384,75 @@ def test_execution_exception_still_routes_through_llm_reviewer(monkeypatch, tmp_
     exec_result = ExecutionResult(
         term_out=["Traceback ... KeyError: missing\n"],
         exec_time=0.1,
-        exc_type="KeyError",
+        exc_type=exception_type,
         exc_info={"message": "missing"},
     )
 
     parsed = result_parse_agent.run(agent, node, exec_result)
 
     assert parsed is node
-    assert len(calls) == 1
-    assert '"exception_type": "KeyError"' in calls[0]["user_message"]
     assert node.is_buggy is True
+    assert node.is_valid is False
+    assert node.search_eligible is False
+    assert node.delivery_ready is False
     assert node.metric.value is None
+    assert node.review_verdict == "reject"
+    assert node.review_reason_codes == ["runtime_exception"]
+    assert exception_type in node.analysis_for_prompt
+    assert "missing" in node.analysis_for_prompt
+    assert "Traceback ... KeyError: missing" in node.term_out
+    assert node.exec_time == 0.1
+    assert node.llm_insight
+
+
+def test_printed_score_cannot_make_crashed_run_comparable(monkeypatch, tmp_path):
+    agent = _parse_agent(tmp_path, "- metric_direction: minimize")
+    monkeypatch.setattr(result_parse_agent, "query", lambda **_: pytest.fail("No paid review for a crash"))
+    node = SearchNode(code="raise ValueError()", stage="draft", _term_out=[])
+    result_parse_agent.run(agent, node, ExecutionResult(
+        term_out=["Final Validation Score: 0.01\n"], exec_time=1, exc_type="ValueError",
+    ))
+    assert node.metric.value is None
+    assert not node.search_eligible
+
+
+def test_candidate_failure_file_without_score_skips_paid_review(monkeypatch, tmp_path):
+    agent = _parse_agent(tmp_path, "- metric_direction: minimize")
+    calls = []
+    monkeypatch.setattr(result_parse_agent, "candidate_failure_evidence", lambda *_: {
+        "path": "working/evaluation_failure.json", "content": {"status": "failed"},
+    })
+    def review(**kwargs):
+        calls.append(kwargs)
+        return {"is_bug": True, "summary": "Incomplete evaluation", "metric": None, "lower_is_better": True}
+    monkeypatch.setattr(result_parse_agent, "query", review)
+    node = SearchNode(code="print('evaluation incomplete')", stage="draft", _term_out=[])
+    result_parse_agent.run(agent, node, ExecutionResult(term_out=["incomplete\n"], exec_time=1, exc_type=None))
+    assert len(calls) == 0
+    assert node.is_buggy is True
+    assert node.search_eligible is False
+    assert node.review_verdict == "reject"
+    assert node.review_reason_codes == ["candidate_failure_artifact"]
+    assert "evaluation_failure.json" in node.analysis_for_prompt
+
+
+def test_missing_score_without_verifiable_result_skips_paid_review(monkeypatch, tmp_path):
+    agent = _parse_agent(tmp_path, "- metric_direction: minimize")
+    monkeypatch.setattr(
+        result_parse_agent,
+        "query",
+        lambda **_: pytest.fail("An unscorable result must not call the reviewer"),
+    )
+    node = SearchNode(code="print('finished without result')", stage="draft", _term_out=[])
+    result_parse_agent.run(
+        agent,
+        node,
+        ExecutionResult(term_out=["finished without result\n"], exec_time=1, exc_type=None),
+    )
+    assert node.is_buggy is True
+    assert node.review_reason_codes == ["metric_missing"]
+    assert node.metric.value is None
+    assert "no comparable" in node.analysis_for_prompt.lower()
 
 
 def test_prediction_result_review_receives_complete_contract_and_final_score_boundary(monkeypatch, tmp_path):

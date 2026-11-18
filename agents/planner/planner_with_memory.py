@@ -105,6 +105,7 @@ def generate_initial_plan(
         temperature=agent_instance.acfg.code.temp,
         cfg=agent_instance.cfg,
         json_schema=None,
+        stage_id="improvement_planning",
     )
 
     planning_text = planning_response.strip() if isinstance(planning_response, str) else str(planning_response).strip()
@@ -209,6 +210,7 @@ def refine_plan_to_json(
             temperature=agent_instance.acfg.code.temp,
             cfg=agent_instance.cfg,
             json_schema=json_schema,
+            stage_id="improvement_planning",
         )
 
         if not planning_response or (isinstance(planning_response, str) and not planning_response.strip()):

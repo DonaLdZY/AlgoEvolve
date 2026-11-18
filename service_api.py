@@ -935,6 +935,7 @@ def _build_snapshot(req: SnapshotRequest) -> dict[str, Any]:
         "log_dir": str(log_dir),
         "workspace_dir": str(workspace_dir) if workspace_dir else "",
         "events": _parse_log_events(log_dir / brief_log_name, limit=snapshot_event_limit),
+        "web_research_metrics": _safe_read_json(log_dir / "web_research_metrics.json", {}),
         "nodes": node_rows,
         "pending_nodes": pending_nodes,
         "best_node_id": best_node_id,

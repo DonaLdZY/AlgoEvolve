@@ -37,6 +37,7 @@ def diff_generate_and_apply(
     extra_user_sections: str = "",
     learning_guidance: str = "",
     max_diff_retries: int = 3,
+    stage_id: str = "candidate_diff_generation",
 ) -> Tuple[str, str]:
     model_name = agent_instance.acfg.code.model
 
@@ -68,6 +69,7 @@ def diff_generate_and_apply(
         prompt=diff_prompt,
         temperature=agent_instance.acfg.code.temp,
         cfg=agent_instance.cfg,
+        stage_id=stage_id,
     )
 
     def regenerate_fn(current_code: str, retry_note: str) -> str:
@@ -86,6 +88,7 @@ def diff_generate_and_apply(
             prompt=new_prompt,
             temperature=agent_instance.acfg.code.temp,
             cfg=agent_instance.cfg,
+            stage_id=stage_id,
         )
 
     final_code, total_applied, _ = apply_diff_with_retry(

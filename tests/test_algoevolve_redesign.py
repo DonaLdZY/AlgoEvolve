@@ -9,6 +9,7 @@ import pytest
 
 from agents.coder import stepwise_coder
 from agents import code_review_agent, result_parse_agent, draft_agent
+from agents.prompts.shared import get_internet_clarification
 from agents.prompt_policy import (
     autonomous_method_selection_guidance,
     dynamic_expansion_instruction,
@@ -110,6 +111,23 @@ def test_complexity_prompt_does_not_assign_a_method_family() -> None:
     assert "hybrid rl" not in instruction.lower()
 
 
+def test_draft_metric_guidance_requires_contract_repair_instead_of_invention() -> None:
+    guidance = draft_agent.EVALUATION_CONTRACT_GUIDANCE.lower()
+
+    assert "do not score candidates" in guidance
+    assert "exact missing formula or parameter" in guidance
+    assert "most conservative supported scalar" not in guidance
+
+
+def test_network_guidance_preserves_task_restrictions_and_does_not_assume_assets() -> None:
+    guidance = "\n".join(get_internet_clarification("C:/models")).lower()
+    assert "follow the active task" in guidance
+    assert "do not reinterpret a network restriction" in guidance
+    assert "not proof that the files exist or load" in guidance
+    assert "can and should use online resources" not in guidance
+    assert "guaranteed to exist" not in guidance
+
+
 def test_sibling_ordinals_are_atomic_and_action_profile_round_trips() -> None:
     parent = SearchNode(code="", plan="root", stage="root")
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -173,6 +191,52 @@ def test_finite_solution_interfaces_and_dangerous_code_preflight() -> None:
     assert dangerous.dangerous_findings
 
 
+@pytest.mark.parametrize("call", [
+    "train()",
+    "train('input', 'artifact', 'unexpected')",
+    "train(dataset='input', artifact_dir='artifact')",
+    "predict('model.pkl')",
+])
+def test_preflight_catches_invalid_cli_interface_calls_before_execution(call):
+    code = (
+        "def train(data, artifact_dir='artifact'): return data\n"
+        "def predict(model_path, data): return data\n"
+        f"if __name__ == '__main__':\n    {call}\n"
+    )
+    report = preflight_code(code, interface_for(task_family="prediction", method_family="tree"))
+    assert not report.ok
+    assert len(report.invalid_calls) == 1
+    assert "module call" in report.invalid_calls[0]
+
+
+@pytest.mark.parametrize("suffix", [
+    "train('input')",
+    "train(data='input', artifact_dir='artifact')",
+    "train(*runtime_args, **runtime_kwargs)",
+    "def helper(train):\n    return train()\n",
+    "class Runner:\n    def train(self): return 1\n    def run(self): return self.train()\n",
+    "train = factory()\ntrain()",
+])
+def test_preflight_preserves_defaulted_dynamic_and_shadowed_calls(suffix):
+    code = (
+        "def train(data, artifact_dir='artifact'): return data\n"
+        "def predict(model_path, data): return data\n" + suffix + "\n"
+    )
+    assert preflight_code(
+        code, interface_for(task_family="prediction", method_family="tree"),
+    ).ok
+
+
+def test_preflight_rejects_ast_parseable_but_uncompilable_candidate():
+    report = preflight_code(
+        "def train(data, artifact_dir): return data\n"
+        "def predict(model_path, data): return data\n"
+        "return None\n",
+        interface_for(task_family="prediction", method_family="tree"),
+    )
+    assert not report.ok and report.syntax_error
+
+
 @pytest.mark.parametrize("formal_task", [False, True])
 @pytest.mark.parametrize("initially_valid", [False, True])
 def test_preflight_rejection_regenerates_same_draft_instead_of_dropping_it(
@@ -206,6 +270,8 @@ def test_preflight_rejection_regenerates_same_draft_instead_of_dropping_it(
     reviews = []
     def review(_agent, node):
         reviews.append(node.id)
+        if formal_task and initially_valid:
+            return "def solve(data, model_path): return data\n"
         return node.code
     monkeypatch.setattr(code_review_agent, "run", review)
     monkeypatch.setattr(
@@ -238,6 +304,62 @@ def test_preflight_rejection_regenerates_same_draft_instead_of_dropping_it(
     assert result.plan.startswith("simulated annealing" if initially_valid else "same simulated annealing")
     assert "def solve(model_path, data)" in result.code
     assert bool(reviews) is (formal_task or not initially_valid)
+    if formal_task and initially_valid:
+        assert result.preexecution_review_warnings == [
+            "Reviewer edit did not improve deterministic preflight; original code was retained."
+        ]
+
+
+def test_preflight_regeneration_stops_when_failure_signature_does_not_change(monkeypatch):
+    root = SearchNode(code="", plan="root", stage="root", step=0)
+    agent = AgentSearch.__new__(AgentSearch)
+    agent.virtual_root = root
+    agent.task_desc = "Minimize assignment cost."
+    agent.data_preview = ""
+    agent.autorealize_context = ""
+    agent.has_autorealize_context = False
+    agent.coldstart_description = ""
+    agent.runtime_checkpoint_callback = None
+    agent.scfg = SimpleNamespace(num_drafts=2)
+    agent.cfg = SimpleNamespace(runtime=SimpleNamespace(resume_run=False))
+    agent.acfg = SimpleNamespace(
+        draft=SimpleNamespace(fast_first_draft_skip_pre_review=False),
+        retries=SimpleNamespace(preflight_regeneration_max_attempts=2),
+    )
+    rejected = SearchNode(
+        code="def solve(data, model_path): return data\n",
+        plan="simulated annealing",
+        stage="draft",
+        parent=root,
+    )
+    reviews, regenerations = [], []
+    monkeypatch.setattr(code_review_agent, "run", lambda _agent, node: reviews.append(node.id) or node.code)
+    def regenerate(_agent, node, _interface, _preflight, *, attempt):
+        regenerations.append(attempt)
+        return node.plan, node.code
+    monkeypatch.setattr(code_review_agent, "regenerate_after_preflight_failure", regenerate)
+    from agents import draft_agent
+    monkeypatch.setattr(draft_agent, "run", lambda *_args, **_kwargs: rejected)
+
+    with pytest.raises(RuntimeError, match="failed mandatory pre-execution"):
+        agent._run_single_step(
+            root,
+            exec_callback=lambda *_args, **_kwargs: None,
+            execute_immediately=False,
+            fast_draft_mode=False,
+            expansion_profile=ExpansionProfile.create(1, operator="draft", task_family="decision"),
+        )
+
+    assert reviews == [rejected.id]
+    assert regenerations == [1]
+
+
+def test_code_review_prompt_requires_oof_calibration_and_temporal_purge():
+    from agents.prompts.validation_template_prompts import get_code_review_guidelines
+
+    prompt = "\n".join(get_code_review_guidelines(submission_required=False))
+    assert "same development rows" in prompt
+    assert "earliest validation cutoff" in prompt
 
 
 def test_exhausted_review_can_continue_only_when_deterministic_preflight_passes(monkeypatch):
@@ -323,6 +445,185 @@ def test_final_preflight_allows_engine_only_entrypoint():
     assert preflight_code(code, interface, require_final_evaluation=True).ok
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "if __name__ == '__main__':\n    evaluate_holdout(data, partition='holdout')\n",
+        "def train(data, artifact_dir):\n    return evaluate(data, split='test')\n",
+        "def predict(model_path, data):\n    return evaluate_holdout(data, _allow_holdout=True)\n",
+    ],
+)
+def test_preflight_blocks_search_time_holdout_access(body):
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        + body
+    )
+    report = preflight_code(code, interface)
+    assert report.ok is False
+    assert report.policy_findings
+
+
+def test_preflight_allows_holdout_only_inside_engine_final_evaluate():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def final_evaluate(data, artifact_dir):\n"
+        "    return evaluate_holdout(data, partition='holdout', _allow_holdout=True)\n"
+    )
+    report = preflight_code(code, interface, require_final_evaluation=True)
+    assert report.ok is True
+    assert not report.policy_findings
+
+
+def test_preflight_requires_completed_final_result_contract_keys():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def final_evaluate(data, artifact_dir):\n"
+        "    return {'status': 'completed', 'holdout_mae': 0.4}\n"
+    )
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is False
+    finding = next(item for item in report.policy_findings if "completed return must include fields" in item)
+    assert all(name in finding for name in ("metrics", "model_path", "inference_checks"))
+
+
+def test_preflight_does_not_accept_contract_names_mentioned_outside_completed_return():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def final_evaluate(data, artifact_dir):\n"
+        "    required = ('metrics', 'model_path', 'inference_checks')\n"
+        "    return {'status': 'completed', 'holdout_mae': 0.4}\n"
+    )
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is False
+    finding = next(item for item in report.policy_findings if "completed return must include fields" in item)
+    assert all(name in finding for name in ("metrics", "model_path", "inference_checks"))
+
+
+def test_preflight_accepts_complete_final_result_contract_keys():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def final_evaluate(data, artifact_dir):\n"
+        "    return {'status': 'completed', 'metrics': {'mae': 0.4}, "
+        "'model_path': 'model.pkl', 'inference_checks': {}}\n"
+    )
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is True
+
+
+def test_preflight_ignores_completed_helper_results_when_checking_final_contract():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def evaluate_holdout(data, artifact_dir, split):\n"
+        "    return {'status': 'completed', 'split': split, 'mae': 0.4, 'rows': []}\n"
+        "def final_evaluate(data, artifact_dir):\n"
+        "    holdout = evaluate_holdout(data, artifact_dir, 'holdout')\n"
+        "    report = {'status': 'completed', 'holdout_mae': holdout['mae'], "
+        "'model_path': 'model.pkl', 'inference_checks': []}\n"
+        "    return report\n"
+    )
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is False
+    finding = next(item for item in report.policy_findings if "completed return must include fields" in item)
+    assert finding.endswith("metrics")
+
+
+def test_preflight_accepts_final_contract_with_internal_evaluation_helpers():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def evaluate_holdout(data, artifact_dir, split):\n"
+        "    return {'status': 'completed', 'split': split, 'mae': 0.4, 'rows': []}\n"
+        "def final_evaluate(data, artifact_dir):\n"
+        "    holdout = evaluate_holdout(data, artifact_dir, 'holdout')\n"
+        "    return {'status': 'completed', 'metrics': {'mae': holdout['mae']}, "
+        "'model_path': 'model.pkl', 'inference_checks': []}\n"
+    )
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is True
+
+
+def test_preflight_defers_mutated_final_result_to_runtime_contract_validation():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def final_evaluate(data, artifact_dir):\n"
+        "    report = {'status': 'completed', 'model_path': 'model.pkl', "
+        "'inference_checks': []}\n"
+        "    report['metrics'] = {'mae': 0.4}\n"
+        "    return report\n"
+    )
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is True
+
+
+def test_preflight_allows_top_level_helper_reachable_only_from_final_evaluate():
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+    code = (
+        "def train(data, artifact_dir): return artifact_dir\n"
+        "def predict(model_path, data): return data\n"
+        "def final_evaluate(data, artifact_dir): return score_final(data)\n"
+        "def score_final(data):\n"
+        "    return evaluate_holdout(data, partition='holdout', _allow_holdout=True)\n"
+    )
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is True
+    assert not report.policy_findings
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        (
+            "def train(data, artifact_dir): return score_final(data)\n"
+            "def predict(model_path, data): return data\n"
+            "def final_evaluate(data, artifact_dir): return score_final(data)\n"
+            "def score_final(data): return evaluate_holdout(data, partition='holdout')\n"
+        ),
+        (
+            "def train(data, artifact_dir): return score_final(data)\n"
+            "def predict(model_path, data): return data\n"
+            "def score_final(data): return evaluate_holdout(data, partition='holdout')\n"
+            "if __name__ == '__main__': train(None, None)\n"
+        ),
+    ],
+)
+def test_preflight_rejects_holdout_helpers_reachable_from_search(code):
+    interface = interface_for(task_family="prediction", method_family="tree_boosting")
+
+    report = preflight_code(code, interface, require_final_evaluation=True)
+
+    assert report.ok is False
+    assert report.policy_findings
+
+
 def test_preflight_regeneration_prompt_ends_with_exact_rejection_evidence(
     monkeypatch,
 ) -> None:
@@ -346,7 +647,8 @@ def test_preflight_regeneration_prompt_ends_with_exact_rejection_evidence(
     interface = interface_for(task_family="decision", method_family="heuristic")
     report = preflight_code(node.code, interface)
 
-    def fake_generate(_agent, prompt):
+    def fake_generate(_agent, prompt, *, stage_id):
+        assert stage_id == "preflight_code_regeneration"
         captured["prompt"] = prompt
         return "corrected", "def solve(model_path, data): return data\n"
 

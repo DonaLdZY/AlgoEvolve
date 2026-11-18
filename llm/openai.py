@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from openai import OpenAI
+import jsonschema
 
 from config import Config
 from .gemini import FunctionSpec, compile_prompt_to_md
@@ -82,7 +83,11 @@ def _append_with_overlap(
     if not base or not addition:
         return f"{base}{addition}"
     max_scan = min(len(base), len(addition), max(0, int(max_scan_chars)))
-    for size in range(max_scan, 15, -1):
+    minimum_overlap = 6 if (
+        (base[-1].isalnum() or base[-1] == "_")
+        and (addition[0].isalnum() or addition[0] == "_")
+    ) else 16
+    for size in range(max_scan, minimum_overlap - 1, -1):
         if base[-size:] == addition[:size]:
             return base + addition[size:]
     return base + addition
@@ -194,6 +199,12 @@ def _example_from_schema(schema: dict | None) -> Any:
         return _example_from_schema(schema["anyOf"][0])
 
     schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        if "null" in schema_type:
+            return None
+        schema_type = schema_type[0] if schema_type else None
+    if schema_type == "null":
+        return None
     if schema_type == "object":
         properties = schema.get("properties", {})
         return {key: _example_from_schema(value) for key, value in properties.items()}
@@ -240,6 +251,13 @@ def _insert_after_task_section(user_message: str, section: str) -> str:
     # section ("# Instructions", "# Implementation", etc.) is the safe point
     # where the stage-specific instructions can diverge.
     split_at = _stable_task_section_end(user)
+    # Use a generated length, not a marker search through untrusted code/logs.
+    candidate = re.match(r"\s*# Candidate implementation\n<!-- candidate-code-chars: (\d+) -->\n", user[split_at:])
+    if candidate:
+        code_end = split_at + candidate.end() + int(candidate.group(1))
+        boundary = "\n\n# End candidate implementation"
+        if user[code_end:].startswith(boundary + "\n"):
+            split_at = code_end + len(boundary)
     if split_at == len(user):
         return f"{user.rstrip()}\n\n{inserted}"
     return f"{user[:split_at].rstrip()}\n\n{inserted}\n\n{user[split_at:].lstrip()}"
@@ -260,11 +278,13 @@ def _build_json_mode_messages(
     func_spec: FunctionSpec,
 ) -> list[dict[str, str]]:
     """Build a JSON-output fallback prompt for providers with weak tool-calling support."""
-    example = json.dumps(_example_from_schema(func_spec.json_schema), ensure_ascii=False, indent=2)
+    example = json.dumps(_example_from_schema(func_spec.json_schema), ensure_ascii=False, separators=(",", ":"))
+    schema = json.dumps(func_spec.json_schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     instruction = (
         f"You must respond with a valid JSON object for `{func_spec.name}`.\n"
         f"Return JSON only, with no markdown fences and no extra commentary.\n"
-        f"JSON example:\n{example}"
+        f"JSON schema (all constraints and descriptions apply):\n{schema}\n"
+        f"JSON example (shape only, not factual values):\n{example}"
     )
     combined_system = f"{system_message}\n\n{instruction}" if system_message else instruction
     cache_messages = _cache_friendly_messages(combined_system, user_message)
@@ -283,6 +303,26 @@ def _parse_message_json_content(content: str) -> dict:
         if match:
             return json.loads(match.group(0))
         raise
+
+
+def _prefer_structured_json(stage, model: str, mode_override: str | None = None) -> bool:
+    mode = str(
+        mode_override
+        if mode_override is not None
+        else os.environ.get("ALGOEVOLVE_STRUCTURED_OUTPUT_MODE", "auto")
+    ).strip().lower()
+    if mode not in {"auto", "json", "tools"}:
+        raise ValueError("ALGOEVOLVE_STRUCTURED_OUTPUT_MODE must be auto, json, or tools")
+    official = (urlparse(str(getattr(stage, "base_url", "") or "")).hostname or "").lower() == "api.deepseek.com"
+    return mode == "json" or (mode == "auto" and official and is_deepseek_model(model))
+
+
+def _validated_json_content(content: str, func_spec: FunctionSpec, finish_reason: str) -> dict:
+    if finish_reason != "stop":
+        raise ValueError(f"Structured content did not finish normally: {finish_reason}")
+    output = _parse_message_json_content(content)
+    jsonschema.validate(output, func_spec.json_schema)
+    return output
 
 # Return type aligned with gemini.query
 OutputType = str | dict
@@ -310,9 +350,9 @@ def _stage_max_tokens(stage) -> int | None:
 
 def _stage_minimum_output_tokens(stage) -> int:
     try:
-        tokens = int(getattr(stage, "minimum_output_tokens", 32768) or 0)
+        tokens = int(getattr(stage, "minimum_output_tokens", 0) or 0)
     except (TypeError, ValueError):
-        tokens = 32768
+        tokens = 0
     return max(0, tokens)
 
 
@@ -321,8 +361,9 @@ def _resolve_max_tokens(explicit_value: Any, stage) -> int | None:
         explicit = int(explicit_value) if explicit_value is not None else 0
     except (TypeError, ValueError):
         explicit = 0
-    requested = explicit if explicit > 0 else int(_stage_max_tokens(stage) or 0)
-    effective = max(requested, _stage_minimum_output_tokens(stage))
+    if explicit > 0:
+        return explicit
+    effective = max(int(_stage_max_tokens(stage) or 0), _stage_minimum_output_tokens(stage))
     return effective or None
 
 
@@ -471,8 +512,12 @@ def _create_with_retry(
         ))
         remaining = window - input_tokens - int(window * 0.18)
         requested = int(params.get("max_tokens") or 32768)
-        if remaining < min(requested, 32768):
+        minimum_reply = max(1, int(getattr(stage, "context_minimum_reply_tokens", 8192) or 8192))
+        if remaining < min(requested, minimum_reply):
             raise ValueError(f"Complete request exceeds context budget: input={input_tokens}, window={window}")
+        if remaining < requested:
+            logger.info("Keeping complete request (%s estimated input tokens); reply budget %s -> %s with 18%% headroom",
+                        input_tokens, requested, remaining)
         params["max_tokens"] = min(requested, remaining)
     max_attempts = max(
         1,
@@ -625,22 +670,30 @@ def _log_usage(label: str, completion: Any) -> None:
     if not usage:
         return
     details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
-    cached = (
-        usage.get("prompt_cache_hit_tokens")
-        or usage.get("cached_tokens")
-        or details.get("cached_tokens")
-        or details.get("prompt_cache_hit_tokens")
+    cached = next(
+        (
+            pool[key]
+            for pool in (usage, details)
+            for key in ("prompt_cache_hit_tokens", "cached_tokens")
+            if pool.get(key) is not None
+        ),
+        None,
     )
-    missed = (
-        usage.get("prompt_cache_miss_tokens")
-        or details.get("prompt_cache_miss_tokens")
+    missed = next(
+        (
+            pool[key]
+            for pool in (usage, details)
+            for key in ("prompt_cache_miss_tokens", "cache_miss_input_tokens")
+            if pool.get(key) is not None
+        ),
+        None,
     )
     logger.info(
         "[llm_usage] %s prompt=%s cached=%s miss=%s completion=%s total=%s",
         label,
         usage.get("prompt_tokens"),
-        cached,
-        missed,
+        cached if cached is not None else "unknown",
+        missed if missed is not None else "unknown",
         usage.get("completion_tokens"),
         usage.get("total_tokens"),
     )
@@ -665,7 +718,13 @@ def query(
         max_retries=0,
         timeout=max(1.0, float(getattr(stage, "request_timeout_seconds", 1200.0))),
     )
-    messages = _build_messages(system_message, user_message)
+    json_mode = func_spec is not None and _prefer_structured_json(
+        stage,
+        model,
+        filtered.get("structured_output_mode"),
+    )
+    messages = (_build_json_mode_messages(system_message, user_message, func_spec)
+                if json_mode else _build_messages(system_message, user_message))
     if not messages:
         raise ValueError("Either system_message or user_message must be provided")
     logger.info(
@@ -702,7 +761,9 @@ def query(
     if extra_body:
         params["extra_body"] = extra_body
     _apply_deepseek_request_options(params, stage, model, use_thinking)
-    if func_spec is not None:
+    if json_mode:
+        params["response_format"] = {"type": "json_object"}
+    elif func_spec is not None:
         tool_dict = _build_tool_dict(model, func_spec)
         params["tools"] = [tool_dict]
         if not deepseek_model:
@@ -710,8 +771,9 @@ def query(
 
     t0 = time.time()
     prompt_name = str(filtered.get("prompt_name") or infer_prompt_name("query"))
+    stage_id = str(filtered.get("stage_id") or "").strip() or None
     prompt_parts = prompt_parts_from_messages(messages)
-    if func_spec is not None:
+    if func_spec is not None and not json_mode:
         prompt_parts.append(
             {
                 "name": "function_schema",
@@ -733,12 +795,23 @@ def query(
     if getattr(choice, "finish_reason", None) == "length":
         logger.warning(f"Response truncated by max_tokens ({params.get('max_tokens')}), consider increasing it")
 
-    if func_spec is None:
+    if json_mode:
+        output = None
+        try:
+            output = _validated_json_content(message.content or "", func_spec, finish_reason)
+        finally:
+            # Even malformed/empty/truncated paid responses must enter the ledger.
+            log_llm_usage(cfg=cfg, prompt_name=prompt_name, stage_id=stage_id, mode="query_json",
+                provider="openai_compatible", model=model, response=completion, seconds=req_time,
+                finish_reason=finish_reason, max_tokens=params.get("max_tokens"), parsed_ok=output is not None,
+                prompt_parts=prompt_parts, estimated_completion_text=message.content or "")
+    elif func_spec is None:
         output = message.content or ""
         logger.info(f"OpenAI response: {output}", extra={"verbose": True})
         log_llm_usage(
             cfg=cfg,
             prompt_name=prompt_name,
+            stage_id=stage_id,
             mode="query_text",
             provider="openai_compatible",
             model=model,
@@ -753,17 +826,21 @@ def query(
     else:
         if message.tool_calls:
             tc = message.tool_calls[0]
-            if tc.function.name != func_spec.name:
-                raise ValueError(f"Function name mismatch: expected {func_spec.name}, got {tc.function.name}")
+            parse_error = None
+            output = None
             try:
+                if tc.function.name != func_spec.name:
+                    raise ValueError(
+                        f"Function name mismatch: expected {func_spec.name}, got {tc.function.name}"
+                    )
                 output = _parse_json_args(tc.function.arguments or "{}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid function arguments: {tc.function.arguments}")
-                raise e
-            logger.info(f"OpenAI function call response: {output}", extra={"verbose": True})
+                jsonschema.validate(output, func_spec.json_schema)
+            except Exception as exc:
+                parse_error = exc
             log_llm_usage(
                 cfg=cfg,
                 prompt_name=prompt_name,
+                stage_id=stage_id,
                 mode="query_function",
                 provider="openai_compatible",
                 model=model,
@@ -771,17 +848,41 @@ def query(
                 seconds=req_time,
                 finish_reason=finish_reason,
                 max_tokens=params.get("max_tokens"),
-                parsed_ok=True,
+                parsed_ok=parse_error is None,
                 prompt_parts=prompt_parts,
-                estimated_completion_text=json.dumps(output, ensure_ascii=False, default=str),
+                estimated_completion_text=(
+                    json.dumps(output, ensure_ascii=False, default=str)
+                    if output is not None else str(getattr(tc.function, "arguments", "") or "")
+                ),
             )
+            if parse_error is not None:
+                logger.error("Invalid function response: %s", parse_error)
+                raise parse_error
+            logger.info(f"OpenAI function call response: {output}", extra={"verbose": True})
         elif deepseek_model and message.content:
+            # Compatible endpoints may return a complete structured answer as
+            # content. Validate it locally before paying for a second request.
+            try:
+                output = _validated_json_content(message.content, func_spec, finish_reason)
+            except (ValueError, jsonschema.ValidationError):
+                output = None
+            if output is not None:
+                log_llm_usage(cfg=cfg, prompt_name=prompt_name, stage_id=stage_id, mode="query_function_content",
+                    provider="openai_compatible", model=model, response=completion, seconds=req_time,
+                    finish_reason=finish_reason, max_tokens=params.get("max_tokens"), parsed_ok=True,
+                    prompt_parts=prompt_parts, estimated_completion_text=message.content)
+                return (output, req_time, getattr(completion.usage, "prompt_tokens", 0) or 0,
+                        getattr(completion.usage, "completion_tokens", 0) or 0,
+                        {"model": getattr(completion, "model", model),
+                         "created": getattr(completion, "created", int(time.time())),
+                         "usage": usage_to_dict(getattr(completion, "usage", None))})
             logger.warning(
                 "DeepSeek returned message content instead of tool_calls; falling back to JSON output parsing"
             )
             log_llm_usage(
                 cfg=cfg,
                 prompt_name=f"{prompt_name}:tool_call_failed_content",
+                stage_id=stage_id,
                 mode="query_function_unparsed",
                 provider="openai_compatible",
                 model=model,
@@ -818,25 +919,17 @@ def query(
             )
             fallback_seconds = time.time() - fallback_t0
             message = completion.choices[0].message
-            if not message.content:
-                raise ValueError("DeepSeek JSON fallback returned empty content")
-            output = _parse_message_json_content(message.content)
-            logger.info(f"DeepSeek JSON fallback response: {output}", extra={"verbose": True})
             fallback_choice = completion.choices[0]
-            log_llm_usage(
-                cfg=cfg,
-                prompt_name=f"{prompt_name}:json_fallback",
-                mode="query_json_fallback",
-                provider="openai_compatible",
-                model=model,
-                response=completion,
-                seconds=fallback_seconds,
-                finish_reason=str(getattr(fallback_choice, "finish_reason", "") or ""),
-                max_tokens=json_params.get("max_tokens"),
-                parsed_ok=True,
-                prompt_parts=prompt_parts_from_messages(json_params.get("messages", [])),
-                estimated_completion_text=json.dumps(output, ensure_ascii=False, default=str),
-            )
+            fallback_finish = str(getattr(fallback_choice, "finish_reason", "") or "")
+            output = None
+            try:
+                output = _validated_json_content(message.content or "", func_spec, fallback_finish)
+            finally:
+                log_llm_usage(cfg=cfg, prompt_name=f"{prompt_name}:json_fallback", stage_id=stage_id, mode="query_json_fallback",
+                    provider="openai_compatible", model=model, response=completion, seconds=fallback_seconds,
+                    finish_reason=fallback_finish, max_tokens=json_params.get("max_tokens"), parsed_ok=output is not None,
+                    prompt_parts=prompt_parts_from_messages(json_params.get("messages", [])),
+                    estimated_completion_text=message.content or "")
             in_tok = getattr(completion.usage, "prompt_tokens", 0) or 0
             out_tok = getattr(completion.usage, "completion_tokens", 0) or 0
             info = {
@@ -944,6 +1037,7 @@ def generate(
     json_schema: dict | None = None,
     max_retries: int | None = None,
     retry_delay: float | None = None,
+    stage_id: str | None = None,
 ) -> str:
     """Streaming text generation via OpenAI-compatible Chat API. Supports chat format {system, user, assistant} for Qwen."""
     stage = cfg.agent.code
@@ -1071,6 +1165,7 @@ def generate(
             log_llm_usage(
                 cfg=cfg,
                 prompt_name=prompt_name,
+                stage_id=stage_id,
                 mode="generate_stream",
                 provider="openai_compatible",
                 model=model,
@@ -1143,6 +1238,7 @@ def generate(
                 log_llm_usage(
                     cfg=cfg,
                     prompt_name=f"{prompt_name}:continuation_{continuation_round}",
+                    stage_id=stage_id,
                     mode="generate_stream_continuation",
                     provider="openai_compatible",
                     model=model,

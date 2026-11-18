@@ -346,6 +346,7 @@ def run_planner(
     extra_prompt_sections: Dict[str, str] | None = None,
     max_retries: int = 3,
     stage_name: str = "Planning",
+    stage_id: str = "improvement_planning",
 ) -> Dict[str, Any]:
     allowed_modules = get_planning_allowed_modules(agent_instance=agent_instance)
     component_descriptions = {
@@ -424,6 +425,7 @@ def run_planner(
             temperature=agent_instance.acfg.code.temp,
             cfg=agent_instance.cfg,
             json_schema=json_schema,
+            stage_id=stage_id,
         )
 
         planning_result = parse_planning_response(planning_response)

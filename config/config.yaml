@@ -168,6 +168,16 @@ exec:
 agent:
   # Language for model-authored plans, reviews, debug hints, summaries, and UI insight: english|chinese
   output_language: "english"
+  # Optional public method research; accepts the AutoDecision key or legacy AlgoEvolve aliases.
+  # Enable per task with an explicit public query; local task text and data are not sent.
+  web_research:
+    enabled: false
+    query: ""
+    timeout_seconds: 12.0
+    # Fetch supplements short search summaries only; keep the optional wait bounded.
+    fetch_timeout_seconds: 8.0
+    max_results: 3
+    max_context_chars: 2800
   # Maximum nodes and remaining action submissions per launch; failed generation consumes an action.
   # 最大搜索节点/动作预算；生成失败也消耗动作次数，继续搜索可追加预算。
   steps: 50
@@ -197,7 +207,7 @@ agent:
     # null|low|medium|high|xhigh|max / 思考强度
     reasoning_effort: null
     # Every normal request is raised to at least this output cap / 正常业务请求的输出 token 下限
-    minimum_output_tokens: 32768
+    minimum_output_tokens: 0
     # Coding output token cap / 编码输出 token 上限
     max_tokens: 32768
     # Per-request HTTP timeout seconds / 单次 HTTP 请求超时秒数
@@ -234,7 +244,7 @@ agent:
     # null|low|medium|high|xhigh|max / 思考强度
     reasoning_effort: null
     # Every normal request is raised to at least this output cap / 正常业务请求的输出 token 下限
-    minimum_output_tokens: 32768
+    minimum_output_tokens: 0
     # Feedback output token cap / 反馈输出 token 上限
     max_tokens: 32768
     # Per-request HTTP timeout seconds / 单次 HTTP 请求超时秒数
@@ -272,7 +282,7 @@ agent:
     # Deprecated compatibility field; full context is always used / 兼容旧配置；当前始终使用完整上下文
     fast_first_draft_compact_context: false
     # Later drafts use staged generation / 后续草稿是否使用 stepwise
-    use_stepwise_after_first: true
+    use_stepwise_after_first: false
     # Write gray pending draft nodes for frontend / 是否为前端写出灰色生成中节点
     show_pending_draft_nodes: true
     # Deprecated compatibility field; used only by the legacy coupled scheduler / 兼容旧配置；仅旧版耦合调度器使用
@@ -281,14 +291,14 @@ agent:
     stepwise_stage_context: false
     # Append each step to one provider-cache-friendly conversation / 将每一步追加到同一条利于 provider 缓存的会话
     stepwise_accumulate_context: true
-    # Compact older dynamic turns after the estimated prompt reaches this token budget / 估算输入达到该 token 预算后压缩较早动态轮次
-    stepwise_context_max_tokens: 90000
+    # 0 derives the compaction threshold from the selected model context window / 0 表示按所选模型上下文窗口动态确定压缩阈值
+    stepwise_context_max_tokens: 0
     # Keep this many latest step turns verbatim when compacting / 压缩时保留最近若干步骤原文
     stepwise_compaction_keep_recent_steps: 2
     # Maximum output tokens for one history compaction call / 单次历史压缩调用最大输出 token
     stepwise_compaction_max_tokens: 32768
-    # Compact before the context window is full; preserves output/reasoning headroom
-    stepwise_context_headroom_ratio: 0.15
+    # Keep a small estimator margin after reserving the configured output budget / 预留输出预算后，仅保留少量估算误差
+    stepwise_context_headroom_ratio: 0.01
     # Exact older turns are stored here before lossy compaction
     stepwise_snapshot_dirname: "context_snapshots"
 

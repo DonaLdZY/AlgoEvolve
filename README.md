@@ -309,7 +309,7 @@ config/config.yaml
 | `resources.cpu_cores`                     |         `4` | 整个任务进程树共享的逻辑 CPU 配额                |
 | `resources.memory_limit_gb`               |       `8.0` | 整个任务进程树共享的内存目标；`0` 表示不限     |
 | `agent.output_language`                   |   `english` | 模型生成内容语言：`english` 或 `chinese`     |
-| `agent.draft.stepwise_context_max_tokens` |     `90000` | 触发较早动态上下文压缩的估算输入预算             |
+| `agent.draft.stepwise_context_max_tokens` |         `0` | `0` 表示按模型窗口和输出预算动态触发历史压缩     |
 | `runtime.resume_budget_mode`              |     `total` | 恢复时预算按累计总量或新增量解释                 |
 
 `agent.code` 与 `agent.feedback` 分别配置生成模型和评审模型，包括 model、base URL、temperature、thinking、reasoning effort、输出上限、超时和网络重试。网络重试与角色级审查次数是不同概念，避免同时调高造成意外成本。

@@ -129,6 +129,24 @@ def test_openai_message_builder_preserves_native_chat_history() -> None:
     assert _prompt_to_messages(source, model="deepseek-v4-pro") == source
 
 
+def test_stepwise_reserves_reply_and_compacts_even_two_recent_steps(monkeypatch, tmp_path):
+    conversation = stepwise_coder.StepwiseConversation(base_messages=[
+        {"role": "user", "content": "UNCHANGED_FULL_TASK"}])
+    conversation.record("data", "full original data module")
+    conversation.record("model", "full original model module")
+    agent = _agent(max_tokens=0, keep_steps=2, workspace=tmp_path)
+    agent.acfg.code = SimpleNamespace(context_window_tokens=131072, max_tokens=32768)
+    monkeypatch.setattr(conversation, '_estimated_tokens', lambda *_: 100000)
+    calls = []
+    monkeypatch.setattr(stepwise_coder, 'generate', lambda **kw: calls.append(kw) or "Preserved interfaces and rules")
+    messages = conversation.messages_for("inference", agent)
+    assert calls and messages[0] == conversation.base_messages[0]
+    assert "UNCHANGED_FULL_TASK" not in str(calls[0]['prompt'])
+    snapshot = conversation.retrieve_snapshot(conversation.snapshots[0]['snapshot_id'])
+    assert "full original data module" in snapshot
+    assert "full original model module" in str(messages)
+
+
 def test_agent_instructions_follow_complete_task_context_with_inner_headings() -> None:
     user = (
         task_section(
@@ -146,3 +164,53 @@ def test_agent_instructions_follow_complete_task_context_with_inner_headings() -
     assert content.index("Exact schema details") < content.index(TASK_CONTEXT_END_MARKER)
     assert content.index(TASK_CONTEXT_END_MARKER) < content.index(AGENT_INSTRUCTIONS_TITLE)
     assert content.index(AGENT_INSTRUCTIONS_TITLE) < content.index("dynamic-code")
+
+
+def test_merge_receives_exact_stages_after_compaction_and_repairs_syntax(monkeypatch):
+    conversation = stepwise_coder.StepwiseConversation(
+        base_messages=[{'role':'user','content':'UNCHANGED_TASK'}],
+        compacted_history='only a summary, no full code')
+    stages = [{'name':'data','plan':'p','code':'def load_data():\n    return 42'},
+              {'name':'model','plan':'p','code':'def train(data):\n    return data'}]
+    monkeypatch.setattr(stepwise_coder.MetaAgent, '_build_merge_prompt', lambda *a,**kw:{
+        'system':'merge','user':'# Instructions\nKeep complete source\n# Step results\nignored legacy block'})
+    seen=[]
+    stage_ids=[]
+    bad='```python\ndef broken(:\n    pass\n```'
+    def generate(**kw):
+        seen.append(kw['prompt'])
+        stage_ids.append(kw["stage_id"])
+        return bad if len(seen)==1 else '```python\ndef load_data():\n    return 42\ndef train(data):\n    return data\n```'
+    monkeypatch.setattr(stepwise_coder,'generate',generate)
+    agent=_agent();agent.acfg.code=SimpleNamespace(temp=0)
+    _,code=stepwise_coder.MetaAgent().merge('task','data',stages,{},agent,
+        stepwise_coder.StepwiseContext(),conversation=conversation)
+    assert seen[0][0] == conversation.base_messages[0]
+    assert all(stage['code'] in str(seen[0]) or stage['code'] in seen[0][-1]['content'] for stage in stages)
+    assert 'only a summary' not in str(seen[0])
+    assert seen[1][:len(seen[0])] == seen[0]
+    assert seen[1][-2]['content'] == bad
+    assert 'invalid syntax' in seen[1][-1]['content']
+    assert stage_ids == ["stepwise_solution_merge", "stepwise_solution_merge"]
+    compile(code,'merged','exec')
+
+
+def test_stage_snapshot_retrieval_does_not_consume_single_code_attempt(monkeypatch):
+    conversation=stepwise_coder.StepwiseConversation(base_messages=[{'role':'user','content':'fixed'}])
+    monkeypatch.setattr(conversation,'retrieve_snapshot',lambda value:'EXACT_PRIOR_CODE' if value=='a'*16 else None)
+    stage=stepwise_coder.StepAgent('stage','intro','description',[])
+    monkeypatch.setattr(stage,'_build_prompt',lambda **kw:{'system':'stage','user':'# Instructions\nDo stage\n# Current step: stage'})
+    seen=[]
+    stage_ids=[]
+    def generate(**kw):
+        seen.append(kw['prompt'])
+        stage_ids.append(kw["stage_id"])
+        return 'REQUEST_CONTEXT_SNAPSHOT: '+('a'*16)+' | exact schema' if len(seen)==1 else '```python\nvalue=42\n```'
+    monkeypatch.setattr(stepwise_coder,'generate',generate)
+    agent=_agent();agent.acfg.code=SimpleNamespace(temp=0)
+    _,code=stage.generate('task','data',[],{},agent,stepwise_coder.StepwiseContext(),retries=1,conversation=conversation)
+    assert len(seen)==2 and 'EXACT_PRIOR_CODE' in str(seen[1])
+    assert stage_ids == ["stepwise_candidate_generation", "stepwise_candidate_generation"]
+    namespace = {}
+    exec(code, namespace)
+    assert namespace['value'] == 42

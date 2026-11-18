@@ -13,7 +13,8 @@ from engine.search_node import SearchNode
 from agents.prompts.validation_template_prompts import get_code_review_prompt
 from agents.prompts import get_internet_clarification
 from agents.prompts.shared import SEARCH_EVALUATION_GUIDANCE
-from agents.prompt_cache import task_section
+from agents.prompt_cache import candidate_review_section, task_section, routed_data_context
+from llm.model_profiles import is_deepseek_model
 from agents.prompt_policy import (
     configured_output_language,
     infer_task_family,
@@ -70,7 +71,7 @@ CODE_REVIEW_SPEC = FunctionSpec(
                 )
             },
             "revised_code": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": (
                     "ONLY if needs_revision=true: Provide targeted fixes using SEARCH/REPLACE diff format.\n\n"
                     "**REQUIRED FORMAT** (use this for each fix):\n"
@@ -98,11 +99,7 @@ CODE_REVIEW_SPEC = FunctionSpec(
 def run(agent, node: SearchNode) -> str:
     logger.debug(f"[review] node {node.id}")
 
-    review_context = str(
-        getattr(agent, "autorealize_context", "")
-        or getattr(agent, "data_preview", "")
-        or ""
-    )
+    review_context = routed_data_context(agent, "code_review")
     review_task_desc = str(agent.task_desc or "")
     task_family = infer_task_family(agent)
     interface = interface_for(
@@ -170,9 +167,8 @@ def run(agent, node: SearchNode) -> str:
                         "Instructions": prompt.get("Instructions", {}),
                     },
                     user_message=(
-                        f"{task_section(review_task_desc, review_context)}\n"
-                        f"# Code to review\n{prompt.get('Code to review', '')}\n\n"
-                        "# Latest deterministic preflight evidence\n"
+                        candidate_review_section(review_task_desc, review_context, node.code)
+                        + "# Latest deterministic preflight evidence\n"
                         + json.dumps(
                             {
                                 "task_family": task_family,
@@ -180,7 +176,7 @@ def run(agent, node: SearchNode) -> str:
                                 "preflight": preflight.__dict__,
                                 "actual_call_contract": {
                                     "default_search": "Only task training/development data may be fitted/predicted; never final holdout",
-                                    "final_evaluate": "final_evaluate(Path(full_input_directory), Path(final_artifact_directory)); first argument is NOT a DataFrame or CSV filename. Resolve and parse the exact source files before dataframe validation. The output directory already contains the selected node working files.",
+                                    "final_evaluate": "final_evaluate(Path(full_input_directory), Path(final_artifact_directory)); first argument is NOT a DataFrame or CSV filename. Resolve and parse the exact source files before dataframe validation. The output directory contains the frozen ./working/artifact contents at its root, or the legacy ./working contents when no canonical artifact directory exists. Load selected_config.json and recipe dependencies from final_artifact_directory (the supplied artifact_dir), never from __file__, cwd, another node, or an absolute workspace path. When status='completed', return metrics as finite numeric scalars in a non-empty object, inference_checks, and a relative model_path. When no independent evaluation applies, return status='not_applicable' and a concise reason without inventing business metrics.",
                                     "reusable_training": "train(task_training_data, Path(fresh_output_directory)); bind exported selected recipe relative to solution, fit supplied rows, do not enumerate or select candidates again",
                                     "independent_probe_evidence": getattr(node, "interface_probe_evidence", None),
                                     "allowed_function_edits": allowed_definitions,
@@ -199,6 +195,8 @@ def run(agent, node: SearchNode) -> str:
                     model=stage_cfg.model,
                     temperature=stage_cfg.temp,
                     stage_name=role,
+                    stage_id="code_review",
+                    structured_output_mode="json" if is_deepseek_model(stage_cfg.model) else None,
                     cfg=agent.cfg
                 ),
             )
@@ -346,7 +344,11 @@ def regenerate_after_preflight_failure(
         user_prompt,
         assistant_prefix,
     )
-    plan, code = plan_and_code_query(agent, prompt)
+    plan, code = plan_and_code_query(
+        agent,
+        prompt,
+        stage_id="preflight_code_regeneration",
+    )
     if not str(code or "").strip():
         raise RuntimeError("Preflight regeneration returned no executable code")
     return plan, code

@@ -227,9 +227,17 @@ def run(
             plan, code = _diff_evolution(agent, prompt, routed_data_context(agent, "merge"), parent_node)
         except Exception as e:
             logger.warning(f"Diff evolution failed: {e}, falling back to full evolution")
-            plan, code = plan_and_code_query(agent, prompt_complete)
+            plan, code = plan_and_code_query(
+                agent,
+                prompt_complete,
+                stage_id="evolution_code_generation",
+            )
     else:
-        plan, code = plan_and_code_query(agent, prompt_complete)
+        plan, code = plan_and_code_query(
+            agent,
+            prompt_complete,
+            stage_id="evolution_code_generation",
+        )
 
     from_topk = getattr(parent_node, '_topk_triggered', False)
 
@@ -295,6 +303,7 @@ def _diff_evolution(agent, prompt_base, data_preview, parent_node):
         your_task_section=_EVOLUTION_PLANNER_TASK,
         assistant_suffix=build_planner_suffix(prompt_base, data_preview, context, extra_text=_build_evolution_suffix_extra(context)),
         stage_name="EvolutionPlanning",
+        stage_id="evolution_planning",
     )
 
     modules = planning_result.get('module', [])
@@ -323,4 +332,5 @@ def _diff_evolution(agent, prompt_base, data_preview, parent_node):
         introduction=_EVOLUTION_DIFF_INTRODUCTION,
         extra_context=extra_context,
         learning_guidance="Learn from evolution trajectory - use the evolution history to guide your changes. Build on successful patterns and avoid repeating failed approaches from the trajectory.",
+        stage_id="evolution_diff_generation",
     )

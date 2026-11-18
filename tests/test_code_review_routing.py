@@ -33,6 +33,25 @@ def _node() -> SearchNode:
     return SearchNode(code="print(1)", plan="demo", parent=None, stage="draft")
 
 
+def test_approved_review_null_patch_passes_real_provider_validation(monkeypatch):
+    import json
+    import jsonschema
+    from llm.openai import _validated_json_content, _build_json_mode_messages
+
+    response = {'needs_revision': False, 'reasoning': 'No critical issue.', 'revised_code': None}
+    messages = _build_json_mode_messages('Review the code.', 'print(1)', code_review_agent.CODE_REVIEW_SPEC)
+    assert '"revised_code":null' in '\n'.join(m['content'] for m in messages)
+    calls = []
+    def actual_validation(**kwargs):
+        calls.append(kwargs)
+        return _validated_json_content(json.dumps(response), code_review_agent.CODE_REVIEW_SPEC, 'stop')
+    monkeypatch.setattr(code_review_agent, 'query', actual_validation)
+    assert code_review_agent.run(_agent(), _node()) == 'print(1)'
+    assert len(calls) == 1
+    with pytest.raises(jsonschema.ValidationError):
+        _validated_json_content(json.dumps({**response, 'revised_code': 123}), code_review_agent.CODE_REVIEW_SPEC, 'stop')
+
+
 def test_code_review_uses_feedback_role_first(monkeypatch) -> None:
     calls: list[dict] = []
 
@@ -45,7 +64,22 @@ def test_code_review_uses_feedback_role_first(monkeypatch) -> None:
 
     assert code == "print(1)"
     assert [call["stage_name"] for call in calls] == ["feedback"]
+    assert [call["stage_id"] for call in calls] == ["code_review"]
     assert calls[0]["model"] == "fast-review"
+
+
+def test_deepseek_code_review_requests_json_mode_on_the_first_call(monkeypatch) -> None:
+    calls: list[dict] = []
+    agent = _agent(escalate=False)
+    agent.acfg.feedback.model = "deepseek-v4.1-flash"
+
+    def fake_query(**kwargs):
+        calls.append(kwargs)
+        return {"needs_revision": False, "reasoning": "No critical issue."}
+
+    monkeypatch.setattr(code_review_agent, "query", fake_query)
+    assert code_review_agent.run(agent, _node()) == "print(1)"
+    assert calls[0]["structured_output_mode"] == "json"
 
 
 def test_unpatchable_feedback_review_escalates_once(monkeypatch) -> None:

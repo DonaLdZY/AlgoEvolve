@@ -13,6 +13,23 @@ Desktop.ini
 .env.*
 replacements.txt
 gitleaks-report.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+secrets/
+.secrets/
+/config/local*.yaml
+/config/local*.yml
+*.local.yaml
+*.local.yml
+
+# Local development notes and archived experiments
+/PROJECT_CONTEXT.md
+/.local-notes/
+/.local-archive/
+*.local.md
 
 # Python bytecode, environments, and packaging
 __pycache__/
@@ -74,6 +91,15 @@ test_workspace/
 runs/
 outputs/
 dataset/
+/data/
+/datasets/
+/local-data/
+/local_data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
 mle-bench/
 grading_servers/
 run_scripts/*.json

@@ -1,7 +1,9 @@
 import json
+import os
 import time
 
 import psutil
+import pytest
 
 from engine.executor import Interpreter, insert_runtime_prelude
 
@@ -33,3 +35,24 @@ time.sleep(60)
     assert not psutil.pid_exists(child_pid)
     assert runner.current_parallel_run == 0
     assert runner.run("print('reused')", "next").exc_type is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CreateProcess rejects long cwd paths")
+def test_long_windows_working_directory_uses_short_subprocess_alias(tmp_path):
+    working_dir = tmp_path
+    for index in range(3):
+        working_dir = working_dir / (f"segment-{index}-" + "x" * 75)
+    working_dir.mkdir(parents=True)
+    assert len(str(working_dir)) >= 260
+
+    result = Interpreter(working_dir, timeout=10, max_parallel_run=1).run(
+        "from pathlib import Path\n"
+        "Path('child-output.txt').write_text('ok', encoding='utf-8')\n"
+        "print('cwd-ok')",
+        "long-cwd",
+    )
+
+    assert result.exc_type is None, result.term_out
+    assert "cwd-ok" in "".join(result.term_out)
+    assert (working_dir / "child-output.txt").read_text(encoding="utf-8") == "ok"
+    assert not list(working_dir.glob("runfile_*.py"))
